@@ -3,37 +3,33 @@ import numpy as np
 from hmmlearn import hmm
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.cluster import KMeans
 import talib
-from datetime import datetime
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 
 print("Starting Bitcoin HMM analysis...")
 
 def load_and_preprocess_data(filepath):
     print(f"Loading data from {filepath}...")
-    df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+    df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Num Trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'])
+    df.drop(columns=['Close time', 'Quote asset volume', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'], inplace=True)
     #drop useless row
     df = df.drop(0)
-    df = df.astype(float)
-    df['Unix'] = df['Timestamp']
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='s')
     df = df.set_index('Timestamp')
+    df.index = pd.to_datetime(df.index)
+    df = df.astype(float)
 
-    print("Resampling to hourly values...")
-    df = df.resample('h').mean()
+    print("Filtering out old data...")
+    df = df[(df.index >= "2020-01-01")]
 
     print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
-    df["Volatility"] = df["Returns"].rolling(window=48).std()
+    df["Volatility"] = df["Returns"].rolling(window=24).std()
 
     # replaces 0's with nan to avoid infinity being present in Volume_Change
     df = df.replace(0, pd.NA)
-    #print("Calculating volume change...")
-    #df["Volume_Change"] = df["Volume"].pct_change()
-
-    print("Filter out older data")
-    df = df[(df['Unix'] >= 1514782800) & (df['Unix'] <= 1546232400)]
+    print("Calculating volume change...")
+    df["Volume_Change"] = df["Volume"].pct_change()
 
     print("Calculating EMA")
     df['EMA'] = talib.EMA(df['Close'], timeperiod=30)
@@ -50,30 +46,43 @@ def load_and_preprocess_data(filepath):
     print(f"Data preprocessed, df shape:{df.shape}")
     return df
 
-def train_hmm(data, n_components=3):
+def train_hmm(data, test_size=0.1, n_components=5):
+    train_data, test_data = train_test_split(data, test_size=test_size, shuffle=False)
+
     print(f"Training HMM with {n_components} components...")
-    features = ["EMA", "RSI", "Aroon", "Volatility"]
-    X = data[features].values
+    features = ["Close"]
+    X_train = train_data[features].values
+    X_test = test_data[features].values
 
     print("Normalizing features...")
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
     print("Fitting HMM model...")
-    model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=50000, random_state=42, verbose=True)
-    model.fit(X_scaled)
+    model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=1000, random_state=42, verbose=True, tol=0.0001)
+    model.fit(X_train_scaled)
 
-    print("HMM training complete")
-    return model, scaler
+    train_states = model.predict(X_train_scaled)
+    test_states = model.predict(X_test_scaled)
 
-def predict_states(model, data, scaler):
-    print("Predicting states...")
-    features = ["EMA", "RSI", "Aroon", "Volatility"]
-    X = data[features].values
-    X_scaled = scaler.transform(X)
-    states = model.predict(X_scaled)
-    print(f"States precicted. Unique states: {np.unique(states)}")
-    return states
+    shifted_states = np.roll(test_states, -1)[:-1]
+    original_states = test_states[:-1]
+
+    # Calculate the accuracy as the fraction of times the states stay the same
+    accuracy = np.mean(original_states == shifted_states)
+
+    print(f"Testing State Prediction Consistency Score: {accuracy}")
+    return model, scaler, train_states, train_data
+
+# def predict_states(model, data, scaler):
+#     print("Predicting states...")
+#     features = ["EMA", "RSI", "Aroon", "Close"]
+#     X = data[features].values
+#     X_scaled = scaler.transform(X)
+#     states = model.predict(X_scaled)
+#     print(f"States precicted. Unique states: {np.unique(states)}")
+#     return states
 
 def analyze_states(model, data, states):
     print("Analyzing states...")
@@ -83,7 +92,7 @@ def analyze_states(model, data, states):
     for state in range(model.n_components):
         print(f"\nAnalyzing State {state}:")
         state_data = df_analysis[df_analysis['State'] == state]
-        print(state_data[["EMA", "RSI", "Aroon", "Volatility"]].describe())
+        print(state_data[["Close"]].describe())
         print(f"Number of periods in State {state}: {len(state_data)}")
 
 def plot_results(model, data, states):
@@ -106,31 +115,33 @@ def plot_results(model, data, states):
     ax2.set_xlabel('Date')
 
     plt.tight_layout()
-    print("Showing plot...")
-    plt.show()
+    print("Saving plot...")
+    plt.savefig('my_plot.png')
 
 print("Starting main execution...")
-data = load_and_preprocess_data("btcusd_1-min_data.csv")
+data = load_and_preprocess_data("btc_1h_data_2018_to_2024-2024-10-10.csv")
 
 print("Training HMM model...")
-model, scaler = train_hmm(data)
-
-print("Predicting states...")
-states = predict_states(model, data, scaler)
+model, scaler, states, train_data = train_hmm(data)
 
 print("Analyzing states...")
-analyze_states(model, data, states)
+analyze_states(model, train_data, states)
 
 print("Plotting results...")
-plot_results(model, data, states)
+plot_results(model, train_data, states)
 
 print("Printing transition matrix...")
 print(model.transmat_)
+print("Start probabilities:")
+print(model.startprob_)
 
-print("\nPrinting means and covariances of each state")
-for i in range(model.n_components):
-    print(f"State {i}:")
-    print("Mean:", model.means_[i])
-    print("Covariance:", model.covars_[i])
+features = ["EMA", "RSI", "Aroon", "Close"]
+X = train_data[features].values
+
+#print("\nPrinting means and covariances of each state")
+#for i in range(model.n_components):
+ #   print(f"State {i}:")
+  #  print("Mean:", model.means_[i])
+   # print("Covariance:", model.covars_[i])
 
 print("Bitcoin HMM analysis complete")
