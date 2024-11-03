@@ -24,7 +24,7 @@ def load_and_preprocess_data(filepath):
     df = df.astype(float)
 
     print("Filtering out old data...")
-    df = df[(df.index >= "2024-01-01")]
+    df = df[(df.index >= "2022-01-01")]
 
     print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
@@ -88,7 +88,17 @@ def generate_consecutive_samples(df, sample_length=100):
 
 def bootstrap_train_hmm(data, features, scaler, n_components=3, sample_num=30):
     def hamming_distance(seq1, seq2):
-        return np.sum(seq1 != seq2) / len(seq1)
+        difference = len([(i, seq1[i], seq2[i])
+                      for i in range(len(seq1))
+                      if seq1[i] != seq2[i]])
+        return difference / len(seq1)
+
+    #need this for finding the best model
+    def random_int_not_in_list(lst, min_val, max_val):
+        while True:
+            num = random.randint(min_val, max_val)
+            if num not in lst:
+                return num
 
     features = features
     scaler = scaler
@@ -102,8 +112,8 @@ def bootstrap_train_hmm(data, features, scaler, n_components=3, sample_num=30):
     #create test data
     X_test = test_sample[features].values
     X_scaled_test = scaler.fit_transform(X_test)
-    #the range is len(samples)-2 so that the test_sample is not included
-    for i in range(len(samples)-2):
+    #the range is len(samples)-1 so that the test_sample is not included
+    for i in range(len(samples)-1):
         #Create sample, get feature data and scale data
         X = samples[i][features].values
         X_scaled = scaler.fit_transform(X)
@@ -126,14 +136,18 @@ def bootstrap_train_hmm(data, features, scaler, n_components=3, sample_num=30):
     current_state_prediction = state_predictions[0]
     hamming_distances = []
     used = []
+    used_indices = []
     i = 0
     j = 0
+    #instead of testing the current model against every single model I want to test it against sample_num/2 random models (this is to prevent calculating the same hamming distance for every model)
     #this whole while loop is meant to find the lowest average hamming distance from state predictions, we can then use this to find the best bootstrap model
     while current_state_prediction not in used:
+        #random_index = random_int_not_in_list(used_indices, 0, sample_num-2)
+        #used_indices.append(random_index)
         if i != j: #To make sure we're not calculating the hamming distance between the same state predictions
-            total_hamming += hamming_distance(current_state_prediction, state_predictions[i])
+            total_hamming += hamming_distance(state_predictions[i], current_state_prediction)
         i += 1
-        if i >= len(state_predictions):
+        if i >= sample_num-1:
             j += 1
             if j >= len(state_predictions):
                 break
@@ -143,6 +157,7 @@ def bootstrap_train_hmm(data, features, scaler, n_components=3, sample_num=30):
             current_state_prediction = state_predictions[j]
             total_hamming = 0
             i = 0
+            used_indices = []
 
     #average_hamming_distance = total_hamming / pair_count
     #Here I'm finding the model with the tenth highest accuracy in hopes that it will have a more even distribution of states
@@ -203,7 +218,7 @@ data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10.csv")
 
 scaler = StandardScaler()
 features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
-best_model = bootstrap_train_hmm(data, features, scaler, 4, 40)
+best_model = bootstrap_train_hmm(data, features, scaler, 2, 200)
 
 # print("Training HMM model...")
 # model, scaler = train_hmm(data)
