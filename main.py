@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 from itertools import combinations
 import random
 from sklearn.cluster import KMeans
+import statistics
 
 print("Starting Bitcoin HMM analysis...")
 
@@ -24,7 +25,7 @@ def load_and_preprocess_data(filepath):
     df = df.astype(float)
 
     print("Filtering out old data...")
-    df = df[(df.index >= "2022-01-01")]
+    df = df[(df.index >= "2024-01-01")]
 
     print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
@@ -93,13 +94,6 @@ def bootstrap_train_hmm(data, features, scaler, n_components=3, sample_num=30):
                       if seq1[i] != seq2[i]])
         return difference / len(seq1)
 
-    #need this for finding the best model
-    def random_int_not_in_list(lst, min_val, max_val):
-        while True:
-            num = random.randint(min_val, max_val)
-            if num not in lst:
-                return num
-
     features = features
     scaler = scaler
     state_predictions = []
@@ -136,39 +130,47 @@ def bootstrap_train_hmm(data, features, scaler, n_components=3, sample_num=30):
     current_state_prediction = state_predictions[0]
     hamming_distances = []
     used = []
-    used_indices = []
     i = 0
     j = 0
-    #instead of testing the current model against every single model I want to test it against sample_num/2 random models (this is to prevent calculating the same hamming distance for every model)
     #this whole while loop is meant to find the lowest average hamming distance from state predictions, we can then use this to find the best bootstrap model
     while current_state_prediction not in used:
-        #random_index = random_int_not_in_list(used_indices, 0, sample_num-2)
-        #used_indices.append(random_index)
         if i != j: #To make sure we're not calculating the hamming distance between the same state predictions
             total_hamming += hamming_distance(state_predictions[i], current_state_prediction)
         i += 1
         if i >= sample_num-1:
             j += 1
-            if j >= len(state_predictions):
-                break
             used.append(current_state_prediction)
             average_hamming_distance = total_hamming / i
             hamming_distances.append(average_hamming_distance)
+            if j >= len(state_predictions):
+                break
             current_state_prediction = state_predictions[j]
             total_hamming = 0
             i = 0
-            used_indices = []
 
-    #average_hamming_distance = total_hamming / pair_count
-    #Here I'm finding the model with the tenth highest accuracy in hopes that it will have a more even distribution of states
-    sorted_indices = np.argsort(hamming_distances)
-    sorted_hamming_distances = [hamming_distances[i] for i in sorted_indices]
-    print(hamming_distances)
-    print(sorted_hamming_distances)
-    low_hamming_distance = sorted_hamming_distances[9]
-    decent_model = models[sorted_indices[9]]
-    print(low_hamming_distance)
-    return decent_model
+    #calculate standard deviation to find variability of state predictions
+    standard_deviations = []
+    for states in state_predictions:
+        dev = statistics.pstdev(states)
+        standard_deviations.append(dev)
+
+    # Normalize hamming distances and standard deviations
+    hamming_distances = np.array(hamming_distances)
+    standard_deviations = np.array(standard_deviations)
+    normalized_hamming_distances = (hamming_distances - hamming_distances.min()) / (hamming_distances.max() - hamming_distances.min())
+    normalized_standard_deviations = (standard_deviations - standard_deviations.min()) / (standard_deviations.max() - standard_deviations.min())
+
+    #calculate a hybrid score between the hamming distance and standard deviation in hopes of finding a model with a good mix of accuracy and state variability
+    weight1, weight2 = 0.01, 0.99
+    hybrid_scores = weight1 * (1 - normalized_hamming_distances) + weight2 * normalized_standard_deviations
+
+    best_index = np.argmax(hybrid_scores)
+    best_model = models[best_index]
+    print(f"Best Model Hybrid Score: {hybrid_scores[best_index]}")
+    print(f"Hamming distance: {hamming_distances[best_index]}")
+    print(f"Standard deviation: {standard_deviations[best_index]}")
+
+    return best_model
 
 def predict_states(model, data, features, scaler):
     print("Predicting states...")
@@ -218,7 +220,7 @@ data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10.csv")
 
 scaler = StandardScaler()
 features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
-best_model = bootstrap_train_hmm(data, features, scaler, 2, 200)
+best_model = bootstrap_train_hmm(data, features, scaler, 16, 60)
 
 # print("Training HMM model...")
 # model, scaler = train_hmm(data)
@@ -229,7 +231,7 @@ print("Analyzing states...")
 analyze_states(best_model, data, features, states)
 #
 print("Plotting results...")
-plot_results(data, states, 4)
+plot_results(data, states, 16)
 #
 # print("Printing transition matrix...")
 # print(model.transmat_)
