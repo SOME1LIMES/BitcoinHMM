@@ -4,6 +4,7 @@ from hmmlearn import hmm
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 import talib
+from datetime import datetime
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from itertools import combinations
@@ -11,6 +12,7 @@ import random
 from sklearn.cluster import KMeans
 import statistics
 
+pd.set_option('display.max_columns', None)
 print("Starting Bitcoin HMM analysis...")
 
 def load_and_preprocess_data(filepath):
@@ -25,7 +27,7 @@ def load_and_preprocess_data(filepath):
     df = df.astype(float)
 
     print("Filtering out old data...")
-    df = df[(df.index >= "2024-01-01")]
+    df = df[(df.index >= "2024-02-28")]
 
     print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
@@ -80,113 +82,57 @@ def train_hmm(data, n_components=3):
     print("HMM training complete")
     return model, scaler
 
-#need this function because the pandas sample function takes random rows whereas I need consecutive rows
-def generate_consecutive_samples(df, sample_length=100):
-    max_start_index = len(df) - sample_length
-    start_index = np.random.randint(0, max_start_index + 1)
-    sample_df = df.iloc[start_index:start_index + sample_length]
-    return sample_df
-
-def bootstrap_train_hmm(data, features, scaler, n_components=3, sample_num=30):
-    def hamming_distance(seq1, seq2):
-        difference = len([(i, seq1[i], seq2[i])
-                      for i in range(len(seq1))
-                      if seq1[i] != seq2[i]])
-        return difference / len(seq1)
-
-    features = features
-    scaler = scaler
-    state_predictions = []
+def train_hmm_ensemble(data, features, scaler, n_components=3, sample_num=30):
     models = []
     samples = np.array_split(data, sample_num)
 
-    #create test data
-    test_sample = samples[len(samples)-1]
-
-    #create test data
-    X_test = test_sample[features].values
-    X_scaled_test = scaler.fit_transform(X_test)
-    #the range is len(samples)-1 so that the test_sample is not included
-    for i in range(len(samples)-1):
-        #Create sample, get feature data and scale data
-        X = samples[i][features].values
+    for i in range(sample_num):
+        # Prepare bootstrap sample
+        sample_data = samples[i]
+        X = sample_data[features].values
         X_scaled = scaler.fit_transform(X)
-        #Apply K-Means clustering to initialize HMM means
-        kmeans = KMeans(n_clusters=n_components, random_state=42)
-        kmeans.fit(X_scaled)
-        initial_means = kmeans.cluster_centers_
-        #Initialize and train the HMM model
-        model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=300, init_params='st', random_state=42)
-        models.append(model)
-        model.means_ = initial_means  # Set initial means from K-Means
-        model.covars_ = np.array([np.cov(X_scaled.T) + 1e-4 * np.eye(X_scaled.shape[1]) for _ in range(n_components)])
+
+        # Train HMM model
+        model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=300, init_params='stmc',
+                                random_state=i)
         model.fit(X_scaled)
-        #predict states with each bootstrap model
-        states = model.predict(X_scaled_test)
-        states = states.tolist()
-        state_predictions.append(states)
+        models.append(model)
 
-    total_hamming = 0
-    current_state_prediction = state_predictions[0]
-    hamming_distances = []
-    used = []
-    i = 0
-    j = 0
-    #this whole while loop is meant to find the lowest average hamming distance from state predictions, we can then use this to find the best bootstrap model
-    while current_state_prediction not in used:
-        if i != j: #To make sure we're not calculating the hamming distance between the same state predictions
-            total_hamming += hamming_distance(state_predictions[i], current_state_prediction)
-        i += 1
-        if i >= sample_num-1:
-            j += 1
-            used.append(current_state_prediction)
-            average_hamming_distance = total_hamming / i
-            hamming_distances.append(average_hamming_distance)
-            if j >= len(state_predictions):
-                break
-            current_state_prediction = state_predictions[j]
-            total_hamming = 0
-            i = 0
+    print(f"Ensemble of {sample_num} HMM models trained.")
+    return models
 
-    #calculate standard deviation to find variability of state predictions
-    standard_deviations = []
-    for states in state_predictions:
-        dev = statistics.pstdev(states)
-        standard_deviations.append(dev)
 
-    # Normalize hamming distances and standard deviations
-    hamming_distances = np.array(hamming_distances)
-    standard_deviations = np.array(standard_deviations)
-    normalized_hamming_distances = (hamming_distances - hamming_distances.min()) / (hamming_distances.max() - hamming_distances.min())
-    normalized_standard_deviations = (standard_deviations - standard_deviations.min()) / (standard_deviations.max() - standard_deviations.min())
-
-    #calculate a hybrid score between the hamming distance and standard deviation in hopes of finding a model with a good mix of accuracy and state variability
-    weight1, weight2 = 0.01, 0.99
-    hybrid_scores = weight1 * (1 - normalized_hamming_distances) + weight2 * normalized_standard_deviations
-
-    best_index = np.argmax(hybrid_scores)
-    best_model = models[best_index]
-    print(f"Best Model Hybrid Score: {hybrid_scores[best_index]}")
-    print(f"Hamming distance: {hamming_distances[best_index]}")
-    print(f"Standard deviation: {standard_deviations[best_index]}")
-
-    return best_model
-
-def predict_states(model, data, features, scaler):
-    print("Predicting states...")
-    features = features
+def predict_ensemble_states(models, data, features, scaler):
     X = data[features].values
     X_scaled = scaler.transform(X)
-    states = model.predict(X_scaled)
-    print(f"States precicted. Unique states: {np.unique(states)}")
-    return states
+    all_predictions = []
 
-def analyze_states(model, data, features, states):
+    # Predict states using each model
+    for model in models:
+        states = model.predict(X_scaled)
+        all_predictions.append(states)
+
+    # Aggregate the predictions using voting
+    all_predictions = np.array(all_predictions)
+    final_states = []
+
+    for t in range(all_predictions.shape[1]):
+        # Get the predictions for the current time step from all models
+        state_votes = all_predictions[:, t]
+        # Find the state that occurs most frequently (voting)
+        final_state = np.bincount(state_votes).argmax()
+        final_states.append(final_state)
+
+    final_states = np.array(final_states)
+    print(f"Final states predicted using ensemble voting. Unique states: {np.unique(final_states)}")
+    return final_states
+
+def analyze_states(data, features, states, n_components=3):
     print("Analyzing states...")
     df_analysis = data.copy()
     df_analysis['State'] = states
 
-    for state in range(model.n_components):
+    for state in range(n_components):
         print(f"\nAnalyzing State {state}:")
         state_data = df_analysis[df_analysis['State'] == state]
         print(state_data[features].describe())
@@ -213,25 +159,26 @@ def plot_results(data, states, n_components):
 
     plt.tight_layout()
     print("Saving plot...")
-    plt.savefig('my_plot.png')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    plt.savefig('plots/' + str(timestamp))
 
 print("Starting main execution...")
 data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10.csv")
 
 scaler = StandardScaler()
 features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
-best_model = bootstrap_train_hmm(data, features, scaler, 16, 60)
+models = train_hmm_ensemble(data, features, scaler, 10, 60)
 
 # print("Training HMM model...")
 # model, scaler = train_hmm(data)
 print("Predicting states...")
-states = predict_states(best_model, data, features, scaler)
+states = predict_ensemble_states(models, data, features, scaler)
 
 print("Analyzing states...")
-analyze_states(best_model, data, features, states)
+analyze_states(data, features, states, 10)
 #
 print("Plotting results...")
-plot_results(data, states, 16)
+plot_results(data, states, 10)
 #
 # print("Printing transition matrix...")
 # print(model.transmat_)
