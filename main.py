@@ -64,7 +64,9 @@ def load_and_preprocess_data(filepath):
     df.dropna(inplace=True)
 
     print(f"Data preprocessed, df shape:{df.shape}")
-    return df
+    train_df = df[:len(df)-2000]
+    test_df = df[len(df)-2000:]
+    return train_df, test_df
 
 def train_hmm(data, n_components=3):
     print(f"Training HMM with {n_components} components...")
@@ -138,6 +140,33 @@ def analyze_states(data, features, states, n_components=3):
         print(state_data[features].describe())
         print(f"Number of periods in State {state}: {len(state_data)}")
 
+def calculate_transition_matrix(states, n_components):
+    # Initialize the transition matrix with zeros
+    transition_matrix = np.zeros((n_components, n_components))
+
+    # Iterate through the state sequence to count transitions
+    for i in range(len(states) - 1):
+        current_state = states[i]
+        next_state = states[i + 1]
+        transition_matrix[current_state, next_state] += 1
+
+    # Normalize the rows to convert counts to probabilities
+    for i in range(n_components):
+        row_sum = np.sum(transition_matrix[i])
+        if row_sum > 0:
+            transition_matrix[i] /= row_sum
+
+    return transition_matrix
+
+def transition_matrix_simulation(data_len, trans_matrix, starting_state):
+    possible_states = [i for i in range(len(trans_matrix))]
+    predicted_states = []
+    for i in range(data_len):
+        starting_state = np.random.choice(possible_states, p=trans_matrix[starting_state])
+        predicted_states.append(starting_state)
+    predicted_states = [int(item) for item in predicted_states]
+    return predicted_states
+
 def plot_results(data, states, n_components):
     print("Plotting results...")
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15,10), sharex=True)
@@ -163,35 +192,29 @@ def plot_results(data, states, n_components):
     plt.savefig('plots/' + str(timestamp))
 
 print("Starting main execution...")
-data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10.csv")
+train_data, test_data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10.csv")
 
 scaler = StandardScaler()
 features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
-models = train_hmm_ensemble(data, features, scaler, 10, 60)
+models = train_hmm_ensemble(train_data, features, scaler, 18, 35)
 
 # print("Training HMM model...")
 # model, scaler = train_hmm(data)
 print("Predicting states...")
-states = predict_ensemble_states(models, data, features, scaler)
+states = predict_ensemble_states(models, test_data, features, scaler)
 
 print("Analyzing states...")
-analyze_states(data, features, states, 10)
+analyze_states(test_data, features, states, 18)
+
+print("Calculating transition matrix...")
+trans_matrix = calculate_transition_matrix(states, 18)
+trans_df = pd.DataFrame(trans_matrix)
+print(trans_df)
+
 #
-print("Plotting results...")
-plot_results(data, states, 10)
-#
-# print("Printing transition matrix...")
-# print(model.transmat_)
-# print("Start probabilities:")
-# print(model.startprob_)
-#
-# features = ["EMA", "RSI", "Aroon", "Close"]
-# X = data[features].values
-#
-# #print("\nPrinting means and covariances of each state")
-# #for i in range(model.n_components):
-#  #   print(f"State {i}:")
-#   #  print("Mean:", model.means_[i])
-#    # print("Covariance:", model.covars_[i])
-#
-# print("Bitcoin HMM analysis complete")
+print("Plotting predicted states...")
+plot_results(test_data, states, 18)
+
+#differences_count = sum(1 for a, b in zip(states[len(states)-1000:], trans_states) if a != b)
+#print(f"Differences between actual predicted states and transition matrix estimation: {differences_count}")
+
