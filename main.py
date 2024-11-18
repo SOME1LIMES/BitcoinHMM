@@ -7,18 +7,14 @@ import talib
 from datetime import datetime
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
-from itertools import combinations
-import random
-from sklearn.cluster import KMeans
-import statistics
+from sklearn.ensemble import RandomForestClassifier
 
 pd.set_option('display.max_columns', None)
 print("Starting Bitcoin HMM analysis...")
 
 def load_and_preprocess_data(filepath):
     print(f"Loading data from {filepath}...")
-    df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Num Trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'])
-    df.drop(columns=['Close time', 'Quote asset volume', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'], inplace=True)
+    df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Num Trades', 'Label'])
     #drop useless row
     df = df.drop(0)
     #df = df.drop(columns=['Timestamp'])
@@ -27,7 +23,7 @@ def load_and_preprocess_data(filepath):
     df = df.astype(float)
 
     print("Filtering out old data...")
-    df = df[(df.index >= "2024-02-28")]
+    df = df[(df.index >= "2022-01-01")]
 
     print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
@@ -63,10 +59,7 @@ def load_and_preprocess_data(filepath):
     print("Dropping nan values...")
     df.dropna(inplace=True)
 
-    print(f"Data preprocessed, df shape:{df.shape}")
-    train_df = df[:len(df)-2000]
-    test_df = df[len(df)-2000:]
-    return train_df, test_df
+    return df
 
 def train_hmm(data, n_components=3):
     print(f"Training HMM with {n_components} components...")
@@ -192,28 +185,44 @@ def plot_results(data, states, n_components):
     plt.savefig('plots/' + str(timestamp))
 
 print("Starting main execution...")
-train_data, test_data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10.csv")
+data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv")
 
 scaler = StandardScaler()
-features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
-models = train_hmm_ensemble(train_data, features, scaler, 18, 35)
+hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
+models = train_hmm_ensemble(data, hmm_features, scaler, 18, 35)
 
-# print("Training HMM model...")
-# model, scaler = train_hmm(data)
 print("Predicting states...")
-states = predict_ensemble_states(models, test_data, features, scaler)
+states = predict_ensemble_states(models, data, hmm_features, scaler)
+data['State'] = states
+print(data['Label'])
+print(data['Label'].value_counts())
 
-print("Analyzing states...")
-analyze_states(test_data, features, states, 18)
+#Build random forest model
+rf_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "State"]
+labels = data.pop('Label').tolist()
+labels = [int(x) for x in labels]
+data_train, data_test, label_train, label_test = train_test_split(data[rf_features], labels, test_size=0.2)
 
-print("Calculating transition matrix...")
-trans_matrix = calculate_transition_matrix(states, 18)
-trans_df = pd.DataFrame(trans_matrix)
-print(trans_df)
+rf = RandomForestClassifier(class_weight='balanced', random_state=42)
+rf.fit(data_train, label_train)
+label_pred = rf.predict(data_test)
 
+#Testing accuracy
+accuracy = accuracy_score(label_test, label_pred)
+print(accuracy)
+print(label_test)
+print(label_pred.tolist())
+
+# print("Analyzing states...")
+# analyze_states(data_test, features, states, 18)
 #
-print("Plotting predicted states...")
-plot_results(test_data, states, 18)
+# print("Calculating transition matrix...")
+# trans_matrix = calculate_transition_matrix(states, 18)
+# trans_df = pd.DataFrame(trans_matrix)
+# print(trans_df)
+#
+# print("Plotting predicted states...")
+# plot_results(test_data, states, 18)
 
 #differences_count = sum(1 for a, b in zip(states[len(states)-1000:], trans_states) if a != b)
 #print(f"Differences between actual predicted states and transition matrix estimation: {differences_count}")
