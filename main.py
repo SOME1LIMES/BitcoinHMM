@@ -16,9 +16,8 @@ print("Starting Bitcoin HMM analysis...")
 def load_and_preprocess_data(filepath):
     print(f"Loading data from {filepath}...")
     df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Num Trades', 'Label'])
-    #drop useless row
+    #Drop useless row
     df = df.drop(0)
-    #df = df.drop(columns=['Timestamp'])
     df = df.set_index('Timestamp')
     df.index = pd.to_datetime(df.index)
     df = df.astype(float)
@@ -30,8 +29,8 @@ def load_and_preprocess_data(filepath):
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
 
-    # replaces 0's with nan to avoid infinity being present in Volume_Change
-    # Since the label column has 0's present, we need to make sure that they are not replaced
+    #Replaces 0's with nan to avoid infinity being present in Volume_Change
+    #Since the label column has 0's present, we need to make sure that they are not replaced
     columns_to_replace = df.columns.difference(['Label'])
     df[columns_to_replace] = df[columns_to_replace].replace(0, pd.NA)
     print("Calculating volume change...")
@@ -85,12 +84,12 @@ def train_hmm_ensemble(data, features, scaler, n_components=3, sample_num=30):
     samples = np.array_split(data, sample_num)
 
     for i in range(sample_num):
-        # Prepare bootstrap sample
+        #Prepare bootstrap sample
         sample_data = samples[i]
         X = sample_data[features].values
         X_scaled = scaler.fit_transform(X)
 
-        # Train HMM model
+        #Train HMM model
         model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=300, init_params='stmc',
                                 random_state=i)
         model.fit(X_scaled)
@@ -105,19 +104,19 @@ def predict_ensemble_states(models, data, features, scaler):
     X_scaled = scaler.transform(X)
     all_predictions = []
 
-    # Predict states using each model
+    #Predict states using each model
     for model in models:
         states = model.predict(X_scaled)
         all_predictions.append(states)
 
-    # Aggregate the predictions using voting
+    #Aggregate the predictions using voting
     all_predictions = np.array(all_predictions)
     final_states = []
 
-    for t in range(all_predictions.shape[1]):
-        # Get the predictions for the current time step from all models
-        state_votes = all_predictions[:, t]
-        # Find the state that occurs most frequently (voting)
+    for i in range(all_predictions.shape[1]):
+        #Get the predictions for the current time step from all models
+        state_votes = all_predictions[:, i]
+        #Find the state that occurs most frequently
         final_state = np.bincount(state_votes).argmax()
         final_states.append(final_state)
 
@@ -137,16 +136,16 @@ def analyze_states(data, features, states, n_components=3):
         print(f"Number of periods in State {state}: {len(state_data)}")
 
 def calculate_transition_matrix(states, n_components):
-    # Initialize the transition matrix with zeros
+    #Initialize the transition matrix with zeros
     transition_matrix = np.zeros((n_components, n_components))
 
-    # Iterate through the state sequence to count transitions
+    #Iterate through the state sequence to count transitions
     for i in range(len(states) - 1):
         current_state = states[i]
         next_state = states[i + 1]
         transition_matrix[current_state, next_state] += 1
 
-    # Normalize the rows to convert counts to probabilities
+    #Normalize the rows to convert counts to probabilities
     for i in range(n_components):
         row_sum = np.sum(transition_matrix[i])
         if row_sum > 0:
@@ -242,7 +241,7 @@ rf = RandomForestClassifier(class_weight='balanced', random_state=42, n_estimato
 rf.fit(data_train, label_train)
 label_pred = rf.predict(data_test)
 
-#need to do this for plotting results as data_test has completely random rows (thus completely random timestamps). This leads to a cluttered graph.
+#Need to do this for plotting results as data_test has completely random rows (thus completely random timestamps). This leads to a cluttered graph.
 data_visual = data[len(data)-2000:]
 label_visual = data_visual.pop('Label').tolist()
 data_visual = data_visual[rf_features]
