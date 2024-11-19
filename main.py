@@ -8,6 +8,7 @@ from datetime import datetime
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils import resample
 
 pd.set_option('display.max_columns', None)
 print("Starting Bitcoin HMM analysis...")
@@ -23,14 +24,16 @@ def load_and_preprocess_data(filepath):
     df = df.astype(float)
 
     print("Filtering out old data...")
-    df = df[(df.index >= "2022-01-01")]
+    df = df[(df.index >= "2024-02-20")]
 
     print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
 
     # replaces 0's with nan to avoid infinity being present in Volume_Change
-    df = df.replace(0, pd.NA)
+    # Since the label column has 0's present, we need to make sure that they are not replaced
+    columns_to_replace = df.columns.difference(['Label'])
+    df[columns_to_replace] = df[columns_to_replace].replace(0, pd.NA)
     print("Calculating volume change...")
     df["Volume_Change"] = df["Volume"].pct_change()
 
@@ -160,7 +163,7 @@ def transition_matrix_simulation(data_len, trans_matrix, starting_state):
     predicted_states = [int(item) for item in predicted_states]
     return predicted_states
 
-def plot_results(data, states, n_components):
+def plot_results_hmm(data, states, n_components):
     print("Plotting results...")
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15,10), sharex=True)
 
@@ -171,7 +174,6 @@ def plot_results(data, states, n_components):
     for state in range(n_components):
         mask = (states == state)
         ax1.fill_between(data.index, data['Close'].min(), data['Close'].max(), where=mask, alpha=0.3, label=f'State {state}')
-
     ax1.legend()
 
     ax2.plot(data.index, data['Returns'])
@@ -182,36 +184,87 @@ def plot_results(data, states, n_components):
     plt.tight_layout()
     print("Saving plot...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    plt.savefig('plots/' + str(timestamp))
+    plt.savefig('plots/hmm' + str(timestamp))
+
+def plot_results_rf(data, labels_true, labels_pred):
+    print("Plotting results...")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15,10), sharex=True)
+
+    ax1.plot(data.index, data['Close'])
+    ax1.set_title('Bitcoin Price and Real Labels')
+    ax1.set_ylabel('Price')
+
+    for label in range(3):
+        mask = (labels_true == label)
+        ax1.fill_between(data.index, data['Close'].min(), data['Close'].max(), where=mask, alpha=0.3, label=f'Signal {label}')
+    ax1.legend()
+
+    ax2.plot(data.index, data['Close'])
+    ax2.set_title('Bitcoin Price and Predicted Labels')
+    ax2.set_ylabel('Price')
+
+    for label in range(3):
+        mask = (labels_pred == label)
+        ax2.fill_between(data.index, data['Close'].min(), data['Close'].max(), where=mask, alpha=0.3, label=f'Signal {label}')
+    ax2.legend()
+
+    plt.tight_layout()
+    print("Saving plot...")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    plt.savefig('plots/rf' + str(timestamp))
 
 print("Starting main execution...")
 data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv")
-
 scaler = StandardScaler()
 hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
-models = train_hmm_ensemble(data, hmm_features, scaler, 18, 35)
+rf_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "State"]
 
+models = train_hmm_ensemble(data, hmm_features, scaler, 13, 13)
 print("Predicting states...")
 states = predict_ensemble_states(models, data, hmm_features, scaler)
 data['State'] = states
-print(data['Label'])
-print(data['Label'].value_counts())
+
+#Resample dataset so that it is balanced
+data_hold = data[data['Label'] == 1]
+data_buy = data[data['Label'] == 2]
+data_sell = data[data['Label'] == 0]
+
+max_len = max(len(data_buy), len(data_sell))
+data_hold_downsampled = resample(data_hold, replace=False, n_samples=max_len, random_state=42)
+data_balanced = pd.concat([data_hold_downsampled, data_buy, data_sell])
 
 #Build random forest model
-rf_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "State"]
-labels = data.pop('Label').tolist()
+labels = data_balanced.pop('Label').tolist()
 labels = [int(x) for x in labels]
-data_train, data_test, label_train, label_test = train_test_split(data[rf_features], labels, test_size=0.2)
+data_train, data_test, label_train, label_test = train_test_split(data_balanced[rf_features], labels, test_size=0.2)
 
-rf = RandomForestClassifier(class_weight='balanced', random_state=42)
+rf = RandomForestClassifier(class_weight='balanced', random_state=42, n_estimators=300)
 rf.fit(data_train, label_train)
 label_pred = rf.predict(data_test)
 
+#need to do this for plotting results as data_test has completely random rows (thus completely random timestamps). This leads to a cluttered graph.
+data_visual = data[len(data)-2000:]
+label_visual = data_visual.pop('Label').tolist()
+data_visual = data_visual[rf_features]
+label_visual = [int(x) for x in label_visual]
+label_visual_pred = rf.predict(data_visual)
+
 #Testing accuracy
 accuracy = accuracy_score(label_test, label_pred)
-print(accuracy)
-print(label_test)
-print(label_pred.tolist())
+print(f"test accuracy: {accuracy}")
+accuracy = accuracy_score(label_visual, label_visual_pred)
+print(f"visual accuracy: {accuracy}")
+print(label_visual)
+print(label_visual_pred.tolist())
+
+print("Plotting predicted states...")
+plot_results_hmm(data, states, 13)
+
+print("Plotting real and predicted labels...")
+plot_results_rf(data_visual, np.array(label_visual), np.array(label_visual_pred))
+
+#print(label_test)
+#print(label_pred.tolist())
 
 # print("Analyzing states...")
 # analyze_states(data_test, features, states, 18)
@@ -221,8 +274,7 @@ print(label_pred.tolist())
 # trans_df = pd.DataFrame(trans_matrix)
 # print(trans_df)
 #
-# print("Plotting predicted states...")
-# plot_results(test_data, states, 18)
+
 
 #differences_count = sum(1 for a, b in zip(states[len(states)-1000:], trans_states) if a != b)
 #print(f"Differences between actual predicted states and transition matrix estimation: {differences_count}")
