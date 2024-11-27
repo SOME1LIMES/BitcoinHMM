@@ -23,7 +23,7 @@ def load_and_preprocess_data(filepath):
     df = df.astype(float)
 
     print("Filtering out old data...")
-    df = df[(df.index >= "2024-02-20")]
+    df = df[(df.index >= "2021-01-01")]
 
     print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
@@ -61,7 +61,10 @@ def load_and_preprocess_data(filepath):
     print("Dropping nan values...")
     df.dropna(inplace=True)
 
-    return df
+    training_df = df[(df.index >= "2022-01-02")]
+    out_of_training_df = df[((df.index >= "2021-01-01") & (df.index <= "2022-01-01"))]
+
+    return training_df, out_of_training_df
 
 def train_hmm(data, n_components=3):
     print(f"Training HMM with {n_components} components...")
@@ -213,7 +216,7 @@ def plot_results_rf(data, labels_true, labels_pred):
     plt.savefig('plots/rf' + str(timestamp))
 
 print("Starting main execution...")
-data = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv")
+data, data_out = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv")
 scaler = StandardScaler()
 hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
 rf_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "State"]
@@ -221,32 +224,35 @@ rf_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Ar
 models = train_hmm_ensemble(data, hmm_features, scaler, 13, 13)
 print("Predicting states...")
 states = predict_ensemble_states(models, data, hmm_features, scaler)
+states_out = predict_ensemble_states(models, data_out, hmm_features, scaler)
 data['State'] = states
+data_out['State'] = states_out
 
 #Resample dataset so that it is balanced
-data_hold = data[data['Label'] == 1]
-data_buy = data[data['Label'] == 2]
-data_sell = data[data['Label'] == 0]
-
-max_len = max(len(data_buy), len(data_sell))
-data_hold_downsampled = resample(data_hold, replace=False, n_samples=max_len, random_state=42)
-data_balanced = pd.concat([data_hold_downsampled, data_buy, data_sell])
+# data_hold = data[data['Label'] == 1]
+# data_buy = data[data['Label'] == 2]
+# data_sell = data[data['Label'] == 0]
+#
+# max_len = max(len(data_buy), len(data_sell))
+# data_hold_downsampled = resample(data_hold, replace=False, n_samples=max_len, random_state=42)
+# data_balanced = pd.concat([data_hold_downsampled, data_buy, data_sell])
 
 #Build random forest model
-labels = data_balanced.pop('Label').tolist()
+labels = data.pop('Label').tolist()
 labels = [int(x) for x in labels]
-data_train, data_test, label_train, label_test = train_test_split(data_balanced[rf_features], labels, test_size=0.2)
+data_train, data_test, label_train, label_test = train_test_split(data[rf_features], labels, test_size=0.2)
 
 rf = RandomForestClassifier(class_weight='balanced', random_state=42, n_estimators=300)
 rf.fit(data_train, label_train)
 label_pred = rf.predict(data_test)
 
-#Need to do this for plotting results as data_test has completely random rows (thus completely random timestamps). This leads to a cluttered graph.
-data_visual = data[len(data)-2000:]
+#Need to do this for plotting results as data_test has completely random rows (thus completely random timestamps). This leads to a cluttered graph. This is also useful for testing data that is out of the training data
+data_visual = data_out[len(data_out)-2000:]
 label_visual = data_visual.pop('Label').tolist()
-data_visual = data_visual[rf_features]
 label_visual = [int(x) for x in label_visual]
+data_visual = data_visual[rf_features]
 label_visual_pred = rf.predict(data_visual)
+label_visual_pred = label_visual_pred.tolist()
 
 #Testing accuracy
 accuracy = accuracy_score(label_test, label_pred)
@@ -254,7 +260,17 @@ print(f"test accuracy: {accuracy}")
 accuracy = accuracy_score(label_visual, label_visual_pred)
 print(f"visual accuracy: {accuracy}")
 print(label_visual)
-print(label_visual_pred.tolist())
+print(label_visual_pred)
+
+#Filtering lists so that there is only entries where either the real list or the predicted list has a 0 or 2 in them
+#Since buying and selling are the more important predictions in an actual algo trader I want to see only the buy/sell accuracy
+buy_sell_label, buy_sell_label_pred = zip(*[(x, y) for x, y in zip(label_visual, label_visual_pred) if (x in [0, 2] or y in [0, 2])])
+buy_sell_label = list(buy_sell_label)
+buy_sell_label_pred = list(buy_sell_label_pred)
+buy_sell_accuracy = accuracy_score(buy_sell_label, buy_sell_label_pred)
+print(f"buy_sell accuracy: {buy_sell_accuracy}")
+print(buy_sell_label)
+print(buy_sell_label_pred)
 
 print("Plotting predicted states...")
 plot_results_hmm(data, states, 13)
