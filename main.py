@@ -7,17 +7,26 @@ import talib
 from datetime import datetime
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.utils import resample
+from sklearn.pipeline import Pipeline
+from category_encoders.target_encoder import TargetEncoder
+from xgboost import XGBClassifier
+from skopt import BayesSearchCV
+from skopt.space import Real, Categorical, Integer
+from xgboost import plot_importance
+from sklearn.utils import class_weight
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+from sklearn.model_selection import TimeSeriesSplit
 
 pd.set_option('display.max_columns', None)
 print("Starting Bitcoin HMM analysis...")
 
 def load_and_preprocess_data(filepath):
     print(f"Loading data from {filepath}...")
-    df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Num Trades', 'Label'])
+    df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Num Trades', 'Label', 'ATR', 'Price_Change', 'Buy_Threshold', 'Sell_Threshold'])
+    df.drop(['ATR', 'Price_Change', 'Buy_Threshold', 'Sell_Threshold'], axis=1, inplace=True)
+    df.drop(0, inplace=True)
     #Drop useless row
-    df = df.drop(0)
     df = df.set_index('Timestamp')
     df.index = pd.to_datetime(df.index)
     df = df.astype(float)
@@ -61,8 +70,8 @@ def load_and_preprocess_data(filepath):
     print("Dropping nan values...")
     df.dropna(inplace=True)
 
-    training_df = df[(df.index >= "2022-01-02")]
-    out_of_training_df = df[((df.index >= "2021-01-01") & (df.index <= "2022-01-01"))]
+    training_df = df[(df.index >= "2022-10-01")]
+    out_of_training_df = df[((df.index >= "2021-10-02") & (df.index <= "2022-01-01"))]
 
     return training_df, out_of_training_df
 
@@ -216,55 +225,74 @@ def plot_results_rf(data, labels_true, labels_pred):
     plt.savefig('plots/rf' + str(timestamp))
 
 print("Starting main execution...")
-data, data_out = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv")
+data_train, data_test = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv")
 scaler = StandardScaler()
-hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility"]
-rf_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "State"]
+hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "Num Trades", "Returns"]
+xg_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "State", "Num Trades", "Returns"]
 
-models = train_hmm_ensemble(data, hmm_features, scaler, 13, 13)
+#Need this because there was a weird error were the data in these columns were not classified as floats, this caused a problem with the pipeline as I'm not using a target encoder
+data_train['Volume'] = pd.to_numeric(data_train['Volume'], errors='coerce')
+data_train['Num Trades'] = pd.to_numeric(data_train['Num Trades'], errors='coerce')
+data_train['Returns'] = pd.to_numeric(data_train['Returns'], errors='coerce')
+data_test['Volume'] = pd.to_numeric(data_test['Volume'], errors='coerce')
+data_test['Num Trades'] = pd.to_numeric(data_test['Num Trades'], errors='coerce')
+data_test['Returns'] = pd.to_numeric(data_test['Returns'], errors='coerce')
+
+models = train_hmm_ensemble(data_train, hmm_features, scaler, 3, 3)
 print("Predicting states...")
-states = predict_ensemble_states(models, data, hmm_features, scaler)
-states_out = predict_ensemble_states(models, data_out, hmm_features, scaler)
-data['State'] = states
-data_out['State'] = states_out
+states = predict_ensemble_states(models, data_train, hmm_features, scaler)
+states_out = predict_ensemble_states(models, data_test, hmm_features, scaler)
+data_train['State'] = states
+data_test['State'] = states_out
 
-#Resample dataset so that it is balanced
-# data_hold = data[data['Label'] == 1]
-# data_buy = data[data['Label'] == 2]
-# data_sell = data[data['Label'] == 0]
-#
-# max_len = max(len(data_buy), len(data_sell))
-# data_hold_downsampled = resample(data_hold, replace=False, n_samples=max_len, random_state=42)
-# data_balanced = pd.concat([data_hold_downsampled, data_buy, data_sell])
+#Build xgboost model
+labels_train = data_train.pop('Label').tolist()
+labels_train = [int(x) for x in labels_train]
+labels_test = data_test.pop('Label').tolist()
+labels_test = [int(x) for x in labels_test]
 
-#Build random forest model
-labels = data.pop('Label').tolist()
-labels = [int(x) for x in labels]
-data_train, data_test, label_train, label_test = train_test_split(data[rf_features], labels, test_size=0.2)
+data_train = data_train[xg_features]
+data_test = data_test[xg_features]
 
-rf = RandomForestClassifier(class_weight='balanced', random_state=42, n_estimators=300)
-rf.fit(data_train, label_train)
-label_pred = rf.predict(data_test)
+tscv = TimeSeriesSplit(n_splits=5)
 
-#Need to do this for plotting results as data_test has completely random rows (thus completely random timestamps). This leads to a cluttered graph. This is also useful for testing data that is out of the training data
-data_visual = data_out[len(data_out)-2000:]
-label_visual = data_visual.pop('Label').tolist()
-label_visual = [int(x) for x in label_visual]
-data_visual = data_visual[rf_features]
-label_visual_pred = rf.predict(data_visual)
-label_visual_pred = label_visual_pred.tolist()
+pipeline = ImbPipeline(steps=[
+    ('smote', SMOTE(random_state=42)),
+    ('xgb', XGBClassifier(random_state=42, eval_metric='mlogloss'))
+])
 
-#Testing accuracy
-accuracy = accuracy_score(label_test, label_pred)
-print(f"test accuracy: {accuracy}")
-accuracy = accuracy_score(label_visual, label_visual_pred)
-print(f"visual accuracy: {accuracy}")
-print(label_visual)
-print(label_visual_pred)
+search_space = {
+    'xgb__max_depth': Integer(2,8),
+    'xgb__learning_rate': Real(0.001, 1.0, prior='log-uniform'),
+    'xgb__subsample': Real(0.5, 1.0),
+    'xgb__colsample_bytree': Real(0.5, 1.0),
+    'xgb__colsample_bylevel': Real(0.5, 1.0),
+    'xgb__colsample_bynode' : Real(0.5, 1.0),
+    'xgb__reg_alpha': Real(0.0, 10.0),
+    'xgb__reg_lambda': Real(0.0, 10.0),
+    'xgb__gamma': Real(0.0, 10.0)
+}
+opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=30, scoring='balanced_accuracy', random_state=42)
 
-#Filtering lists so that there is only entries where either the real list or the predicted list has a 0 or 2 in them
-#Since buying and selling are the more important predictions in an actual algo trader I want to see only the buy/sell accuracy
-buy_sell_label, buy_sell_label_pred = zip(*[(x, y) for x, y in zip(label_visual, label_visual_pred) if (x in [0, 2] or y in [0, 2])])
+opt.fit(data_train, labels_train)
+print("Best estimator: ", opt.best_estimator_)
+print("Best score: ", opt.best_score_)
+print("Best params: ", opt.best_params_)
+print(opt.score(data_test, labels_test))
+labels_pred = opt.predict(data_test)
+labels_pred = labels_pred.tolist()
+print(labels_pred.count(0))
+print(labels_pred.count(1))
+print(labels_pred.count(2))
+
+xgboost_step = opt.best_estimator_.steps[1]
+xgboost_model = xgboost_step[1]
+plot_importance(xgboost_model)
+plt.show()
+
+# #Filtering lists so that there is only entries where either the real list or the predicted list has a 0 or 2 in them
+# #Since buying and selling are the more important predictions in an actual algo trader I want to see only the buy/sell accuracy
+buy_sell_label, buy_sell_label_pred = zip(*[(x, y) for x, y in zip(labels_test, labels_pred) if (x in [0, 2] or y in [0, 2])])
 buy_sell_label = list(buy_sell_label)
 buy_sell_label_pred = list(buy_sell_label_pred)
 buy_sell_accuracy = accuracy_score(buy_sell_label, buy_sell_label_pred)
@@ -272,25 +300,4 @@ print(f"buy_sell accuracy: {buy_sell_accuracy}")
 print(buy_sell_label)
 print(buy_sell_label_pred)
 
-print("Plotting predicted states...")
-plot_results_hmm(data, states, 13)
-
-print("Plotting real and predicted labels...")
-plot_results_rf(data_visual, np.array(label_visual), np.array(label_visual_pred))
-
-#print(label_test)
-#print(label_pred.tolist())
-
-# print("Analyzing states...")
-# analyze_states(data_test, features, states, 18)
-#
-# print("Calculating transition matrix...")
-# trans_matrix = calculate_transition_matrix(states, 18)
-# trans_df = pd.DataFrame(trans_matrix)
-# print(trans_df)
-#
-
-
-#differences_count = sum(1 for a, b in zip(states[len(states)-1000:], trans_states) if a != b)
-#print(f"Differences between actual predicted states and transition matrix estimation: {differences_count}")
 
