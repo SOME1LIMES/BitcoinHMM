@@ -6,19 +6,21 @@ from sklearn.preprocessing import StandardScaler
 import talib
 from datetime import datetime
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from category_encoders.target_encoder import TargetEncoder
 from xgboost import XGBClassifier
 from skopt import BayesSearchCV
 from skopt.space import Real, Categorical, Integer
 from xgboost import plot_importance
-from sklearn.utils import class_weight
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.model_selection import TimeSeriesSplit
+import pickle
+from requests import Request, Session
+from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
+import json
+import time
 
 pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
 print("Starting Bitcoin HMM analysis...")
 
 def load_and_preprocess_data(filepath):
@@ -70,18 +72,24 @@ def load_and_preprocess_data(filepath):
     print("Dropping nan values...")
     df.dropna(inplace=True)
 
-    training_df = df[(df.index >= "2022-10-01")]
-    out_of_training_df = df[((df.index >= "2021-10-02") & (df.index <= "2022-01-01"))]
+    training_df = df[(df.index >= "2022-01-02")]
+    out_of_training_df = df[((df.index >= "2021-01-01") & (df.index <= "2022-01-01"))]
+
+    # Need this because there was a weird error were the data in these columns were not classified as floats, this caused a problem with the pipeline as I'm not using a target encoder
+    training_df['Volume'] = pd.to_numeric(training_df['Volume'], errors='coerce')
+    training_df['Num Trades'] = pd.to_numeric(training_df['Num Trades'], errors='coerce')
+    training_df['Returns'] = pd.to_numeric(training_df['Returns'], errors='coerce')
+    out_of_training_df['Volume'] = pd.to_numeric(out_of_training_df['Volume'], errors='coerce')
+    out_of_training_df['Num Trades'] = pd.to_numeric(out_of_training_df['Num Trades'], errors='coerce')
+    out_of_training_df['Returns'] = pd.to_numeric(out_of_training_df['Returns'], errors='coerce')
 
     return training_df, out_of_training_df
 
-def train_hmm(data, n_components=3):
+def train_hmm(data, features, scaler, n_components=3):
     print(f"Training HMM with {n_components} components...")
-    features = ["EMA", "RSI", "Aroon", "Volatility"]
     X = data[features].values
 
     print("Normalizing features...")
-    scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     print("Fitting HMM model...")
@@ -89,90 +97,24 @@ def train_hmm(data, n_components=3):
     model.fit(X_scaled)
 
     print("HMM training complete")
-    return model, scaler
 
-def train_hmm_ensemble(data, features, scaler, n_components=3, sample_num=30):
-    models = []
-    samples = np.array_split(data, sample_num)
+    filepath = "hmm_model.pkl"
+    with open("hmm_model.pkl", "wb") as f:
+        pickle.dump(model, f)
 
-    for i in range(sample_num):
-        #Prepare bootstrap sample
-        sample_data = samples[i]
-        X = sample_data[features].values
-        X_scaled = scaler.fit_transform(X)
+    return filepath
 
-        #Train HMM model
-        model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=300, init_params='stmc',
-                                random_state=i)
-        model.fit(X_scaled)
-        models.append(model)
+def load_hmm(filepath):
+    with open(filepath, "rb") as f:
+        model = pickle.load(f)
+    return model
 
-    print(f"Ensemble of {sample_num} HMM models trained.")
-    return models
-
-
-def predict_ensemble_states(models, data, features, scaler):
-    X = data[features].values
-    X_scaled = scaler.transform(X)
-    all_predictions = []
-
-    #Predict states using each model
-    for model in models:
-        states = model.predict(X_scaled)
-        all_predictions.append(states)
-
-    #Aggregate the predictions using voting
-    all_predictions = np.array(all_predictions)
-    final_states = []
-
-    for i in range(all_predictions.shape[1]):
-        #Get the predictions for the current time step from all models
-        state_votes = all_predictions[:, i]
-        #Find the state that occurs most frequently
-        final_state = np.bincount(state_votes).argmax()
-        final_states.append(final_state)
-
-    final_states = np.array(final_states)
-    print(f"Final states predicted using ensemble voting. Unique states: {np.unique(final_states)}")
-    return final_states
-
-def analyze_states(data, features, states, n_components=3):
-    print("Analyzing states...")
-    df_analysis = data.copy()
-    df_analysis['State'] = states
-
-    for state in range(n_components):
-        print(f"\nAnalyzing State {state}:")
-        state_data = df_analysis[df_analysis['State'] == state]
-        print(state_data[features].describe())
-        print(f"Number of periods in State {state}: {len(state_data)}")
-
-def calculate_transition_matrix(states, n_components):
-    #Initialize the transition matrix with zeros
-    transition_matrix = np.zeros((n_components, n_components))
-
-    #Iterate through the state sequence to count transitions
-    for i in range(len(states) - 1):
-        current_state = states[i]
-        next_state = states[i + 1]
-        transition_matrix[current_state, next_state] += 1
-
-    #Normalize the rows to convert counts to probabilities
-    for i in range(n_components):
-        row_sum = np.sum(transition_matrix[i])
-        if row_sum > 0:
-            transition_matrix[i] /= row_sum
-
-    return transition_matrix
-
-def transition_matrix_simulation(data_len, trans_matrix, starting_state):
-    possible_states = [i for i in range(len(trans_matrix))]
-    predicted_states = []
-    for i in range(data_len):
-        starting_state = np.random.choice(possible_states, p=trans_matrix[starting_state])
-        predicted_states.append(starting_state)
-    predicted_states = [int(item) for item in predicted_states]
-    return predicted_states
+def predict_states(model, data, features, scaler):
+     X = data[features].values
+     X_scaled = scaler.transform(X)
+     states = model.predict(X_scaled)
+     print(f"States precicted. Unique states: {np.unique(states)}")
+     return states
 
 def plot_results_hmm(data, states, n_components):
     print("Plotting results...")
@@ -224,24 +166,124 @@ def plot_results_rf(data, labels_true, labels_pred):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     plt.savefig('plots/rf' + str(timestamp))
 
+def train_xgboost(data_train, labels_train, data_test, labels_test):
+    tscv = TimeSeriesSplit(n_splits=3)
+
+    pipeline = ImbPipeline(steps=[
+        ('smote', SMOTE(random_state=42)),
+        ('xgb', XGBClassifier(random_state=42, eval_metric='mlogloss', early_stopping_rounds=25, verbose=0))
+    ])
+
+    search_space = {
+        'xgb__max_depth': Integer(2, 8),
+        'xgb__learning_rate': Real(0.001, 1.0, prior='log-uniform'),
+        'xgb__subsample': Real(0.5, 1.0),
+        'xgb__colsample_bytree': Real(0.5, 1.0),
+        'xgb__colsample_bylevel': Real(0.5, 1.0),
+        'xgb__colsample_bynode': Real(0.5, 1.0),
+        'xgb__reg_alpha': Real(0.0, 10.0),
+        'xgb__reg_lambda': Real(0.0, 10.0),
+        'xgb__gamma': Real(0.0, 10.0),
+        'xgb__n_estimators': Integer(100, 500),
+        'xgb__min_child_weight': Integer(1, 15)
+    }
+    opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=3, scoring='balanced_accuracy', random_state=42)
+
+    opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)])
+    print("Best estimator: ", opt.best_estimator_)
+    print("Best score: ", opt.best_score_)
+    print("Best params: ", opt.best_params_)
+    print(opt.score(data_test, labels_test))
+    labels_pred = opt.predict(data_test)
+    labels_pred = labels_pred.tolist()
+    print(labels_pred.count(0))
+    print(labels_pred.count(1))
+    print(labels_pred.count(2))
+
+    xgboost_step = opt.best_estimator_.steps[1]
+    xgboost_model = xgboost_step[1]
+    plot_importance(xgboost_model)
+    plt.show()
+
+    #save the model
+    filepath = "xgboost_pipeline.pkl"
+    with open(filepath, "wb") as f:
+        pickle.dump(opt.best_estimator_, f)
+
+    return filepath
+
+def load_xgboost(filepath):
+    with open(filepath, "rb") as f:
+        model = pickle.load(f)
+    return model
+
+def get_historical_data():
+    unix = int(time.time())
+    unix -= 60 * 60 * 100
+    print(unix)
+
+    url = 'https://pro-api.coinmarketcap.com/v2/cryptocurrency/ohlcv/historical'
+    parameters = {
+        'id': '1',
+        'time_period': 'hourly',
+        'time_start': unix,
+        'count': '100',
+        'interval': '1h'
+    }
+    headers = {
+        'Accepts': 'application/json',
+        'X-CMC_PRO_API_KEY': 'be0057a3-f3af-4dbc-b189-79aa189efc25',
+    }
+
+    session = Session()
+    session.headers.update(headers)
+
+    try:
+      response = session.get(url, params=parameters)
+      data = json.loads(response.text)
+    except (ConnectionError, Timeout, TooManyRedirects) as e:
+      print(e)
+
+    df = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+
+    btc_close, btc_open, btc_high, btc_low = [], [], [], []
+    for i in range(len(data['data']['quotes'])):
+        df.loc[len(df)] = {"Open": data['data']['quotes'][i]['quote']['USD']['open'],
+                           "High": data['data']['quotes'][i]['quote']['USD']['high'],
+                           "Low": data['data']['quotes'][i]['quote']['USD']['low'],
+                           "Close": data['data']['quotes'][i]['quote']['USD']['close']}
+
+    return df
+
+def calculate_indicators(df):
+    df["Returns"] = df["Close"].pct_change()
+    df["Volatility"] = df["Returns"].rolling(window=24).std()
+    df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=14)
+    df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=50)
+    df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
+    df['Aroon'] = talib.AROONOSC(df['High'], df['Low'], timeperiod=14)
+
+    upper, middle, lower = talib.BBANDS(df['Close'], 20)
+    df['BB_Width'] = upper - lower
+
+    macd, macdsignal, macdhist = talib.MACDFIX(df['Close'])
+    df['MACD'] = macd
+    df['MACDSignal'] = macdsignal
+    df['MACDHist'] = macdhist
+
+    return df
+
 print("Starting main execution...")
-data_train, data_test = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv")
+data_train, data_test = load_and_preprocess_data("btc_1h_data_2018_to_2024-2024-10-10_labeled.csv")
 scaler = StandardScaler()
-hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "Num Trades", "Returns"]
-xg_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volume", "Volatility", "State", "Num Trades", "Returns"]
+hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns"]
+xg_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "State", "Returns"]
 
-#Need this because there was a weird error were the data in these columns were not classified as floats, this caused a problem with the pipeline as I'm not using a target encoder
-data_train['Volume'] = pd.to_numeric(data_train['Volume'], errors='coerce')
-data_train['Num Trades'] = pd.to_numeric(data_train['Num Trades'], errors='coerce')
-data_train['Returns'] = pd.to_numeric(data_train['Returns'], errors='coerce')
-data_test['Volume'] = pd.to_numeric(data_test['Volume'], errors='coerce')
-data_test['Num Trades'] = pd.to_numeric(data_test['Num Trades'], errors='coerce')
-data_test['Returns'] = pd.to_numeric(data_test['Returns'], errors='coerce')
-
-models = train_hmm_ensemble(data_train, hmm_features, scaler, 3, 3)
+hmm_path = train_hmm(data_train, hmm_features, scaler, 14)
+hmm_model = load_hmm(hmm_path)
 print("Predicting states...")
-states = predict_ensemble_states(models, data_train, hmm_features, scaler)
-states_out = predict_ensemble_states(models, data_test, hmm_features, scaler)
+states = predict_states(hmm_model, data_train, hmm_features, scaler)
+states_out = predict_states(hmm_model, data_test, hmm_features, scaler)
 data_train['State'] = states
 data_test['State'] = states_out
 
@@ -254,41 +296,11 @@ labels_test = [int(x) for x in labels_test]
 data_train = data_train[xg_features]
 data_test = data_test[xg_features]
 
-tscv = TimeSeriesSplit(n_splits=5)
-
-pipeline = ImbPipeline(steps=[
-    ('smote', SMOTE(random_state=42)),
-    ('xgb', XGBClassifier(random_state=42, eval_metric='mlogloss'))
-])
-
-search_space = {
-    'xgb__max_depth': Integer(2,8),
-    'xgb__learning_rate': Real(0.001, 1.0, prior='log-uniform'),
-    'xgb__subsample': Real(0.5, 1.0),
-    'xgb__colsample_bytree': Real(0.5, 1.0),
-    'xgb__colsample_bylevel': Real(0.5, 1.0),
-    'xgb__colsample_bynode' : Real(0.5, 1.0),
-    'xgb__reg_alpha': Real(0.0, 10.0),
-    'xgb__reg_lambda': Real(0.0, 10.0),
-    'xgb__gamma': Real(0.0, 10.0)
-}
-opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=30, scoring='balanced_accuracy', random_state=42)
-
-opt.fit(data_train, labels_train)
-print("Best estimator: ", opt.best_estimator_)
-print("Best score: ", opt.best_score_)
-print("Best params: ", opt.best_params_)
-print(opt.score(data_test, labels_test))
-labels_pred = opt.predict(data_test)
+#xgboost_path = train_xgboost(data_train, labels_train, data_test, labels_test)
+xgboost_path = "xgboost_pipeline.pkl"
+xgboost_model = load_xgboost(xgboost_path)
+labels_pred = xgboost_model.predict(data_test)
 labels_pred = labels_pred.tolist()
-print(labels_pred.count(0))
-print(labels_pred.count(1))
-print(labels_pred.count(2))
-
-xgboost_step = opt.best_estimator_.steps[1]
-xgboost_model = xgboost_step[1]
-plot_importance(xgboost_model)
-plt.show()
 
 # #Filtering lists so that there is only entries where either the real list or the predicted list has a 0 or 2 in them
 # #Since buying and selling are the more important predictions in an actual algo trader I want to see only the buy/sell accuracy
@@ -297,7 +309,16 @@ buy_sell_label = list(buy_sell_label)
 buy_sell_label_pred = list(buy_sell_label_pred)
 buy_sell_accuracy = accuracy_score(buy_sell_label, buy_sell_label_pred)
 print(f"buy_sell accuracy: {buy_sell_accuracy}")
-print(buy_sell_label)
-print(buy_sell_label_pred)
 
+recent_df = get_historical_data()
+recent_df = calculate_indicators(recent_df)
+recent_df = recent_df.dropna()
+recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
+
+labels_recent_pred = xgboost_model.predict(recent_df[xg_features])
+labels_recent_pred = labels_recent_pred.tolist()
+recent_df['Label'] = labels_recent_pred
+recent_df['PriceDiff'] = recent_df['Close'].diff()
+
+print(recent_df[['Close', 'Label', 'PriceDiff']])
 
