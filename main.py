@@ -25,7 +25,7 @@ pd.set_option('display.max_rows', None)
 def load_and_preprocess_data(filepath, window_size=2):
     print(f"Loading data from {filepath}...")
     df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Num Trades', 'Label', 'ATR', 'Price_Change', 'Buy_Threshold', 'Sell_Threshold'])
-    df.drop(['ATR', 'Price_Change', 'Buy_Threshold', 'Sell_Threshold'], axis=1, inplace=True)
+    df.drop(['ATR', 'Price_Change', 'Buy_Threshold', 'Sell_Threshold', 'Open', 'High', 'Low'], axis=1, inplace=True)
     df.drop(0, inplace=True)
     #Drop useless row
     df = df.set_index('Timestamp')
@@ -44,7 +44,6 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=14)
     df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=50)
     df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
-    df['Aroon'] = talib.AROONOSC(df['High'], df['Low'], timeperiod=14)
 
     upper, middle, lower = talib.BBANDS(df['Close'], 20)
     df['BB_Width'] = upper - lower
@@ -63,45 +62,33 @@ def load_and_preprocess_data(filepath, window_size=2):
 
     #calculate aggregate features
     df['Close_Mean'] = df['Close'].rolling(window=window_size).mean()
-    df['High_Mean'] = df['High'].rolling(window=window_size).mean()
-    df['Open_Mean'] = df['Open'].rolling(window=window_size).mean()
-    df['Low_Mean'] = df['Low'].rolling(window=window_size).mean()
     df['Returns_Mean'] = df['Returns'].rolling(window=window_size).mean()
     df['Volatility_Mean'] = df['Volatility'].rolling(window=window_size).mean()
     df['LOW_EMA_Mean'] = df['LOW_EMA'].rolling(window=window_size).mean()
     df['HIGH_EMA_Mean'] = df['HIGH_EMA'].rolling(window=window_size).mean()
     df['RSI_Mean'] = df['RSI'].rolling(window=window_size).mean()
-    df['Aroon_Mean'] = df['Aroon'].rolling(window=window_size).mean()
     df['BB_Width_Mean'] = df['BB_Width'].rolling(window=window_size).mean()
     df['MACD_Mean'] = df['MACD'].rolling(window=window_size).mean()
     df['MACDSignal_Mean'] = df['MACDSignal'].rolling(window=window_size).mean()
     df['MACDHist_Mean'] = df['MACDHist'].rolling(window=window_size).mean()
 
     df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
-    df['High_Dev'] = df['High'].rolling(window=window_size).std()
-    df['Open_Dev'] = df['Open'].rolling(window=window_size).std()
-    df['Low_Dev'] = df['Low'].rolling(window=window_size).std()
     df['Returns_Dev'] = df['Returns'].rolling(window=window_size).std()
     df['Volatility_Dev'] = df['Volatility'].rolling(window=window_size).std()
     df['LOW_EMA_Dev'] = df['LOW_EMA'].rolling(window=window_size).std()
     df['HIGH_EMA_Dev'] = df['HIGH_EMA'].rolling(window=window_size).std()
     df['RSI_Dev'] = df['RSI'].rolling(window=window_size).std()
-    df['Aroon_Dev'] = df['Aroon'].rolling(window=window_size).std()
     df['BB_Width_Dev'] = df['BB_Width'].rolling(window=window_size).std()
     df['MACD_Dev'] = df['MACD'].rolling(window=window_size).std()
     df['MACDSignal_Dev'] = df['MACDSignal'].rolling(window=window_size).std()
     df['MACDHist_Dev'] = df['MACDHist'].rolling(window=window_size).std()
 
     df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['High_Drawdown'] = (df['High'] / df['High'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Open_Drawdown'] = (df['Open'] / df['Open'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Low_Drawdown'] = (df['Low'] / df['Low'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['Returns_Drawdown'] = (df['Returns'] / df['Returns'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['Volatility_Drawdown'] = (df['Volatility'] / df['Volatility'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['LOW_EMA_Drawdown'] = (df['LOW_EMA'] / df['LOW_EMA'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['HIGH_EMA_Drawdown'] = (df['HIGH_EMA'] / df['HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['RSI_Drawdown'] = (df['RSI'] / df['RSI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Aroon_Drawdown'] = (df['Aroon'] / df['Aroon'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['BB_Width_Drawdown'] = (df['BB_Width'] / df['BB_Width'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['MACD_Drawdown'] = (df['MACD'] / df['MACD'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['MACDSignal_Drawdown'] = (df['MACDSignal'] / df['MACDSignal'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
@@ -249,16 +236,14 @@ def load_xgboost(filepath):
 
 def get_historical_data(count=100):
     unix = int(time.time())
-    unix -= 60 * 60 * count
-    print(unix)
+    unix -= 60 * 15 * count
 
-    url = 'https://pro-api.coinmarketcap.com/v2/cryptocurrency/ohlcv/historical'
+    url = 'https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/historical'
     parameters = {
         'id': '1',
-        'time_period': 'hourly',
         'time_start': unix,
         'count': f'{count}',
-        'interval': '1h'
+        'interval': '15m'
     }
     headers = {
         'Accepts': 'application/json',
@@ -269,19 +254,15 @@ def get_historical_data(count=100):
     session.headers.update(headers)
 
     try:
-      response = session.get(url, params=parameters)
-      data = json.loads(response.text)
+        response = session.get(url, params=parameters)
+        data = json.loads(response.text)
     except (ConnectionError, Timeout, TooManyRedirects) as e:
-      print(e)
+        print(e)
 
-    df = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+    df = pd.DataFrame(columns=["Close"])
 
-    btc_close, btc_open, btc_high, btc_low = [], [], [], []
     for i in range(len(data['data']['quotes'])):
-        df.loc[len(df)] = {"Open": data['data']['quotes'][i]['quote']['USD']['open'],
-                           "High": data['data']['quotes'][i]['quote']['USD']['high'],
-                           "Low": data['data']['quotes'][i]['quote']['USD']['low'],
-                           "Close": data['data']['quotes'][i]['quote']['USD']['close']}
+        df.loc[len(df)] = {"Close": data['data']['quotes'][i]['quote']['USD']['price']}
 
     return df
 
@@ -291,7 +272,6 @@ def calculate_indicators(df, window_size=2):
     df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=14)
     df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=50)
     df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
-    df['Aroon'] = talib.AROONOSC(df['High'], df['Low'], timeperiod=14)
 
     upper, middle, lower = talib.BBANDS(df['Close'], 20)
     df['BB_Width'] = upper - lower
@@ -303,30 +283,22 @@ def calculate_indicators(df, window_size=2):
 
     # calculate aggregate features
     df['Close_Mean'] = df['Close'].rolling(window=window_size).mean()
-    df['High_Mean'] = df['High'].rolling(window=window_size).mean()
-    df['Open_Mean'] = df['Open'].rolling(window=window_size).mean()
-    df['Low_Mean'] = df['Low'].rolling(window=window_size).mean()
     df['Returns_Mean'] = df['Returns'].rolling(window=window_size).mean()
     df['Volatility_Mean'] = df['Volatility'].rolling(window=window_size).mean()
     df['LOW_EMA_Mean'] = df['LOW_EMA'].rolling(window=window_size).mean()
     df['HIGH_EMA_Mean'] = df['HIGH_EMA'].rolling(window=window_size).mean()
     df['RSI_Mean'] = df['RSI'].rolling(window=window_size).mean()
-    df['Aroon_Mean'] = df['Aroon'].rolling(window=window_size).mean()
     df['BB_Width_Mean'] = df['BB_Width'].rolling(window=window_size).mean()
     df['MACD_Mean'] = df['MACD'].rolling(window=window_size).mean()
     df['MACDSignal_Mean'] = df['MACDSignal'].rolling(window=window_size).mean()
     df['MACDHist_Mean'] = df['MACDHist'].rolling(window=window_size).mean()
 
     df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
-    df['High_Dev'] = df['High'].rolling(window=window_size).std()
-    df['Open_Dev'] = df['Open'].rolling(window=window_size).std()
-    df['Low_Dev'] = df['Low'].rolling(window=window_size).std()
     df['Returns_Dev'] = df['Returns'].rolling(window=window_size).std()
     df['Volatility_Dev'] = df['Volatility'].rolling(window=window_size).std()
     df['LOW_EMA_Dev'] = df['LOW_EMA'].rolling(window=window_size).std()
     df['HIGH_EMA_Dev'] = df['HIGH_EMA'].rolling(window=window_size).std()
     df['RSI_Dev'] = df['RSI'].rolling(window=window_size).std()
-    df['Aroon_Dev'] = df['Aroon'].rolling(window=window_size).std()
     df['BB_Width_Dev'] = df['BB_Width'].rolling(window=window_size).std()
     df['MACD_Dev'] = df['MACD'].rolling(window=window_size).std()
     df['MACDSignal_Dev'] = df['MACDSignal'].rolling(window=window_size).std()
@@ -334,11 +306,6 @@ def calculate_indicators(df, window_size=2):
 
     df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(
         window=window_size).min()
-    df['High_Drawdown'] = (df['High'] / df['High'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Open_Drawdown'] = (df['Open'] / df['Open'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Low_Drawdown'] = (df['Low'] / df['Low'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['Returns_Drawdown'] = (df['Returns'] / df['Returns'].rolling(window=window_size).max() - 1).rolling(
         window=window_size).min()
     df['Volatility_Drawdown'] = (df['Volatility'] / df['Volatility'].rolling(window=window_size).max() - 1).rolling(
@@ -348,8 +315,6 @@ def calculate_indicators(df, window_size=2):
     df['HIGH_EMA_Drawdown'] = (df['HIGH_EMA'] / df['HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(
         window=window_size).min()
     df['RSI_Drawdown'] = (df['RSI'] / df['RSI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Aroon_Drawdown'] = (df['Aroon'] / df['Aroon'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
     df['BB_Width_Drawdown'] = (df['BB_Width'] / df['BB_Width'].rolling(window=window_size).max() - 1).rolling(
         window=window_size).min()
     df['MACD_Drawdown'] = (df['MACD'] / df['MACD'].rolling(window=window_size).max() - 1).rolling(
@@ -417,13 +382,13 @@ def trading_simulation(data, starting_money=500, buy_percentage=0.1):
 
 print("Starting main execution...")
 window_size = 2
-data_train, data_eval, data_test = load_and_preprocess_data("btc_1h_data_2018_to_2024-2024-10-10_labeled.csv", window_size)
+data_train, data_eval, data_test = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv", window_size)
 scaler = StandardScaler()
-hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns"]
-xg_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "State", "Returns", "Label"]
-agg_features = ["Close_Mean", "High_Mean", "Low_Mean", "Open_Mean", "LOW_EMA_Mean", "HIGH_EMA_Mean", "RSI_Mean", "Aroon_Mean", "BB_Width_Mean", "MACD_Mean", "MACDSignal_Mean", "MACDHist_Mean", "Volatility_Mean", "Returns_Mean",
-                "Close_Dev", "High_Dev", "Low_Dev", "Open_Dev", "LOW_EMA_Dev", "HIGH_EMA_Dev", "RSI_Dev", "Aroon_Dev", "BB_Width_Dev", "MACD_Dev", "MACDSignal_Dev", "MACDHist_Dev", "Volatility_Dev", "Returns_Dev",
-                "Close_Drawdown", "High_Drawdown", "Low_Drawdown", "Open_Drawdown", "LOW_EMA_Drawdown", "HIGH_EMA_Drawdown", "RSI_Drawdown", "Aroon_Drawdown", "BB_Width_Drawdown", "MACD_Drawdown", "MACDSignal_Drawdown", "MACDHist_Drawdown", "Volatility_Drawdown", "Returns_Drawdown"]
+hmm_features = ["Close", "LOW_EMA", "HIGH_EMA", "RSI", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns"]
+xg_features = ["Close", "LOW_EMA", "HIGH_EMA", "RSI", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "State", "Returns", "Label"]
+agg_features = ["Close_Mean", "LOW_EMA_Mean", "HIGH_EMA_Mean", "RSI_Mean", "BB_Width_Mean", "MACD_Mean", "MACDSignal_Mean", "MACDHist_Mean", "Volatility_Mean", "Returns_Mean",
+                "Close_Dev", "LOW_EMA_Dev", "HIGH_EMA_Dev", "RSI_Dev", "BB_Width_Dev", "MACD_Dev", "MACDSignal_Dev", "MACDHist_Dev", "Volatility_Dev", "Returns_Dev",
+                "Close_Drawdown", "LOW_EMA_Drawdown", "HIGH_EMA_Drawdown", "RSI_Drawdown", "BB_Width_Drawdown", "MACD_Drawdown", "MACDSignal_Drawdown", "MACDHist_Drawdown", "Volatility_Drawdown", "Returns_Drawdown"]
 
 hmm_path = train_hmm(data_train, hmm_features, scaler, 8)
 hmm_model = load_hmm(hmm_path)
@@ -476,11 +441,10 @@ buy_sell_label_pred = list(buy_sell_label_pred)
 buy_sell_accuracy = accuracy_score(buy_sell_label, buy_sell_label_pred)
 print(f"buy_sell accuracy: {buy_sell_accuracy}")
 
-recent_df = get_historical_data(750)
+recent_df = get_historical_data(3000)
 recent_df = calculate_indicators(recent_df)
 recent_df = recent_df.dropna()
 recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
-print(recent_df['Close'])
 
 #Need this to make recent_df compatible with convert_data_to_windows method
 recent_df['Label'] = 0
@@ -499,5 +463,6 @@ recent_df['Label'] = labels_recent_pred
 recent_df['PriceDiff'] = recent_df['Close_t-1'].diff()
 
 trading_df = recent_df[['Close_t-1', 'Label']]
-trading_simulation(trading_df, 100000, 0.9)
+print(trading_df)
+trading_simulation(trading_df, 500, 0.1)
 
