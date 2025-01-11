@@ -21,7 +21,6 @@ import time
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
-print("Starting Bitcoin HMM analysis...")
 
 def load_and_preprocess_data(filepath, window_size=2):
     print(f"Loading data from {filepath}...")
@@ -33,10 +32,6 @@ def load_and_preprocess_data(filepath, window_size=2):
     df.index = pd.to_datetime(df.index)
     df = df.astype(float)
 
-    print("Filtering out old data...")
-    df = df[(df.index >= "2021-01-01")]
-
-    print("Calculating returns and volatility...")
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
 
@@ -44,26 +39,16 @@ def load_and_preprocess_data(filepath, window_size=2):
     #Since the label column has 0's present, we need to make sure that they are not replaced
     columns_to_replace = df.columns.difference(['Label'])
     df[columns_to_replace] = df[columns_to_replace].replace(0, pd.NA)
-    print("Calculating volume change...")
     df["Volume_Change"] = df["Volume"].pct_change()
 
-    print("Calculating low period EMA")
     df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=14)
-
-    print("Calculating high period EMA")
     df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=50)
-
-    print("Calculating RSI")
     df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
-
-    print("Calculating Aroon Oscillator")
     df['Aroon'] = talib.AROONOSC(df['High'], df['Low'], timeperiod=14)
 
-    print("Calculating Bollinger Band width")
     upper, middle, lower = talib.BBANDS(df['Close'], 20)
     df['BB_Width'] = upper - lower
 
-    print("Calculating MACD")
     macd, macdsignal, macdhist = talib.MACDFIX(df['Close'])
     df['MACD'] = macd
     df['MACDSignal'] = macdsignal
@@ -262,9 +247,9 @@ def load_xgboost(filepath):
         model = pickle.load(f)
     return model
 
-def get_historical_data():
+def get_historical_data(count=100):
     unix = int(time.time())
-    unix -= 60 * 60 * 100
+    unix -= 60 * 60 * count
     print(unix)
 
     url = 'https://pro-api.coinmarketcap.com/v2/cryptocurrency/ohlcv/historical'
@@ -272,7 +257,7 @@ def get_historical_data():
         'id': '1',
         'time_period': 'hourly',
         'time_start': unix,
-        'count': '100',
+        'count': f'{count}',
         'interval': '1h'
     }
     headers = {
@@ -376,7 +361,7 @@ def calculate_indicators(df, window_size=2):
 
     return df
 
-def convert_data_to_windows(data, window_size=50):
+def convert_data_to_windows(data, window_size=2):
     rows = []
 
     for i in range(len(data) - window_size):
@@ -394,6 +379,40 @@ def convert_data_to_windows(data, window_size=50):
     window_data = pd.DataFrame(rows)
 
     return window_data
+
+def trading_simulation(data, starting_money=500, buy_percentage=0.1):
+    money = starting_money
+    bitcoin = 0
+    labels = data['Label'].tolist()
+    close_prices = data['Close_t-1'].tolist()
+    sell_order = False
+    buy_order = False
+
+    #0 is sell, 2 is buy
+
+    count = 0
+    for label in labels:
+        if label == 0:
+            sell_order = True
+        elif label == 2:
+            buy_order = True
+
+        if sell_order and label == 2:
+            money += bitcoin * close_prices[count]
+            print(f"Sold {bitcoin} bitcoin at {close_prices[count]}")
+            bitcoin = 0
+            sell_order = False
+        if buy_order and label == 0:
+            bitcoin += money * buy_percentage / close_prices[count]
+            money -= money * buy_percentage
+            buy_order = False
+            print(f"Bought {bitcoin} bitcoin at {close_prices[count]}")
+
+        print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
+        count += 1
+
+    print("Final money: ", money)
+    print("Profit: ", money - starting_money)
 
 
 print("Starting main execution...")
@@ -457,7 +476,7 @@ buy_sell_label_pred = list(buy_sell_label_pred)
 buy_sell_accuracy = accuracy_score(buy_sell_label, buy_sell_label_pred)
 print(f"buy_sell accuracy: {buy_sell_accuracy}")
 
-recent_df = get_historical_data()
+recent_df = get_historical_data(750)
 recent_df = calculate_indicators(recent_df)
 recent_df = recent_df.dropna()
 recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
@@ -479,5 +498,6 @@ labels_recent_pred = labels_recent_pred.tolist()
 recent_df['Label'] = labels_recent_pred
 recent_df['PriceDiff'] = recent_df['Close_t-1'].diff()
 
-print(recent_df[['Close_t-1', 'Label', 'PriceDiff']])
+trading_df = recent_df[['Close_t-1', 'Label']]
+trading_simulation(trading_df, 100000, 0.9)
 
