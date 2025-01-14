@@ -8,19 +8,25 @@ from datetime import datetime
 from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
 from skopt import BayesSearchCV
-from skopt.space import Real, Categorical, Integer
+from skopt.space import Real, Integer
 from xgboost import plot_importance
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.model_selection import TimeSeriesSplit
 import pickle
-from requests import Request, Session
+import requests
 from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
 import json
 import time
+import urllib.parse
+import hashlib
+import hmac
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
+
+api_key = 'IbIgJihiEgl4rEjWnOFazg7F4YVzJXVG8if3iKcGsurgspgblDN2F73XMPdUzOcH'
+api_sec = 'kN7vx7TDa207GdVbE5DL6Vf6f8xs2nXaYdX0xlKJQuibieOv2laiMQ53rQoUZGjc'
 
 def load_and_preprocess_data(filepath, window_size=2):
     print(f"Loading data from {filepath}...")
@@ -247,41 +253,59 @@ def load_xgboost(filepath):
         model = pickle.load(f)
     return model
 
-def get_historical_data(count=100):
-    unix = int(time.time())
-    unix -= 60 * 60 * count
-    print(unix)
+def get_binanceus_signature(data, secret):
+    postdata = urllib.parse.urlencode(data)
+    message = postdata.encode()
+    byte_key = bytes(secret, 'UTF-8')
+    mac = hmac.new(byte_key, message, hashlib.sha256).hexdigest()
+    return mac
 
-    url = 'https://pro-api.coinmarketcap.com/v2/cryptocurrency/ohlcv/historical'
-    parameters = {
-        'id': '1',
-        'time_period': 'hourly',
-        'time_start': unix,
-        'count': f'{count}',
-        'interval': '1h'
+def exchange_btc(side, quoteOrderQty):
+    data = {
+        "symbol": 'BTCUSDC',
+        "side": side,
+        "type": 'MARKET',
+        "quoteOrderQty": quoteOrderQty,
+        "timestamp": int(round(time.time() * 1000))
     }
     headers = {
-        'Accepts': 'application/json',
-        'X-CMC_PRO_API_KEY': 'be0057a3-f3af-4dbc-b189-79aa189efc25',
+        'X-MBX-APIKEY': api_key
+    }
+    signature = get_binanceus_signature(data, api_sec)
+    payload = {
+        **data,
+        "signature": signature,
+    }
+    req = requests.post(('https://api.binance.us/api/v3/order'), headers=headers, data=payload)
+    return req.text
+
+def get_historical_data(count=1000):
+    url = 'https://api.binance.us/api/v3/klines'
+    parameters = {
+        'symbol': 'BTCUSDC',
+        'interval': '3m',
+        'limit': f'{count}'
+    }
+    headers = {
+        'X-MBX-APIKEY': api_key,
     }
 
-    session = Session()
+    session = requests.Session()
     session.headers.update(headers)
 
     try:
-      response = session.get(url, params=parameters)
-      data = json.loads(response.text)
+        response = session.get(url, params=parameters)
+        data = json.loads(response.text)
     except (ConnectionError, Timeout, TooManyRedirects) as e:
-      print(e)
+        print(e)
 
     df = pd.DataFrame(columns=["Open", "High", "Low", "Close"])
 
-    btc_close, btc_open, btc_high, btc_low = [], [], [], []
-    for i in range(len(data['data']['quotes'])):
-        df.loc[len(df)] = {"Open": data['data']['quotes'][i]['quote']['USD']['open'],
-                           "High": data['data']['quotes'][i]['quote']['USD']['high'],
-                           "Low": data['data']['quotes'][i]['quote']['USD']['low'],
-                           "Close": data['data']['quotes'][i]['quote']['USD']['close']}
+    for i in range(len(data)):
+        df.loc[len(df)] = {"Open": float(data[i][1]),
+                           "High": float(data[i][2]),
+                           "Low": float(data[i][3]),
+                           "Close": float(data[i][4])}
 
     return df
 
@@ -363,17 +387,15 @@ def calculate_indicators(df, window_size=2):
 
 def convert_data_to_windows(data, window_size=2):
     rows = []
-
-    for i in range(len(data) - window_size):
+    for i in range(len(data) - window_size - 1):
         row = {}
 
         for feature in data.columns:
             if feature != 'Label':
                 for t in range(window_size):
-                    row[f"{feature}_t-{window_size-t}"] = data[feature].iloc[i + t]
+                    row[f"{feature}_t-{window_size-t}"] = data[feature].iloc[i + t + 1]
 
-        row['Label'] = data['Label'].iloc[i + window_size]
-
+        row['Label'] = data['Label'].iloc[i + window_size + 1]
         rows.append(row)
 
     window_data = pd.DataFrame(rows)
@@ -387,9 +409,9 @@ def trading_simulation(data, starting_money=500, buy_percentage=0.1):
     close_prices = data['Close_t-1'].tolist()
     sell_order = False
     buy_order = False
+    previous_trade_assets = money
 
     #0 is sell, 2 is buy
-
     count = 0
     for label in labels:
         if label == 0:
@@ -402,22 +424,38 @@ def trading_simulation(data, starting_money=500, buy_percentage=0.1):
             print(f"Sold {bitcoin} bitcoin at {close_prices[count]}")
             bitcoin = 0
             sell_order = False
+            # total_assets = money + bitcoin * close_prices[count]
+            # if total_assets < previous_trade_assets:
+            #     print("Loss detected on this trade. Stopping simulation.")
+            #     break
+            # previous_trade_assets = total_assets
+
         if buy_order and label == 0:
             bitcoin += money * buy_percentage / close_prices[count]
             money -= money * buy_percentage
             buy_order = False
             print(f"Bought {bitcoin} bitcoin at {close_prices[count]}")
+            # total_assets = money + bitcoin * close_prices[count]
+            # if total_assets < previous_trade_assets:
+            #     print("Loss detected on this trade. Stopping simulation.")
+            #     break
+            # previous_trade_assets = total_assets
 
+        total_assets = money + bitcoin * close_prices[count]
         print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
         count += 1
 
     print("Final money: ", money)
     print("Profit: ", money - starting_money)
 
+def get_next_interval(interval_seconds):
+    now = time.time()
+    next_interval = ((now // interval_seconds) + 1) * interval_seconds
+    return next_interval - now
 
 print("Starting main execution...")
-window_size = 2
-data_train, data_eval, data_test = load_and_preprocess_data("btc_1h_data_2018_to_2024-2024-10-10_labeled.csv", window_size)
+window_size = 5
+data_train, data_eval, data_test = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv", window_size)
 scaler = StandardScaler()
 hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns"]
 xg_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "State", "Returns", "Label"]
@@ -455,6 +493,10 @@ xg_data_train = pd.concat([xg_data_train, data_train[agg_features]], axis=1)
 xg_data_eval = pd.concat([xg_data_eval, data_eval[agg_features]], axis=1)
 xg_data_test = pd.concat([xg_data_test, data_test[agg_features]], axis=1)
 
+xg_data_train.dropna(inplace=True)
+xg_data_eval.dropna(inplace=True)
+xg_data_test.dropna(inplace=True)
+
 xg_labels_train = xg_data_train.pop('Label').tolist()
 xg_labels_train = [int(x) for x in xg_labels_train]
 xg_labels_eval = xg_data_eval.pop('Label').tolist()
@@ -462,8 +504,8 @@ xg_labels_eval = [int(x) for x in xg_labels_eval]
 xg_labels_test = xg_data_test.pop('Label').tolist()
 xg_labels_test = [int(x) for x in xg_labels_test]
 
-#xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval)
-xgboost_path = "xgboost_pipeline.pkl"
+xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval)
+#xgboost_path = "xgboost_pipeline.pkl"
 xgboost_model = load_xgboost(xgboost_path)
 xg_labels_pred = xgboost_model.predict(xg_data_test)
 xg_labels_pred = xg_labels_pred.tolist()
@@ -476,28 +518,55 @@ buy_sell_label_pred = list(buy_sell_label_pred)
 buy_sell_accuracy = accuracy_score(buy_sell_label, buy_sell_label_pred)
 print(f"buy_sell accuracy: {buy_sell_accuracy}")
 
-recent_df = get_historical_data(750)
-recent_df = calculate_indicators(recent_df)
-recent_df = recent_df.dropna()
-recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
-print(recent_df['Close'])
-
-#Need this to make recent_df compatible with convert_data_to_windows method
-recent_df['Label'] = 0
-recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
-
-#recent_df = recent_df.drop(xg_features, axis=1)
-recent_df = recent_df.drop(index=recent_df.index[:window_size])
-recent_df = recent_df.reset_index(drop=True)
-recent_df_windowed = recent_df_windowed.reset_index(drop=True)
-recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
-recent_df.drop(['Label'], axis=1, inplace=True)
-
-labels_recent_pred = xgboost_model.predict(recent_df)
-labels_recent_pred = labels_recent_pred.tolist()
-recent_df['Label'] = labels_recent_pred
-recent_df['PriceDiff'] = recent_df['Close_t-1'].diff()
-
-trading_df = recent_df[['Close_t-1', 'Label']]
-trading_simulation(trading_df, 100000, 0.9)
+# recent_df = get_historical_data(1000)
+# recent_df = calculate_indicators(recent_df)
+# recent_df = recent_df.dropna()
+# recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
+#
+# #Need this to make recent_df compatible with convert_data_to_windows method
+# recent_df['Label'] = 0
+# recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+#
+# recent_df = recent_df.drop(index=recent_df.index[:window_size])
+# recent_df = recent_df.reset_index(drop=True)
+# recent_df_windowed = recent_df_windowed.reset_index(drop=True)
+# recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
+# recent_df.drop(['Label'], axis=1, inplace=True)
+#
+# labels_recent_pred = xgboost_model.predict(recent_df)
+# labels_recent_pred = labels_recent_pred.tolist()
+# recent_df['Label'] = labels_recent_pred
+# recent_df['PriceDiff'] = recent_df['Close_t-1'].diff()
+#
+# trading_df = recent_df[['Close_t-1', 'PriceDiff', 'Label']]
+# print(trading_df)
+#trading_simulation(trading_df, starting_money=1500, buy_percentage=0.5)
+# while True:
+#     start_time = time.time()
+#
+#     recent_df = calculate_indicators(recent_df)
+#     recent_df = recent_df.dropna()
+#     recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
+#
+#     #Need this to make recent_df compatible with convert_data_to_windows method
+#     recent_df['Label'] = 0
+#     recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+#
+#     recent_df = recent_df.drop(index=recent_df.index[:window_size])
+#     recent_df = recent_df.reset_index(drop=True)
+#     recent_df_windowed = recent_df_windowed.reset_index(drop=True)
+#     recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
+#     print(recent_df)
+#     recent_df.drop(['Label'], axis=1, inplace=True)
+#
+#     labels_recent_pred = xgboost_model.predict(recent_df)
+#     labels_recent_pred = labels_recent_pred.tolist()
+#     recent_df['Label'] = labels_recent_pred
+#     recent_df['PriceDiff'] = recent_df['Close_t-1'].diff()
+#
+#     trading_df = recent_df[['Close_t-1', 'Label']]
+#     print(trading_df)
+#
+#     time.sleep(180)
+#     recent_df = get_historical_data(54)
 
