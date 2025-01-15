@@ -67,36 +67,65 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['S1'] = 2 * df['PP'] - df['High'].shift(1)
     df['S2'] = df['PP'] - (df['High'].shift(1) - df['Low'].shift(1))
 
-    #wave analysis
+    # Wave analysis
     n = 1
     df['Smoothed_Close'] = df['Close'].rolling(window=n).mean()
-    df['Highs'] = df['Smoothed_Close'][argrelextrema(df['Smoothed_Close'].values, np.greater_equal, order=n)[0]]
-    df['Lows'] = df['Smoothed_Close'][argrelextrema(df['Smoothed_Close'].values, np.less_equal, order=n)[0]]
-    df['Highs'] = df['Highs'].fillna(method='ffill')
-    df['Lows'] = df['Lows'].fillna(method='ffill')
-    df.dropna(inplace=True)
 
-    df['Wave_Amplitude'] = 0
+    max_indices = argrelextrema(df['Smoothed_Close'].values, np.greater_equal, order=n)[0]
+    min_indices = argrelextrema(df['Smoothed_Close'].values, np.less_equal, order=n)[0]
+
+    df['Wave_Amplitude'] = np.nan
     df['Wave_Direction'] = 0
+    df['Wave_Length_Bars'] = np.nan
+    df['Wave_Length_Time'] = pd.NaT
 
-    last_high, last_low = 0, 0
-    prev_high, prev_low = 0, 0
+    last_peak_idx = 0
+    last_trough_idx = 0
 
     for i in range(len(df)):
-        idx = df.index[i]  #Get the actual index for the row
-        last_high = df.loc[idx, 'Highs']
-        last_low = df.loc[idx, 'Lows']
-        df.loc[idx, 'Wave_Amplitude'] = last_high - last_low
+        idx = df.index[i]
+        current_close = df['Smoothed_Close'].iloc[i]
 
-        threshold = 0.00000001
-        if last_high > prev_high * (1 + threshold / 100):
+        if last_trough_idx >= last_peak_idx:  # need this extra condition to make sure the amplitude and length are not overwritten by the peak code block (seperating peaks/troughs)
+            trough_close = df['Smoothed_Close'].iloc[last_trough_idx]
+            df.loc[idx, 'Wave_Amplitude'] = current_close - trough_close
+
+            bars_length = i - last_trough_idx
+            time_length = idx - df.index[last_trough_idx]
+            df.loc[idx, 'Wave_Length_Bars'] = bars_length
+            df.loc[idx, 'Wave_Length_Time'] = time_length
+
+        if last_peak_idx >= last_trough_idx:
+            peak_close = df['Smoothed_Close'].iloc[last_peak_idx]
+            df.loc[idx, 'Wave_Amplitude'] = peak_close - current_close
+
+            bars_length = i - last_peak_idx
+            time_length = idx - df.index[last_peak_idx]
+            df.loc[idx, 'Wave_Length_Bars'] = bars_length
+            df.loc[idx, 'Wave_Length_Time'] = time_length
+
+        if i in max_indices:
             df.loc[idx, 'Wave_Direction'] = -1
-        elif last_low < prev_low * (1 - threshold / 100):
+            last_peak_idx = i
+
+        if i in min_indices:
             df.loc[idx, 'Wave_Direction'] = 1
+            last_trough_idx = i
 
-        prev_high, prev_low = last_high, last_low
+    df['Wave_Length_Time'] = df['Wave_Length_Time'] / pd.Timedelta(minutes=1)
 
-    df.dropna(inplace=True)
+    # calculate extra wave features
+    df['Wave_Velocity'] = df['Wave_Amplitude'] / df['Wave_Length_Time']
+    df['Wave_Frequency'] = 1 / df['Wave_Length_Time']
+    df['Wave_Sharpness'] = df['Wave_Amplitude'] / (df['Wave_Length_Time'] ** 2)
+    df['Wave_Slope'] = df['Wave_Amplitude'] / df['Wave_Length_Bars']
+    df['Wave_Energy'] = df['Wave_Amplitude'] ** 2
+    df['Wave_Acceleration'] = df['Wave_Slope'].diff() / df['Wave_Length_Bars']
+    df['Wave_Strength'] = df['Wave_Slope'] * df['Wave_Direction']
+    df['Normalized_Amplitude'] = df['Wave_Amplitude'] / df['Wave_Amplitude'].rolling(window=window_size).mean()
+    df['Normalized_Slope'] = df['Wave_Slope'] / df['Wave_Slope'].rolling(window=window_size).mean()
+
+    df.dropna(subset=['Smoothed_Close'], inplace=True)
 
     #Need this because there was a weird error were the data in these columns were not classified as floats, this caused a problem with the pipeline as I'm not using a target encoder
     df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
@@ -125,6 +154,13 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['R2_Mean'] = df['R2'].rolling(window=window_size).mean()
     df['Wave_Direction_Mean'] = df['Wave_Direction'].rolling(window=window_size).mean()
     df['Wave_Amplitude_Mean'] = df['Wave_Amplitude'].rolling(window=window_size).mean()
+    df['Wave_Velocity_Mean'] = df['Wave_Velocity'].rolling(window=window_size).mean()
+    df['Wave_Frequency_Mean'] = df['Wave_Frequency'].rolling(window=window_size).mean()
+    df['Wave_Sharpness_Mean'] = df['Wave_Sharpness'].rolling(window=window_size).mean()
+    df['Wave_Slope_Mean'] = df['Wave_Slope'].rolling(window=window_size).mean()
+    df['Wave_Energy_Mean'] = df['Wave_Energy'].rolling(window=window_size).mean()
+    df['Wave_Acceleration_Mean'] = df['Wave_Acceleration'].rolling(window=window_size).mean()
+    df['Wave_Strength_Mean'] = df['Wave_Strength'].rolling(window=window_size).mean()
 
     df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
     df['High_Dev'] = df['High'].rolling(window=window_size).std()
@@ -147,6 +183,13 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['R2_Dev'] = df['R2'].rolling(window=window_size).std()
     df['Wave_Direction_Dev'] = df['Wave_Direction'].rolling(window=window_size).std()
     df['Wave_Amplitude_Dev'] = df['Wave_Amplitude'].rolling(window=window_size).std()
+    df['Wave_Velocity_Mean'] = df['Wave_Velocity'].rolling(window=window_size).std()
+    df['Wave_Frequency_Mean'] = df['Wave_Frequency'].rolling(window=window_size).std()
+    df['Wave_Sharpness_Mean'] = df['Wave_Sharpness'].rolling(window=window_size).std()
+    df['Wave_Slope_Mean'] = df['Wave_Slope'].rolling(window=window_size).std()
+    df['Wave_Energy_Mean'] = df['Wave_Energy'].rolling(window=window_size).std()
+    df['Wave_Acceleration_Mean'] = df['Wave_Acceleration'].rolling(window=window_size).std()
+    df['Wave_Strength_Mean'] = df['Wave_Strength'].rolling(window=window_size).std()
 
     df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['High_Drawdown'] = (df['High'] / df['High'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
@@ -169,6 +212,13 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['R2_Drawdown'] = (df['R2'] / df['R2'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['Wave_Direction_Drawdown'] = (df['Wave_Direction'] / df['Wave_Direction'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['Wave_Amplitude_Drawdown'] = (df['Wave_Amplitude'] / df['Wave_Amplitude'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Velocity_Drawdown'] = (df['Wave_Velocity'] / df['Wave_Velocity'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Frequency_Drawdown'] = (df['Wave_Frequency'] / df['Wave_Frequency'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Sharpness_Drawdown'] = (df['Wave_Sharpness'] / df['Wave_Sharpness'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Slope_Drawdown'] = (df['Wave_Slope'] / df['Wave_Slope'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Energy_Drawdown'] = (df['Wave_Energy'] / df['Wave_Energy'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Acceleration_Drawdown'] = (df['Wave_Acceleration'] / df['Wave_Acceleration'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Strength_Drawdown'] = (df['Wave_Strength'] / df['Wave_Strength'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
 
     df.dropna(inplace=True)
 
@@ -260,7 +310,7 @@ def plot_results_rf(data, labels_true, labels_pred):
     plt.savefig('plots/rf' + str(timestamp))
 
 def train_xgboost(data_train, labels_train, data_test, labels_test):
-    tscv = TimeSeriesSplit(n_splits=20)
+    tscv = TimeSeriesSplit(n_splits=5)
 
     pipeline = ImbPipeline(steps=[
         ('smote', SMOTE(random_state=42)),
@@ -280,7 +330,7 @@ def train_xgboost(data_train, labels_train, data_test, labels_test):
         'xgb__n_estimators': Integer(100, 500),
         'xgb__min_child_weight': Integer(1, 15)
     }
-    opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=50, scoring='balanced_accuracy', random_state=42)
+    opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=3, scoring='balanced_accuracy', random_state=42)
 
     opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)])
     print("Best estimator: ", opt.best_estimator_)
@@ -521,12 +571,14 @@ window_size = 10
 data_train, data_eval, data_test = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv", window_size)
 scaler = StandardScaler()
 hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns", "Wave_Direction", "Wave_Amplitude"]
-xg_features = ["Volatility", "Returns", "Wave_Direction", "Wave_Amplitude", "State", "MACD", "MACDHist", "MACDSignal", "Label"]
+xg_features = ["Volatility", "Returns", "Wave_Direction", "Wave_Amplitude", "Wave_Velocity", "Wave_Frequency", "Wave_Sharpness", "Wave_Energy", "Wave_Acceleration", "Wave_Strength", "State", "MACD", "MACDHist", "MACDSignal", "Label"]
 agg_features = ["Wave_Direction_Mean", "Wave_Direction_Dev", "Wave_Direction_Drawdown", "Wave_Amplitude_Mean", "Wave_Amplitude_Dev", "Wave_Amplitude_Drawdown", "Returns_Mean", "Returns_Dev", "Returns_Drawdown",
-                "Volatility_Mean", "Volatility_Dev", "Volatility_Drawdown", "MACD_Mean", "MACD_Dev", "MACD_Drawdown", "MACDHist_Mean", "MACDHist_Dev", "MACDHist_Drawdown", "MACDSignal_Mean", "MACDSignal_Dev", "MACDSignal_Drawdown"]
+                "Volatility_Mean", "Volatility_Dev", "Volatility_Drawdown", "MACD_Mean", "MACD_Dev", "MACD_Drawdown", "MACDHist_Mean", "MACDHist_Dev", "MACDHist_Drawdown", "MACDSignal_Mean", "MACDSignal_Dev", "MACDSignal_Drawdown",
+                "Wave_Velocity_Mean", "Wave_Velocity_Dev", "Wave_Velocity_Drawdown", "Wave_Frequency_Mean", "Wave_Frequency_Dev", "Wave_Frequency_Drawdown", "Wave_Sharpness_Mean", "Wave_Sharpness_Dev", "Wave_Sharpness_Drawdown",
+                "Wave_Energy_Mean", "Wave_Energy_Dev", "Wave_Energy_Drawdown", "Wave_Acceleration_Mean", "Wave_Acceleration_Dev", "Wave_Acceleration_Drawdown", "Wave_Strength_Mean", "Wave_Strength_Dev", "Wave_Strength_Drawdown"]
 
 
-hmm_path = train_hmm(data_train, hmm_features, scaler, 8)
+hmm_path = train_hmm(data_train, hmm_features, scaler, 15)
 hmm_model = load_hmm(hmm_path)
 print("Predicting states...")
 states = predict_states(hmm_model, data_train, hmm_features, scaler)
@@ -632,20 +684,3 @@ print(f"buy_sell accuracy: {buy_sell_accuracy}")
 #
 #     time.sleep(180)
 #     recent_df = get_historical_data(54)
-
-#Best score:  0.3771637437817973
-#Best params:  OrderedDict([('xgb__colsample_bylevel', 0.7224162561505759), ('xgb__colsample_bynode', 0.9593612608346885), ('xgb__colsample_bytree', 0.5524295792763518), ('xgb__gamma', 4.333328018702252), ('xgb__learning_rate', 0.0036632415719891993), ('xgb__max_depth', 5), ('xgb__min_child_weight', 3), ('xgb__n_estimators', 401), ('xgb__reg_alpha', 5.573404230338014), ('xgb__reg_lambda', 9.732069776928888), ('xgb__subsample', 0.8517337655531521)])
-#0.3661007722809326
-#2944
-#9052
-#2153
-#buy_sell accuracy: 0.18407707910750506
-
-#Best score:  0.37683813238408403
-#Best params:  OrderedDict([('xgb__colsample_bylevel', 0.7224162561505759), ('xgb__colsample_bynode', 0.9593612608346885), ('xgb__colsample_bytree', 0.5524295792763518), ('xgb__gamma', 4.333328018702252), ('xgb__learning_rate', 0.0036632415719891993), ('xgb__max_depth', 5), ('xgb__min_child_weight', 3), ('xgb__n_estimators', 401), ('xgb__reg_alpha', 5.573404230338014), ('xgb__reg_lambda', 9.732069776928888), ('xgb__subsample', 0.8517337655531521)])
-#0.3611682106221572
-#2534
-#9654
-#1893
-#buy_sell accuracy: 0.1859656629405787
-#13
