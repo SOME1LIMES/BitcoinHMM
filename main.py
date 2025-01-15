@@ -21,6 +21,7 @@ import time
 import urllib.parse
 import hashlib
 import hmac
+from scipy.signal import argrelextrema
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
@@ -47,8 +48,8 @@ def load_and_preprocess_data(filepath, window_size=2):
     df[columns_to_replace] = df[columns_to_replace].replace(0, pd.NA)
     df["Volume_Change"] = df["Volume"].pct_change()
 
-    df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=14)
-    df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=50)
+    df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=9)
+    df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=21)
     df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
     df['Aroon'] = talib.AROONOSC(df['High'], df['Low'], timeperiod=14)
 
@@ -59,6 +60,41 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['MACD'] = macd
     df['MACDSignal'] = macdsignal
     df['MACDHist'] = macdhist
+
+    df['PP'] = (df['High'].shift(1) + df['Low'].shift(1) + df['Close'].shift(1)) / 3
+    df['R1'] = 2 * df['PP'] - df['Low'].shift(1)
+    df['R2'] = df['PP'] + (df['High'].shift(1) - df['Low'].shift(1))
+    df['S1'] = 2 * df['PP'] - df['High'].shift(1)
+    df['S2'] = df['PP'] - (df['High'].shift(1) - df['Low'].shift(1))
+
+    #wave analysis
+    n = 1
+    df['Smoothed_Close'] = df['Close'].rolling(window=n).mean()
+    df['Highs'] = df['Smoothed_Close'][argrelextrema(df['Smoothed_Close'].values, np.greater_equal, order=n)[0]]
+    df['Lows'] = df['Smoothed_Close'][argrelextrema(df['Smoothed_Close'].values, np.less_equal, order=n)[0]]
+    df['Highs'] = df['Highs'].fillna(method='ffill')
+    df['Lows'] = df['Lows'].fillna(method='ffill')
+    df.dropna(inplace=True)
+
+    df['Wave_Amplitude'] = 0
+    df['Wave_Direction'] = 0
+
+    last_high, last_low = 0, 0
+    prev_high, prev_low = 0, 0
+
+    for i in range(len(df)):
+        idx = df.index[i]  #Get the actual index for the row
+        last_high = df.loc[idx, 'Highs']
+        last_low = df.loc[idx, 'Lows']
+        df.loc[idx, 'Wave_Amplitude'] = last_high - last_low
+
+        threshold = 0.00000001
+        if last_high > prev_high * (1 + threshold / 100):
+            df.loc[idx, 'Wave_Direction'] = -1
+        elif last_low < prev_low * (1 - threshold / 100):
+            df.loc[idx, 'Wave_Direction'] = 1
+
+        prev_high, prev_low = last_high, last_low
 
     df.dropna(inplace=True)
 
@@ -82,6 +118,13 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['MACD_Mean'] = df['MACD'].rolling(window=window_size).mean()
     df['MACDSignal_Mean'] = df['MACDSignal'].rolling(window=window_size).mean()
     df['MACDHist_Mean'] = df['MACDHist'].rolling(window=window_size).mean()
+    df['PP_Mean'] = df['PP'].rolling(window=window_size).mean()
+    df['S1_Mean'] = df['S1'].rolling(window=window_size).mean()
+    df['S2_Mean'] = df['S2'].rolling(window=window_size).mean()
+    df['R1_Mean'] = df['R1'].rolling(window=window_size).mean()
+    df['R2_Mean'] = df['R2'].rolling(window=window_size).mean()
+    df['Wave_Direction_Mean'] = df['Wave_Direction'].rolling(window=window_size).mean()
+    df['Wave_Amplitude_Mean'] = df['Wave_Amplitude'].rolling(window=window_size).mean()
 
     df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
     df['High_Dev'] = df['High'].rolling(window=window_size).std()
@@ -97,6 +140,13 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['MACD_Dev'] = df['MACD'].rolling(window=window_size).std()
     df['MACDSignal_Dev'] = df['MACDSignal'].rolling(window=window_size).std()
     df['MACDHist_Dev'] = df['MACDHist'].rolling(window=window_size).std()
+    df['PP_Dev'] = df['PP'].rolling(window=window_size).std()
+    df['S1_Dev'] = df['S1'].rolling(window=window_size).std()
+    df['S2_Dev'] = df['S2'].rolling(window=window_size).std()
+    df['R1_Dev'] = df['R1'].rolling(window=window_size).std()
+    df['R2_Dev'] = df['R2'].rolling(window=window_size).std()
+    df['Wave_Direction_Dev'] = df['Wave_Direction'].rolling(window=window_size).std()
+    df['Wave_Amplitude_Dev'] = df['Wave_Amplitude'].rolling(window=window_size).std()
 
     df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['High_Drawdown'] = (df['High'] / df['High'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
@@ -112,6 +162,13 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['MACD_Drawdown'] = (df['MACD'] / df['MACD'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['MACDSignal_Drawdown'] = (df['MACDSignal'] / df['MACDSignal'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['MACDHist_Drawdown'] = (df['MACDHist'] / df['MACDHist'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['PP_Drawdown'] = (df['PP'] / df['PP'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['S1_Drawdown'] = (df['S1'] / df['S1'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['S2_Drawdown'] = (df['S2'] / df['S2'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['R1_Drawdown'] = (df['R1'] / df['R1'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['R2_Drawdown'] = (df['R2'] / df['R2'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Direction_Drawdown'] = (df['Wave_Direction'] / df['Wave_Direction'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Wave_Amplitude_Drawdown'] = (df['Wave_Amplitude'] / df['Wave_Amplitude'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
 
     df.dropna(inplace=True)
 
@@ -129,7 +186,7 @@ def train_hmm(data, features, scaler, n_components=3):
     X_scaled = scaler.fit_transform(X)
 
     print("Fitting HMM model...")
-    model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=50000, random_state=42, verbose=True)
+    model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=500, random_state=42, verbose=True)
     model.fit(X_scaled)
 
     print("HMM training complete")
@@ -203,11 +260,11 @@ def plot_results_rf(data, labels_true, labels_pred):
     plt.savefig('plots/rf' + str(timestamp))
 
 def train_xgboost(data_train, labels_train, data_test, labels_test):
-    tscv = TimeSeriesSplit(n_splits=5)
+    tscv = TimeSeriesSplit(n_splits=20)
 
     pipeline = ImbPipeline(steps=[
         ('smote', SMOTE(random_state=42)),
-        ('xgb', XGBClassifier(random_state=42, eval_metric='mlogloss', early_stopping_rounds=25))
+        ('xgb', XGBClassifier(random_state=42, eval_metric='mlogloss', early_stopping_rounds=50))
     ])
 
     search_space = {
@@ -223,7 +280,7 @@ def train_xgboost(data_train, labels_train, data_test, labels_test):
         'xgb__n_estimators': Integer(100, 500),
         'xgb__min_child_weight': Integer(1, 15)
     }
-    opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=3, scoring='balanced_accuracy', random_state=42)
+    opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=50, scoring='balanced_accuracy', random_state=42)
 
     opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)])
     print("Best estimator: ", opt.best_estimator_)
@@ -236,10 +293,10 @@ def train_xgboost(data_train, labels_train, data_test, labels_test):
     print(labels_pred.count(1))
     print(labels_pred.count(2))
 
-    #xgboost_step = opt.best_estimator_.steps[1]
-    #xgboost_model = xgboost_step[1]
-    #plot_importance(xgboost_model)
-    #plt.show()
+    xgboost_step = opt.best_estimator_.steps[1]
+    xgboost_model = xgboost_step[1]
+    plot_importance(xgboost_model, max_num_features=50)
+    plt.show()
 
     #save the model
     filepath = "xgboost_pipeline.pkl"
@@ -312,8 +369,8 @@ def get_historical_data(count=1000):
 def calculate_indicators(df, window_size=2):
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
-    df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=14)
-    df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=50)
+    df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=9)
+    df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=21)
     df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
     df['Aroon'] = talib.AROONOSC(df['High'], df['Low'], timeperiod=14)
 
@@ -324,6 +381,12 @@ def calculate_indicators(df, window_size=2):
     df['MACD'] = macd
     df['MACDSignal'] = macdsignal
     df['MACDHist'] = macdhist
+
+    df['PP'] = (df['High'].shift(1) + df['Low'].shift(1) + df['Close'].shift(1)) / 3
+    df['R1'] = 2 * df['PP'] - df['Low'].shift(1)
+    df['R2'] = df['PP'] + (df['High'].shift(1) - df['Low'].shift(1))
+    df['S1'] = 2 * df['PP'] - df['High'].shift(1)
+    df['S2'] = df['PP'] - (df['High'].shift(1) - df['Low'].shift(1))
 
     # calculate aggregate features
     df['Close_Mean'] = df['Close'].rolling(window=window_size).mean()
@@ -454,14 +517,14 @@ def get_next_interval(interval_seconds):
     return next_interval - now
 
 print("Starting main execution...")
-window_size = 5
+window_size = 10
 data_train, data_eval, data_test = load_and_preprocess_data("btc_15m_data_2018_to_2024-2024-10-10_labeled.csv", window_size)
 scaler = StandardScaler()
-hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns"]
-xg_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "State", "Returns", "Label"]
-agg_features = ["Close_Mean", "High_Mean", "Low_Mean", "Open_Mean", "LOW_EMA_Mean", "HIGH_EMA_Mean", "RSI_Mean", "Aroon_Mean", "BB_Width_Mean", "MACD_Mean", "MACDSignal_Mean", "MACDHist_Mean", "Volatility_Mean", "Returns_Mean",
-                "Close_Dev", "High_Dev", "Low_Dev", "Open_Dev", "LOW_EMA_Dev", "HIGH_EMA_Dev", "RSI_Dev", "Aroon_Dev", "BB_Width_Dev", "MACD_Dev", "MACDSignal_Dev", "MACDHist_Dev", "Volatility_Dev", "Returns_Dev",
-                "Close_Drawdown", "High_Drawdown", "Low_Drawdown", "Open_Drawdown", "LOW_EMA_Drawdown", "HIGH_EMA_Drawdown", "RSI_Drawdown", "Aroon_Drawdown", "BB_Width_Drawdown", "MACD_Drawdown", "MACDSignal_Drawdown", "MACDHist_Drawdown", "Volatility_Drawdown", "Returns_Drawdown"]
+hmm_features = ["Close", "High", "Low", "Open", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns", "Wave_Direction", "Wave_Amplitude"]
+xg_features = ["Volatility", "Returns", "Wave_Direction", "Wave_Amplitude", "State", "MACD", "MACDHist", "MACDSignal", "Label"]
+agg_features = ["Wave_Direction_Mean", "Wave_Direction_Dev", "Wave_Direction_Drawdown", "Wave_Amplitude_Mean", "Wave_Amplitude_Dev", "Wave_Amplitude_Drawdown", "Returns_Mean", "Returns_Dev", "Returns_Drawdown",
+                "Volatility_Mean", "Volatility_Dev", "Volatility_Drawdown", "MACD_Mean", "MACD_Dev", "MACD_Drawdown", "MACDHist_Mean", "MACDHist_Dev", "MACDHist_Drawdown", "MACDSignal_Mean", "MACDSignal_Dev", "MACDSignal_Drawdown"]
+
 
 hmm_path = train_hmm(data_train, hmm_features, scaler, 8)
 hmm_model = load_hmm(hmm_path)
@@ -570,3 +633,19 @@ print(f"buy_sell accuracy: {buy_sell_accuracy}")
 #     time.sleep(180)
 #     recent_df = get_historical_data(54)
 
+#Best score:  0.3771637437817973
+#Best params:  OrderedDict([('xgb__colsample_bylevel', 0.7224162561505759), ('xgb__colsample_bynode', 0.9593612608346885), ('xgb__colsample_bytree', 0.5524295792763518), ('xgb__gamma', 4.333328018702252), ('xgb__learning_rate', 0.0036632415719891993), ('xgb__max_depth', 5), ('xgb__min_child_weight', 3), ('xgb__n_estimators', 401), ('xgb__reg_alpha', 5.573404230338014), ('xgb__reg_lambda', 9.732069776928888), ('xgb__subsample', 0.8517337655531521)])
+#0.3661007722809326
+#2944
+#9052
+#2153
+#buy_sell accuracy: 0.18407707910750506
+
+#Best score:  0.37683813238408403
+#Best params:  OrderedDict([('xgb__colsample_bylevel', 0.7224162561505759), ('xgb__colsample_bynode', 0.9593612608346885), ('xgb__colsample_bytree', 0.5524295792763518), ('xgb__gamma', 4.333328018702252), ('xgb__learning_rate', 0.0036632415719891993), ('xgb__max_depth', 5), ('xgb__min_child_weight', 3), ('xgb__n_estimators', 401), ('xgb__reg_alpha', 5.573404230338014), ('xgb__reg_lambda', 9.732069776928888), ('xgb__subsample', 0.8517337655531521)])
+#0.3611682106221572
+#2534
+#9654
+#1893
+#buy_sell accuracy: 0.1859656629405787
+#13
