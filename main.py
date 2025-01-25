@@ -21,8 +21,9 @@ import time
 import urllib.parse
 import hashlib
 import hmac
-from scipy.signal import argrelextrema
-import math
+import datetime
+import pywt
+from hurst import compute_Hc
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
@@ -37,8 +38,36 @@ def load_and_preprocess_data(filepath, window_size=2):
     #Drop useless row
     df = df.astype(float)
 
+    eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'Close'])
+    eth_df.drop(0, inplace=True)
+    eth_df = eth_df.astype(float)
+    eth_prices = eth_df['Close'].values
+    df['ETH_Close'] = eth_prices
+
+    days = []
+    sessions = []
+    for timestamp in df['Timestamp']:
+        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp)/1000)
+        days.append(utc_time.weekday())
+        hour = utc_time.hour
+        if 0 <= hour < 9:
+            session = 0
+        elif 7 <= hour < 16:
+            session = 1
+        elif 12 <= hour < 21:
+            session = 2
+        else:
+            session = 0
+        sessions.append(session)
+    df['Day'] = days
+    df['Session'] = sessions
+
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
+    df['ETH_Returns'] = df['ETH_Close'].pct_change()
+
+    df['BTC/ETH_Corr'] = df['Returns'].rolling(30).corr(df['ETH_Returns'])
+    df['BTC/ETH_Corr'] = df['BTC/ETH_Corr'].fillna(0)
 
     #Replaces 0's with a number close to 0 to avoid infinity being present in Volume_Change
     #Since the label column has 0's present, we need to make sure that they are not replaced
@@ -113,56 +142,129 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['KC_Lower'] = df['KC_Middle'] - df['ATR'] * 2
     df['KC_Width'] = df['KC_Upper'] - df['KC_Lower']
 
-    # Wave analysis
-    n = 2
-    df['Smoothed_Close'] = df['Close'].rolling(window=n).mean()
+    #max/min points
+    close = df['Close'].values
+    length = len(close)
+    slope = (talib.EMA(close, timeperiod=50) - talib.EMA(close, timeperiod=10)).tolist()
+    extrema_unconfirmed = [0] * length
 
-    max_indices = argrelextrema(df['Smoothed_Close'].values, np.greater_equal, order=n)[0]
-    min_indices = argrelextrema(df['Smoothed_Close'].values, np.less_equal, order=n)[0]
+    for i in range(1, length - 1):
+        if slope[i] < 0 and slope[i - 1] >= 0:
+            extrema_unconfirmed[i] = -1
+        if slope[i] > 0 and slope[i - 1] <= 0:
+            extrema_unconfirmed[i] = 1
 
-    df['Wave_Amplitude'] = 0
-    df['Wave_Direction'] = 0
-    df['Wave_Length_Bars'] = 0
+    df['Extrema_Unconfirmed'] = extrema_unconfirmed
 
-    last_peak_idx = 0
-    last_trough_idx = 0
+    df['Confirmed_Fractal_Peak'] = (
+            (df['Close'] > df['Close'].shift(1)) &
+            (df['Close'] > df['Close'].shift(2)) &
+            (df['Close'] > df['Close'].shift(-1)) &
+            (df['Close'] > df['Close'].shift(-2))
+    )
+    df['Confirmed_Fractal_Trough'] = (
+            (df['Close'] < df['Close'].shift(1)) &
+            (df['Close'] < df['Close'].shift(2)) &
+            (df['Close'] < df['Close'].shift(-1)) &
+            (df['Close'] < df['Close'].shift(-2))
+    )
+    df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].astype(int)
+    df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].astype(int)
+    df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].shift(2)
+    df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].shift(2)
+    df['Price_Diff'] = df['Close'].diff()
 
-    for i in range(len(df)):
-        idx = df.index[i]
-        current_close = df['Smoothed_Close'].iloc[i]
+    #Candlestick patterns
+    df['Body_Size'] = abs(df['Close'] - df['Open'])
+    df['Upper_Wick'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+    df['Lower_Wick'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+    df['Range'] = df['High'] - df['Low']
 
-        if last_trough_idx >= last_peak_idx:  # need this extra condition to make sure the amplitude and length are not overwritten by the peak code block (seperating peaks/troughs)
-            trough_close = df['Smoothed_Close'].iloc[last_trough_idx]
-            df.loc[idx, 'Wave_Amplitude'] = current_close - trough_close
+    #Add small number to avoid division by zero
+    df['Body_Ratio'] = df['Body_Size'] / (df['Range'] + 1e-9)
+    df['Upper_Wick_Ratio'] = df['Upper_Wick'] / (df['Range'] + 1e-9)
+    df['Lower_Wick_Ratio'] = df['Lower_Wick'] / (df['Range'] + 1e-9)
 
-            bars_length = i - last_trough_idx
-            df.loc[idx, 'Wave_Length_Bars'] = bars_length
+    df['Two_Crows'] = talib.CDL2CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Inside'] = talib.CDL3INSIDE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Strike'] = talib.CDL3LINESTRIKE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Outside'] = talib.CDL3OUTSIDE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Stars_South'] = talib.CDL3STARSINSOUTH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Soldiers'] = talib.CDL3WHITESOLDIERS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Abandoned_Baby'] = talib.CDLABANDONEDBABY(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Advance_Block'] = talib.CDLADVANCEBLOCK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Belt_Hold'] = talib.CDLBELTHOLD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Breakaway'] = talib.CDLBREAKAWAY(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Closing_Marubozu'] = talib.CDLCLOSINGMARUBOZU(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Baby_Swallow'] = talib.CDLCONCEALBABYSWALL(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Counterattack'] = talib.CDLCOUNTERATTACK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Dark_Cloud'] = talib.CDLDARKCLOUDCOVER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Doji'] = talib.CDLDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Doji_Star'] = talib.CDLDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Dragonfly_Doji'] = talib.CDLDRAGONFLYDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Engulfing'] = talib.CDLENGULFING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Evening_Doji'] = talib.CDLEVENINGDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Evening_Star'] = talib.CDLEVENINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Up_Down_Gap'] = talib.CDLGAPSIDESIDEWHITE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Gravestone_Doji'] = talib.CDLGRAVESTONEDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hammer'] = talib.CDLHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hanging_Man'] = talib.CDLHANGINGMAN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Harami'] = talib.CDLHARAMI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Harami_Cross'] = talib.CDLHARAMICROSS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['High_Wave'] = talib.CDLHIGHWAVE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hikkake'] = talib.CDLHIKKAKE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Modified_Hikkake'] = talib.CDLHIKKAKEMOD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Homing_Pigeon'] = talib.CDLHOMINGPIGEON(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Identical_Crows'] = talib.CDLIDENTICAL3CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['In_Neck'] = talib.CDLINNECK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Inverted_Hammer'] = talib.CDLINVERTEDHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Kicking'] = talib.CDLKICKING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Kicking_Length'] = talib.CDLKICKINGBYLENGTH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Ladder_Bottom'] = talib.CDLLADDERBOTTOM(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Long_Doji'] = talib.CDLLONGLEGGEDDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Long_Candle'] = talib.CDLLONGLINE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Marubozu'] = talib.CDLMARUBOZU(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Matching_Low'] = talib.CDLMATCHINGLOW(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Mat_Hold'] = talib.CDLMATHOLD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Morning_Doji'] = talib.CDLMORNINGDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Morning_Star'] = talib.CDLMORNINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['On_Neck'] = talib.CDLONNECK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Piercing'] = talib.CDLPIERCING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Rickshaw_Man'] = talib.CDLRICKSHAWMAN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Rising_Falling'] = talib.CDLRISEFALL3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Separating_Lines'] = talib.CDLSEPARATINGLINES(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Shooting_Star'] = talib.CDLSHOOTINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Short_Candle'] = talib.CDLSHORTLINE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Spinning_Top'] = talib.CDLSPINNINGTOP(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Stalled'] = talib.CDLSTALLEDPATTERN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Stick_Sandwich'] = talib.CDLSTICKSANDWICH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Takuri'] = talib.CDLTAKURI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Tasuki_Gap'] = talib.CDLTASUKIGAP(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Thrusting'] = talib.CDLTHRUSTING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Tristar'] = talib.CDLTRISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Unique_River'] = talib.CDLUNIQUE3RIVER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Upside_Gap_Crows'] = talib.CDLUPSIDEGAP2CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
 
-        if last_peak_idx >= last_trough_idx:
-            peak_close = df['Smoothed_Close'].iloc[last_peak_idx]
-            df.loc[idx, 'Wave_Amplitude'] = peak_close - current_close
+    #Calculate correlations
+    df['Close_Corr1'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
+    df['Returns_Corr1'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
+    df['Close_Corr2'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
+    df['Returns_Corr2'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
+    df['Close_Corr3'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
+    df['Returns_Corr3'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
 
-            bars_length = i - last_peak_idx
-            df.loc[idx, 'Wave_Length_Bars'] = bars_length
+    #Calculate wavelet transforms
+    df[['Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3']] = rolling_wavelet(df['Close'])
+    df[['Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2', 'Wavelet_Volume_Coef3']] = rolling_wavelet(df['Volume'])
+    df[['Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1', 'Wavelet_Returns_Coef2','Wavelet_Returns_Coef3']] = rolling_wavelet(df['Returns'])
+    df[['Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2','Wavelet_Volatility_Coef3']] = rolling_wavelet(df['Volatility'])
 
-        if i in max_indices:
-            df.loc[idx, 'Wave_Direction'] = -1
-            last_peak_idx = i
-
-        if i in min_indices:
-            df.loc[idx, 'Wave_Direction'] = 1
-            last_trough_idx = i
-
-    # calculate extra wave features
-    df['Wave_Velocity'] = df['Wave_Amplitude'] / (df['Wave_Length_Bars'] * 15) #need the *15 because these features require the time from the last peak/trough
-    df['Wave_Frequency'] = 1 / (df['Wave_Length_Bars'] * 15)
-    df['Wave_Sharpness'] = df['Wave_Amplitude'] / ((df['Wave_Length_Bars'] * 15) ** 2)
-    df['Wave_Slope'] = df['Wave_Amplitude'] / df['Wave_Length_Bars']
-    df['Wave_Energy'] = df['Wave_Amplitude'] ** 2
-    df['Wave_Acceleration'] = df['Wave_Slope'].diff() / df['Wave_Length_Bars']
-    df['Wave_Strength'] = df['Wave_Slope'] * df['Wave_Direction']
-    df['Normalized_Amplitude'] = df['Wave_Amplitude'] / df['Wave_Amplitude'].rolling(window=window_size).mean()
-    df['Normalized_Slope'] = df['Wave_Slope'] / df['Wave_Slope'].rolling(window=window_size).mean()
+    #Fractal Dimension
+    df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
+    df['Fractal_Dimension'] = 2 - df['Hurst']
 
     #calculate interaction features
     df['Volume-ATR'] = df['Volume'] / df['ATR']
@@ -220,15 +322,6 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['KC_Upper_Mean'] = df['KC_Upper'].rolling(window=window_size).mean()
     df['KC_Middle_Mean'] = df['KC_Middle'].rolling(window=window_size).mean()
     df['KC_Lower_Mean'] = df['KC_Lower'].rolling(window=window_size).mean()
-    df['Wave_Direction_Mean'] = df['Wave_Direction'].rolling(window=window_size).mean()
-    df['Wave_Amplitude_Mean'] = df['Wave_Amplitude'].rolling(window=window_size).mean()
-    df['Wave_Velocity_Mean'] = df['Wave_Velocity'].rolling(window=window_size).mean()
-    df['Wave_Frequency_Mean'] = df['Wave_Frequency'].rolling(window=window_size).mean()
-    df['Wave_Sharpness_Mean'] = df['Wave_Sharpness'].rolling(window=window_size).mean()
-    df['Wave_Slope_Mean'] = df['Wave_Slope'].rolling(window=window_size).mean()
-    df['Wave_Energy_Mean'] = df['Wave_Energy'].rolling(window=window_size).mean()
-    df['Wave_Acceleration_Mean'] = df['Wave_Acceleration'].rolling(window=window_size).mean()
-    df['Wave_Strength_Mean'] = df['Wave_Strength'].rolling(window=window_size).mean()
     df['Volume-ATR_Mean'] = df['Volume-ATR'].rolling(window=window_size).mean()
     df['VWAP-ATR_Mean'] = df['VWAP-ATR'].rolling(window=window_size).mean()
     df['RSI-MACD_Mean'] = df['RSI-MACD'].rolling(window=window_size).mean()
@@ -236,6 +329,19 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['BB-KC_Mean'] = df['BB-KC'].rolling(window=window_size).mean()
     df['Ichimoku_Overlap_Mean'] = df['Ichimoku_Overlap'].rolling(window=window_size).mean()
     df['LOW-HIGH_EMA_Mean'] = df['LOW-HIGH_EMA'].rolling(window=window_size).mean()
+    df['Extrema_Unconfirmed_Mean'] = df['Extrema_Unconfirmed'].rolling(window=window_size).mean()
+    df['Confirmed_Fractal_Peak_Mean'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).mean()
+    df['Confirmed_Fractal_Trough_Mean'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).mean()
+    df['Body_Size_Mean'] = df['Body_Size'].rolling(window=window_size).mean()
+    df['Upper_Wick_Mean'] = df['Upper_Wick'].rolling(window=window_size).mean()
+    df['Lower_Wick_Mean'] = df['Lower_Wick'].rolling(window=window_size).mean()
+    df['Range_Mean'] = df['Range'].rolling(window=window_size).mean()
+    df['Body_Ratio_Mean'] = df['Body_Ratio'].rolling(window=window_size).mean()
+    df['Upper_Wick_Ratio_Mean'] = df['Upper_Wick_Ratio'].rolling(window=window_size).mean()
+    df['Lower_Wick_Ratio_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
+    df['Price_Diff_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
+    df['BTC/ETH_Corr_Mean'] = df['BTC/ETH_Corr'].rolling(window=window_size).mean()
+    df['Fractal_Dimension_Mean'] = df['Fractal_Dimension'].rolling(window=window_size).mean()
 
     df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
     df['High_Dev'] = df['High'].rolling(window=window_size).std()
@@ -280,15 +386,6 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['KC_Upper_Dev'] = df['KC_Upper'].rolling(window=window_size).std()
     df['KC_Middle_Dev'] = df['KC_Middle'].rolling(window=window_size).std()
     df['KC_Lower_Dev'] = df['KC_Lower'].rolling(window=window_size).std()
-    df['Wave_Direction_Dev'] = df['Wave_Direction'].rolling(window=window_size).std()
-    df['Wave_Amplitude_Dev'] = df['Wave_Amplitude'].rolling(window=window_size).std()
-    df['Wave_Velocity_Dev'] = df['Wave_Velocity'].rolling(window=window_size).std()
-    df['Wave_Frequency_Dev'] = df['Wave_Frequency'].rolling(window=window_size).std()
-    df['Wave_Sharpness_Dev'] = df['Wave_Sharpness'].rolling(window=window_size).std()
-    df['Wave_Slope_Dev'] = df['Wave_Slope'].rolling(window=window_size).std()
-    df['Wave_Energy_Dev'] = df['Wave_Energy'].rolling(window=window_size).std()
-    df['Wave_Acceleration_Dev'] = df['Wave_Acceleration'].rolling(window=window_size).std()
-    df['Wave_Strength_Dev'] = df['Wave_Strength'].rolling(window=window_size).std()
     df['Volume-ATR_Dev'] = df['Volume-ATR'].rolling(window=window_size).std()
     df['VWAP-ATR_Dev'] = df['VWAP-ATR'].rolling(window=window_size).std()
     df['RSI-MACD_Dev'] = df['RSI-MACD'].rolling(window=window_size).std()
@@ -296,6 +393,19 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['BB-KC_Dev'] = df['BB-KC'].rolling(window=window_size).std()
     df['Ichimoku_Overlap_Dev'] = df['Ichimoku_Overlap'].rolling(window=window_size).std()
     df['LOW-HIGH_EMA_Dev'] = df['LOW-HIGH_EMA'].rolling(window=window_size).std()
+    df['Extrema_Unconfirmed_Dev'] = df['Extrema_Unconfirmed'].rolling(window=window_size).std()
+    df['Confirmed_Fractal_Peak_Dev'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).std()
+    df['Confirmed_Fractal_Trough_Dev'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).std()
+    df['Body_Size_Dev'] = df['Body_Size'].rolling(window=window_size).std()
+    df['Upper_Wick_Dev'] = df['Upper_Wick'].rolling(window=window_size).std()
+    df['Lower_Wick_Dev'] = df['Lower_Wick'].rolling(window=window_size).std()
+    df['Range_Dev'] = df['Range'].rolling(window=window_size).std()
+    df['Body_Ratio_Dev'] = df['Body_Ratio'].rolling(window=window_size).std()
+    df['Upper_Wick_Ratio_Dev'] = df['Upper_Wick_Ratio'].rolling(window=window_size).std()
+    df['Lower_Wick_Ratio_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
+    df['Price_Diff_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
+    df['BTC/ETH_Corr_Dev'] = df['BTC/ETH_Corr'].rolling(window=window_size).std()
+    df['Fractal_Dimension_Dev'] = df['Fractal_Dimension'].rolling(window=window_size).std()
 
     df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['High_Drawdown'] = (df['High'] / df['High'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
@@ -340,18 +450,47 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['RSI-MACD_Drawdown'] = (df['RSI-MACD'] / df['RSI-MACD'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['BB-KC_Drawdown'] = (df['BB-KC'] / df['BB-KC'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
     df['LOW-HIGH_EMA_Drawdown'] = (df['LOW-HIGH_EMA'] / df['LOW-HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Body_Size_Drawdown'] = (df['Body_Size'] / df['Body_Size'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Range_Drawdown'] = (df['Range'] / df['Range'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Body_Ratio_Drawdown'] = (df['Body_Ratio'] / df['Body_Ratio'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Price_Diff_Drawdown'] = (df['Price_Diff'] / df['Price_Diff'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['BTC/ETH_Corr_Drawdown'] = (df['BTC/ETH_Corr'] / df['BTC/ETH_Corr'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df['Fractal_Dimension_Drawdown'] = (df['Fractal_Dimension'] / df['Fractal_Dimension'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
 
     df['Fast_%K_Drawdown'] = df['Fast_%K_Drawdown'].fillna(0)
+    df['CCI_Drawdown'] = df['CCI_Drawdown'].fillna(0)
+    df['Range_Drawdown'] = df['Range_Drawdown'].fillna(0)
+    df['Body_Ratio_Drawdown'] = df['Body_Ratio_Drawdown'].fillna(0)
+    df['Body_Size_Drawdown'] = df['Body_Size_Drawdown'].fillna(0)
+    df['Price_Diff_Drawdown'] = df['Price_Diff_Drawdown'].fillna(0)
+    df['BTC/ETH_Corr_Drawdown'] = df['BTC/ETH_Corr_Drawdown'].fillna(0)
+
+    print(df[df.isna().any(axis=1)])
 
     df.dropna(inplace=True)
     #defragmenting dataframe
     df = df.copy()
 
-    training_df = df[(df.index >= 68797)] #January 1st 2023 12am
-    eval_df = df[((df.index >= 33757) & (df.index <= 48249))] #January 1st 2022 12am to June 1st 2022 12am
+    training_df = df[(df.index >= 35805)] #January 1st 2023 12am #765
+    eval_df = df[((df.index >= 765) & (df.index <= 15261))] #January 1st 2022 12am to June 1st 2022 12am
     out_of_training_df = df[((df.index >= 48250) & (df.index <= 68796))] #June 1st 2022 12:15am to January 1st 2023 12:15am
 
     return training_df, eval_df, out_of_training_df
+
+def rolling_wavelet(series, window_size=128, wavelet='db4', level=3):
+    wavelet_features = []
+
+    for i in range(window_size, len(series)):
+        window_data = series.iloc[i-window_size:i]
+        coeffs = pywt.wavedec(window_data.values, wavelet=wavelet, level=level)
+
+        # Example: Use the standard deviation of the approximation and detail coefficients
+        features = [np.std(coeff) for coeff in coeffs]
+        wavelet_features.append(features)
+
+    wavelet_features = pd.DataFrame(wavelet_features, columns=[f"Wavelet_Coeff_{i}" for i in range(len(coeffs))])
+    wavelet_features.index = series.index[window_size:]
+    return wavelet_features
 
 def train_hmm(data, features, scaler, n_components=3):
     print(f"Training HMM with {n_components} components...")
@@ -445,7 +584,7 @@ def train_xgboost(data_train, labels_train, data_test, labels_test, splits, iter
     search_space = {
         'xgb__max_depth': Integer(1, 6),
         'xgb__learning_rate': Real(0.001, 1.0, prior='log-uniform'),
-        'xgb__subsample': Real(0.3, 1.0),
+        'xgb__subsample': Real(0.15, 1.0),
         'xgb__colsample_bytree': Real(0.5, 1.0),
         'xgb__colsample_bylevel': Real(0.5, 1.0),
         'xgb__colsample_bynode': Real(0.5, 1.0),
@@ -561,11 +700,46 @@ def get_historical_data(start_time, end_time):
     return combined_df
 
 def calculate_indicators(df, window_size=2):
+    eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'Close'])
+    eth_df.drop(0, inplace=True)
+    eth_df = eth_df.astype(float)
+    eth_prices = eth_df['Close'].values
+    df['ETH_Close'] = eth_prices
+
+    days = []
+    sessions = []
+    for timestamp in df['Timestamp']:
+        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
+        days.append(utc_time.weekday())
+        hour = utc_time.hour
+        if 0 <= hour < 9:
+            session = 0
+        elif 7 <= hour < 16:
+            session = 1
+        elif 12 <= hour < 21:
+            session = 2
+        else:
+            session = 0
+        sessions.append(session)
+    df['Day'] = days
+    df['Session'] = sessions
+
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
+    df['ETH_Returns'] = df['ETH_Close'].pct_change()
 
-    df["Volume"] = df["Volume"].replace(0, 0.00000000000000001)
+    df['BTC/ETH_Corr'] = df['Returns'].rolling(30).corr(df['ETH_Returns'])
+    df['BTC/ETH_Corr'] = df['BTC/ETH_Corr'].fillna(0)
+
+    # Replaces 0's with a number close to 0 to avoid infinity being present in Volume_Change
+    # Since the label column has 0's present, we need to make sure that they are not replaced
+    df['Volume'] = df['Volume'].replace(0, 0.00000000000000001)
     df["Volume_Change"] = df["Volume"].pct_change()
+
+    # Need this because there was a weird error were the data in these columns were not classified as floats, this caused a problem with the pipeline as I'm not using a target encoder
+    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+    df['Returns'] = pd.to_numeric(df['Returns'], errors='coerce')
+
     df['OBV'] = talib.OBV(df['Close'], df['Volume'])
 
     df['MFV'] = (((df['Close'] - df['Low']) - (df['High'] - df['Close']) / (df['High'] - df['Low'])) * df['Volume'])
@@ -582,6 +756,7 @@ def calculate_indicators(df, window_size=2):
         df.loc[i, 'CumulativeVolume'] = new_volume
         if i % 97 == 0:  # reset the cumulative volume everyday
             df.loc[i, 'CumulativeVolume'] = df.loc[i, 'Volume']
+
     df['VWAP'] = (((df['High'] + df['Low'] + df['Close']) / 3) * df['Volume']) / df['CumulativeVolume']
 
     df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=9)
@@ -629,6 +804,134 @@ def calculate_indicators(df, window_size=2):
     df['KC_Lower'] = df['KC_Middle'] - df['ATR'] * 2
     df['KC_Width'] = df['KC_Upper'] - df['KC_Lower']
 
+    # max/min points
+    close = df['Close'].values
+    length = len(close)
+    slope = (talib.EMA(close, timeperiod=50) - talib.EMA(close, timeperiod=10)).tolist()
+    extrema_unconfirmed = [0] * length
+
+    for i in range(1, length - 1):
+        if slope[i] < 0 and slope[i - 1] >= 0:
+            extrema_unconfirmed[i] = -1
+        if slope[i] > 0 and slope[i - 1] <= 0:
+            extrema_unconfirmed[i] = 1
+
+    df['Extrema_Unconfirmed'] = extrema_unconfirmed
+
+    df['Confirmed_Fractal_Peak'] = (
+            (df['Close'] > df['Close'].shift(1)) &
+            (df['Close'] > df['Close'].shift(2)) &
+            (df['Close'] > df['Close'].shift(-1)) &
+            (df['Close'] > df['Close'].shift(-2))
+    )
+    df['Confirmed_Fractal_Trough'] = (
+            (df['Close'] < df['Close'].shift(1)) &
+            (df['Close'] < df['Close'].shift(2)) &
+            (df['Close'] < df['Close'].shift(-1)) &
+            (df['Close'] < df['Close'].shift(-2))
+    )
+    df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].astype(int)
+    df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].astype(int)
+    df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].shift(2)
+    df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].shift(2)
+    df['Price_Diff'] = df['Close'].diff()
+
+    # Candlestick patterns
+    df['Body_Size'] = abs(df['Close'] - df['Open'])
+    df['Upper_Wick'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+    df['Lower_Wick'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+    df['Range'] = df['High'] - df['Low']
+
+    # Add small number to avoid division by zero
+    df['Body_Ratio'] = df['Body_Size'] / (df['Range'] + 1e-9)
+    df['Upper_Wick_Ratio'] = df['Upper_Wick'] / (df['Range'] + 1e-9)
+    df['Lower_Wick_Ratio'] = df['Lower_Wick'] / (df['Range'] + 1e-9)
+
+    df['Two_Crows'] = talib.CDL2CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Inside'] = talib.CDL3INSIDE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Strike'] = talib.CDL3LINESTRIKE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Outside'] = talib.CDL3OUTSIDE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Stars_South'] = talib.CDL3STARSINSOUTH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Soldiers'] = talib.CDL3WHITESOLDIERS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Abandoned_Baby'] = talib.CDLABANDONEDBABY(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Advance_Block'] = talib.CDLADVANCEBLOCK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Belt_Hold'] = talib.CDLBELTHOLD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Breakaway'] = talib.CDLBREAKAWAY(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Closing_Marubozu'] = talib.CDLCLOSINGMARUBOZU(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Baby_Swallow'] = talib.CDLCONCEALBABYSWALL(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Counterattack'] = talib.CDLCOUNTERATTACK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Dark_Cloud'] = talib.CDLDARKCLOUDCOVER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Doji'] = talib.CDLDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Doji_Star'] = talib.CDLDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Dragonfly_Doji'] = talib.CDLDRAGONFLYDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Engulfing'] = talib.CDLENGULFING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Evening_Doji'] = talib.CDLEVENINGDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Evening_Star'] = talib.CDLEVENINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Up_Down_Gap'] = talib.CDLGAPSIDESIDEWHITE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Gravestone_Doji'] = talib.CDLGRAVESTONEDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hammer'] = talib.CDLHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hanging_Man'] = talib.CDLHANGINGMAN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Harami'] = talib.CDLHARAMI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Harami_Cross'] = talib.CDLHARAMICROSS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['High_Wave'] = talib.CDLHIGHWAVE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hikkake'] = talib.CDLHIKKAKE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Modified_Hikkake'] = talib.CDLHIKKAKEMOD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Homing_Pigeon'] = talib.CDLHOMINGPIGEON(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Identical_Crows'] = talib.CDLIDENTICAL3CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['In_Neck'] = talib.CDLINNECK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Inverted_Hammer'] = talib.CDLINVERTEDHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Kicking'] = talib.CDLKICKING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Kicking_Length'] = talib.CDLKICKINGBYLENGTH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Ladder_Bottom'] = talib.CDLLADDERBOTTOM(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Long_Doji'] = talib.CDLLONGLEGGEDDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Long_Candle'] = talib.CDLLONGLINE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Marubozu'] = talib.CDLMARUBOZU(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Matching_Low'] = talib.CDLMATCHINGLOW(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Mat_Hold'] = talib.CDLMATHOLD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Morning_Doji'] = talib.CDLMORNINGDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Morning_Star'] = talib.CDLMORNINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['On_Neck'] = talib.CDLONNECK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Piercing'] = talib.CDLPIERCING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Rickshaw_Man'] = talib.CDLRICKSHAWMAN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Rising_Falling'] = talib.CDLRISEFALL3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Separating_Lines'] = talib.CDLSEPARATINGLINES(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Shooting_Star'] = talib.CDLSHOOTINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Short_Candle'] = talib.CDLSHORTLINE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Spinning_Top'] = talib.CDLSPINNINGTOP(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Stalled'] = talib.CDLSTALLEDPATTERN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Stick_Sandwich'] = talib.CDLSTICKSANDWICH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Takuri'] = talib.CDLTAKURI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Tasuki_Gap'] = talib.CDLTASUKIGAP(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Thrusting'] = talib.CDLTHRUSTING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Tristar'] = talib.CDLTRISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Unique_River'] = talib.CDLUNIQUE3RIVER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Upside_Gap_Crows'] = talib.CDLUPSIDEGAP2CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
+
+    # Calculate correlations
+    df['Close_Corr1'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
+    df['Returns_Corr1'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
+    df['Close_Corr2'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
+    df['Returns_Corr2'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
+    df['Close_Corr3'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
+    df['Returns_Corr3'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
+
+    # Calculate wavelet transforms
+    df[['Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3']] = rolling_wavelet(
+        df['Close'])
+    df[['Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2',
+        'Wavelet_Volume_Coef3']] = rolling_wavelet(df['Volume'])
+    df[['Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1', 'Wavelet_Returns_Coef2',
+        'Wavelet_Returns_Coef3']] = rolling_wavelet(df['Returns'])
+    df[['Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2',
+        'Wavelet_Volatility_Coef3']] = rolling_wavelet(df['Volatility'])
+
+    # Fractal Dimension
+    df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
+    df['Fractal_Dimension'] = 2 - df['Hurst']
+
     # calculate interaction features
     df['Volume-ATR'] = df['Volume'] / df['ATR']
     df['VWAP-ATR'] = (df['Close'] - df['VWAP']) / df['ATR']
@@ -641,58 +944,6 @@ def calculate_indicators(df, window_size=2):
     df.replace([np.inf, -np.inf], 0, inplace=True)
     df.dropna(inplace=True)
 
-    # Wave analysis
-    n = 2
-    df['Smoothed_Close'] = df['Close'].rolling(window=n).mean()
-
-    max_indices = argrelextrema(df['Smoothed_Close'].values, np.greater_equal, order=n)[0]
-    min_indices = argrelextrema(df['Smoothed_Close'].values, np.less_equal, order=n)[0]
-
-    df['Wave_Amplitude'] = 0
-    df['Wave_Direction'] = 0
-    df['Wave_Length_Bars'] = 0
-
-    last_peak_idx = 0
-    last_trough_idx = 0
-
-    for i in range(len(df)):
-        idx = df.index[i]
-        current_close = df['Smoothed_Close'].iloc[i]
-
-        if last_trough_idx >= last_peak_idx:  # need this extra condition to make sure the amplitude and length are not overwritten by the peak code block (seperating peaks/troughs)
-            trough_close = df['Smoothed_Close'].iloc[last_trough_idx]
-            df.loc[idx, 'Wave_Amplitude'] = current_close - trough_close
-
-            bars_length = i - last_trough_idx
-            df.loc[idx, 'Wave_Length_Bars'] = bars_length
-
-        if last_peak_idx >= last_trough_idx:
-            peak_close = df['Smoothed_Close'].iloc[last_peak_idx]
-            df.loc[idx, 'Wave_Amplitude'] = peak_close - current_close
-
-            bars_length = i - last_peak_idx
-            df.loc[idx, 'Wave_Length_Bars'] = bars_length
-
-        if i in max_indices:
-            df.loc[idx, 'Wave_Direction'] = -1
-            last_peak_idx = i
-
-        if i in min_indices:
-            df.loc[idx, 'Wave_Direction'] = 1
-            last_trough_idx = i
-
-    # calculate extra wave features
-    df['Wave_Velocity'] = df['Wave_Amplitude'] / (df['Wave_Length_Bars'] * 15)  # need the *15 because these features require the time from the last peak/trough
-    df['Wave_Frequency'] = 1 / (df['Wave_Length_Bars'] * 15)
-    df['Wave_Sharpness'] = df['Wave_Amplitude'] / ((df['Wave_Length_Bars'] * 15) ** 2)
-    df['Wave_Slope'] = df['Wave_Amplitude'] / df['Wave_Length_Bars']
-    df['Wave_Energy'] = df['Wave_Amplitude'] ** 2
-    df['Wave_Acceleration'] = df['Wave_Slope'].diff() / df['Wave_Length_Bars']
-    df['Wave_Strength'] = df['Wave_Slope'] * df['Wave_Direction']
-    df['Normalized_Amplitude'] = df['Wave_Amplitude'] / df['Wave_Amplitude'].rolling(window=window_size).mean()
-    df['Normalized_Slope'] = df['Wave_Slope'] / df['Wave_Slope'].rolling(window=window_size).mean()
-
-    #df.dropna(subset=['Smoothed_Close'], inplace=True)
     # calculate aggregate features
     df['Close_Mean'] = df['Close'].rolling(window=window_size).mean()
     df['High_Mean'] = df['High'].rolling(window=window_size).mean()
@@ -737,15 +988,6 @@ def calculate_indicators(df, window_size=2):
     df['KC_Upper_Mean'] = df['KC_Upper'].rolling(window=window_size).mean()
     df['KC_Middle_Mean'] = df['KC_Middle'].rolling(window=window_size).mean()
     df['KC_Lower_Mean'] = df['KC_Lower'].rolling(window=window_size).mean()
-    df['Wave_Direction_Mean'] = df['Wave_Direction'].rolling(window=window_size).mean()
-    df['Wave_Amplitude_Mean'] = df['Wave_Amplitude'].rolling(window=window_size).mean()
-    df['Wave_Velocity_Mean'] = df['Wave_Velocity'].rolling(window=window_size).mean()
-    df['Wave_Frequency_Mean'] = df['Wave_Frequency'].rolling(window=window_size).mean()
-    df['Wave_Sharpness_Mean'] = df['Wave_Sharpness'].rolling(window=window_size).mean()
-    df['Wave_Slope_Mean'] = df['Wave_Slope'].rolling(window=window_size).mean()
-    df['Wave_Energy_Mean'] = df['Wave_Energy'].rolling(window=window_size).mean()
-    df['Wave_Acceleration_Mean'] = df['Wave_Acceleration'].rolling(window=window_size).mean()
-    df['Wave_Strength_Mean'] = df['Wave_Strength'].rolling(window=window_size).mean()
     df['Volume-ATR_Mean'] = df['Volume-ATR'].rolling(window=window_size).mean()
     df['VWAP-ATR_Mean'] = df['VWAP-ATR'].rolling(window=window_size).mean()
     df['RSI-MACD_Mean'] = df['RSI-MACD'].rolling(window=window_size).mean()
@@ -753,6 +995,19 @@ def calculate_indicators(df, window_size=2):
     df['BB-KC_Mean'] = df['BB-KC'].rolling(window=window_size).mean()
     df['Ichimoku_Overlap_Mean'] = df['Ichimoku_Overlap'].rolling(window=window_size).mean()
     df['LOW-HIGH_EMA_Mean'] = df['LOW-HIGH_EMA'].rolling(window=window_size).mean()
+    df['Extrema_Unconfirmed_Mean'] = df['Extrema_Unconfirmed'].rolling(window=window_size).mean()
+    df['Confirmed_Fractal_Peak_Mean'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).mean()
+    df['Confirmed_Fractal_Trough_Mean'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).mean()
+    df['Body_Size_Mean'] = df['Body_Size'].rolling(window=window_size).mean()
+    df['Upper_Wick_Mean'] = df['Upper_Wick'].rolling(window=window_size).mean()
+    df['Lower_Wick_Mean'] = df['Lower_Wick'].rolling(window=window_size).mean()
+    df['Range_Mean'] = df['Range'].rolling(window=window_size).mean()
+    df['Body_Ratio_Mean'] = df['Body_Ratio'].rolling(window=window_size).mean()
+    df['Upper_Wick_Ratio_Mean'] = df['Upper_Wick_Ratio'].rolling(window=window_size).mean()
+    df['Lower_Wick_Ratio_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
+    df['Price_Diff_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
+    df['BTC/ETH_Corr_Mean'] = df['BTC/ETH_Corr'].rolling(window=window_size).mean()
+    df['Fractal_Dimension_Mean'] = df['Fractal_Dimension'].rolling(window=window_size).mean()
 
     df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
     df['High_Dev'] = df['High'].rolling(window=window_size).std()
@@ -797,15 +1052,6 @@ def calculate_indicators(df, window_size=2):
     df['KC_Upper_Dev'] = df['KC_Upper'].rolling(window=window_size).std()
     df['KC_Middle_Dev'] = df['KC_Middle'].rolling(window=window_size).std()
     df['KC_Lower_Dev'] = df['KC_Lower'].rolling(window=window_size).std()
-    df['Wave_Direction_Dev'] = df['Wave_Direction'].rolling(window=window_size).std()
-    df['Wave_Amplitude_Dev'] = df['Wave_Amplitude'].rolling(window=window_size).std()
-    df['Wave_Velocity_Dev'] = df['Wave_Velocity'].rolling(window=window_size).std()
-    df['Wave_Frequency_Dev'] = df['Wave_Frequency'].rolling(window=window_size).std()
-    df['Wave_Sharpness_Dev'] = df['Wave_Sharpness'].rolling(window=window_size).std()
-    df['Wave_Slope_Dev'] = df['Wave_Slope'].rolling(window=window_size).std()
-    df['Wave_Energy_Dev'] = df['Wave_Energy'].rolling(window=window_size).std()
-    df['Wave_Acceleration_Dev'] = df['Wave_Acceleration'].rolling(window=window_size).std()
-    df['Wave_Strength_Dev'] = df['Wave_Strength'].rolling(window=window_size).std()
     df['Volume-ATR_Dev'] = df['Volume-ATR'].rolling(window=window_size).std()
     df['VWAP-ATR_Dev'] = df['VWAP-ATR'].rolling(window=window_size).std()
     df['RSI-MACD_Dev'] = df['RSI-MACD'].rolling(window=window_size).std()
@@ -813,6 +1059,19 @@ def calculate_indicators(df, window_size=2):
     df['BB-KC_Dev'] = df['BB-KC'].rolling(window=window_size).std()
     df['Ichimoku_Overlap_Dev'] = df['Ichimoku_Overlap'].rolling(window=window_size).std()
     df['LOW-HIGH_EMA_Dev'] = df['LOW-HIGH_EMA'].rolling(window=window_size).std()
+    df['Extrema_Unconfirmed_Dev'] = df['Extrema_Unconfirmed'].rolling(window=window_size).std()
+    df['Confirmed_Fractal_Peak_Dev'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).std()
+    df['Confirmed_Fractal_Trough_Dev'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).std()
+    df['Body_Size_Dev'] = df['Body_Size'].rolling(window=window_size).std()
+    df['Upper_Wick_Dev'] = df['Upper_Wick'].rolling(window=window_size).std()
+    df['Lower_Wick_Dev'] = df['Lower_Wick'].rolling(window=window_size).std()
+    df['Range_Dev'] = df['Range'].rolling(window=window_size).std()
+    df['Body_Ratio_Dev'] = df['Body_Ratio'].rolling(window=window_size).std()
+    df['Upper_Wick_Ratio_Dev'] = df['Upper_Wick_Ratio'].rolling(window=window_size).std()
+    df['Lower_Wick_Ratio_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
+    df['Price_Diff_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
+    df['BTC/ETH_Corr_Dev'] = df['BTC/ETH_Corr'].rolling(window=window_size).std()
+    df['Fractal_Dimension_Dev'] = df['Fractal_Dimension'].rolling(window=window_size).std()
 
     df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(
         window=window_size).min()
@@ -890,12 +1149,33 @@ def calculate_indicators(df, window_size=2):
     df['LOW-HIGH_EMA_Drawdown'] = (
                 df['LOW-HIGH_EMA'] / df['LOW-HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(
         window=window_size).min()
+    df['Body_Size_Drawdown'] = (df['Body_Size'] / df['Body_Size'].rolling(window=window_size).max() - 1).rolling(
+        window=window_size).min()
+    df['Range_Drawdown'] = (df['Range'] / df['Range'].rolling(window=window_size).max() - 1).rolling(
+        window=window_size).min()
+    df['Body_Ratio_Drawdown'] = (df['Body_Ratio'] / df['Body_Ratio'].rolling(window=window_size).max() - 1).rolling(
+        window=window_size).min()
+    df['Price_Diff_Drawdown'] = (df['Price_Diff'] / df['Price_Diff'].rolling(window=window_size).max() - 1).rolling(
+        window=window_size).min()
+    df['BTC/ETH_Corr_Drawdown'] = (
+                df['BTC/ETH_Corr'] / df['BTC/ETH_Corr'].rolling(window=window_size).max() - 1).rolling(
+        window=window_size).min()
+    df['Fractal_Dimension_Drawdown'] = (
+                df['Fractal_Dimension'] / df['Fractal_Dimension'].rolling(window=window_size).max() - 1).rolling(
+        window=window_size).min()
 
     df['Fast_%K_Drawdown'] = df['Fast_%K_Drawdown'].fillna(0)
-    df[['Normalized_Amplitude', 'Normalized_Slope']] = df[['Normalized_Amplitude', 'Normalized_Slope']].fillna(0)
-    df.dropna(inplace=True)
+    df['CCI_Drawdown'] = df['CCI_Drawdown'].fillna(0)
+    df['Range_Drawdown'] = df['Range_Drawdown'].fillna(0)
+    df['Body_Ratio_Drawdown'] = df['Body_Ratio_Drawdown'].fillna(0)
+    df['Body_Size_Drawdown'] = df['Body_Size_Drawdown'].fillna(0)
+    df['Price_Diff_Drawdown'] = df['Price_Diff_Drawdown'].fillna(0)
+    df['BTC/ETH_Corr_Drawdown'] = df['BTC/ETH_Corr_Drawdown'].fillna(0)
 
-    #defragmenting the dataframe
+    print(df[df.isna().any(axis=1)])
+
+    df.dropna(inplace=True)
+    # defragmenting dataframe
     df = df.copy()
 
     return df
@@ -917,7 +1197,7 @@ def convert_data_to_windows(data, window_size=2):
 
     return window_data
 
-def trading_simulation(probs, closes, buy_percentage, sell_percentage, starting_money=500, spend_percentage=0.1):
+def trading_simulation(probs, closes, buy_percentage, sell_percentage, overconfidence_mult, starting_money=500, spend_percentage=0.1):
     money = starting_money
     bitcoin = 0
     probabilities = probs
@@ -928,41 +1208,48 @@ def trading_simulation(probs, closes, buy_percentage, sell_percentage, starting_
 
     #0 is sell, 2 is buy
     count = 0
+    day_count = 0
     overconfidence = 0
+    historical_daily_starting_assets = []
     for probability in probabilities:
-        if probability[0] >= sell_percentage:
+        print("current probability: " + str(probability))
+        if count % 96 == 0: #update daily starting assets at the start of each day
+            daily_starting_assets = money + (bitcoin * close_prices[count])
+            historical_daily_starting_assets.append(daily_starting_assets)
+            if len(historical_daily_starting_assets) >= 2:
+                if (historical_daily_starting_assets[day_count - 1] * 0.95) > historical_daily_starting_assets[day_count]:
+                    print(f"Stop-loss triggered on Day {day_count}: more than 5% drop in a single day.")
+                    print(f"Current money: {money}, Current bitcoin: {bitcoin}, Current count: {count}")
+                    return
+            day_count += 1
+
+        if probability[0] >= sell_percentage and sell_order == False:
             sell_order = True
-        elif probability[2] >= buy_percentage:
-            overconfidence = (probability[2] - buy_percentage) * 10
-            print('Overconfidence: ' + str(overconfidence))
+        elif probability[2] >= buy_percentage and buy_order == False:
+            overconfidence = (probability[2] - buy_percentage) * overconfidence_mult
+            print(f"Overconfidence on Day {count}: {overconfidence}")
             buy_order = True
 
         if sell_order and probability[2] >= sell_percentage:
             money += bitcoin * close_prices[count]
-            print(f"Sold {bitcoin} bitcoin at {close_prices[count]}")
+            print(f"Day {day_count}: SOLD {bitcoin} BTC at {close_prices[count]} each.")
             bitcoin = 0
             sell_order = False
-            # total_assets = money + bitcoin * close_prices[count]
-            # if total_assets < previous_trade_assets:
-            #     print("Loss detected on this trade. Stopping simulation.")
-            #     break
-            # previous_trade_assets = total_assets
+        elif buy_order and probability[0] >= buy_percentage:
+            amount_to_spend = money * (spend_percentage + overconfidence)
+            # Avoid spending more than we have if overconfidence is large
+            amount_to_spend = min(amount_to_spend, money)
 
-        if buy_order and probability[0] >= buy_percentage:
-            bitcoin += money * (spend_percentage + overconfidence) / close_prices[count]
-            money -= money * (spend_percentage + overconfidence)
+            bitcoin_bought = amount_to_spend / close_prices[count]
+            bitcoin += bitcoin_bought
+            money -= amount_to_spend
             buy_order = False
-            print(f"Bought {bitcoin} bitcoin at {close_prices[count]}")
-            # total_assets = money + bitcoin * close_prices[count]
-            # if total_assets < previous_trade_assets:
-            #     print("Loss detected on this trade. Stopping simulation.")
-            #     break
-            # previous_trade_assets = total_assets
+            print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {close_prices[count]} each.")
 
         print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
         count += 1
 
-    total_assets = money + bitcoin * close_prices[count-1]
+    total_assets = money + bitcoin * close_prices[count-2]
     print("Final money: ", total_assets)
     print("Profit: ", total_assets - starting_money)
 
@@ -972,27 +1259,40 @@ def get_next_interval(interval_seconds):
     return next_interval - now
 
 print("Starting main execution...")
-window_size = 10
+window_size = 8
 data_train, data_eval, data_test = load_and_preprocess_data("BTCUSDC15m_2020-2025_labeled.csv", window_size)
 scaler = StandardScaler()
-hmm_features = ["Open", "High", "Low", "Close", "Volume", "Volume_Change", "OBV", "A/D", "CMF", "VWAP", "RSI", "Aroon", 'Fast_%K', 'Fast_%D', 'WILLR', 'CCI', 'ATR', 'ADX', 'TSI', "BB_Width", "MACD", "MACDSignal", "MACDHist", "Volatility", "Returns"]
-xg_features = ["Open", "High", "Low", "Close", "Volume", "Volume_Change", "OBV", "A/D", "CMF", "Returns", "Volatility", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", 'Fast_%K', 'Fast_%D', 'WILLR', 'CCI', 'ATR', 'ADX', 'TSI', 'BB_Upper', 'BB_Middle', 'BB_Lower',
-               "BB_Width", "MACD", "MACDSignal", "MACDHist", "PP", "R1", "R2", "S1", "S2", 'Tenkan_Sen', 'Kijun_Sen', 'Senkou_Span_A', 'Senkou_Span_B', 'Chikou_Span', 'KC_Upper', 'KC_Middle', 'KC_Lower', 'KC_Width', 'Volume-ATR', 'VWAP-ATR', 'RSI-MACD',
-               'Stochastic-RSI', 'BB-KC', 'Ichimoku_Overlap', 'LOW-HIGH_EMA', "Wave_Direction", "Wave_Amplitude", "Wave_Length_Bars", "Wave_Velocity", "Wave_Frequency", "Wave_Sharpness", "Wave_Slope", "Wave_Energy", "Wave_Acceleration", "Wave_Strength",
-               "Normalized_Slope", "Normalized_Amplitude", "Label"]
+hmm_features = ["Day", "Session", "Open", "High", "Low", "Close", "Volume", "Volume_Change", "OBV", "A/D", "CMF", "Returns", "Volatility", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", 'Fast_%K', 'Fast_%D', 'WILLR', 'CCI', 'ATR', 'ADX', 'TSI', 'BB_Upper', 'BB_Middle', 'BB_Lower',
+               "BB_Width", "MACD", "MACDSignal", "MACDHist", "PP", "R1", "R2", "S1", "S2", 'Tenkan_Sen', 'Kijun_Sen', 'Senkou_Span_A', 'Senkou_Span_B', 'Chikou_Span', 'KC_Upper', 'KC_Middle', 'KC_Lower', 'KC_Width', 'Close_Corr1', 'Returns_Corr1', 'Close_Corr2',
+               'Returns_Corr2', 'Close_Corr3', 'Returns_Corr3', 'Volume-ATR', 'VWAP-ATR', 'RSI-MACD', 'Stochastic-RSI', 'BB-KC', 'Ichimoku_Overlap', 'LOW-HIGH_EMA', "Confirmed_Fractal_Peak", "Confirmed_Fractal_Trough", "Extrema_Unconfirmed", "Body_Size", "Upper_Wick", "Lower_Wick", "Range",
+               "Body_Ratio", "Upper_Wick_Ratio", "Lower_Wick_Ratio", 'Two_Crows', 'Three_Crows', 'Three_Inside', 'Three_Strike', 'Three_Outside', 'Three_Stars_South', 'Three_Soldiers', 'Abandoned_Baby', 'Advance_Block', 'Belt_Hold', 'Breakaway', 'Closing_Marubozu',
+               'Baby_Swallow', 'Counterattack', 'Dark_Cloud', 'Doji', 'Doji_Star', 'Dragonfly_Doji', 'Engulfing', 'Evening_Doji', 'Evening_Star', 'Up_Down_Gap', 'Gravestone_Doji', 'Hammer', 'Hanging_Man', 'Harami', 'Harami_Cross', 'High_Wave', 'Hikkake',
+               'Modified_Hikkake', 'Homing_Pigeon', 'Identical_Crows', 'In_Neck', 'Inverted_Hammer', 'Kicking', 'Kicking_Length', 'Ladder_Bottom', 'Long_Doji', 'Long_Candle', 'Marubozu', 'Matching_Low', 'Mat_Hold', 'Morning_Doji', 'Morning_Star', 'On_Neck',
+               'Piercing', 'Rickshaw_Man', 'Rising_Falling', 'Separating_Lines', 'Shooting_Star', 'Short_Candle', 'Spinning_Top', 'Stalled', 'Stick_Sandwich', 'Takuri', 'Tasuki_Gap', 'Thrusting', 'Tristar', 'Unique_River', 'Upside_Gap_Crows', 'Up_Down_3Gap',
+               'Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3', 'Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2', 'Wavelet_Volume_Coef3', 'Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1',
+               'Wavelet_Returns_Coef2', 'Wavelet_Returns_Coef3', 'Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2', 'Wavelet_Volatility_Coef3', 'Price_Diff', 'BTC/ETH_Corr', 'Fractal_Dimension']
+xg_features = ["Day", "Session", "Open", "High", "Low", "Close", "Volume", "Volume_Change", "OBV", "A/D", "CMF", "Returns", "Volatility", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", 'Fast_%K', 'Fast_%D', 'WILLR', 'CCI', 'ATR', 'ADX', 'TSI', 'BB_Upper', 'BB_Middle', 'BB_Lower',
+               "BB_Width", "MACD", "MACDSignal", "MACDHist", "PP", "R1", "R2", "S1", "S2", 'Tenkan_Sen', 'Kijun_Sen', 'Senkou_Span_A', 'Senkou_Span_B', 'Chikou_Span', 'KC_Upper', 'KC_Middle', 'KC_Lower', 'KC_Width', 'Close_Corr1', 'Returns_Corr1', 'Close_Corr2',
+               'Returns_Corr2', 'Close_Corr3', 'Returns_Corr3', 'Volume-ATR', 'VWAP-ATR', 'RSI-MACD', 'Stochastic-RSI', 'BB-KC', 'Ichimoku_Overlap', 'LOW-HIGH_EMA', "Confirmed_Fractal_Peak", "Confirmed_Fractal_Trough", "Extrema_Unconfirmed", "Body_Size", "Upper_Wick", "Lower_Wick", "Range",
+               "Body_Ratio", "Upper_Wick_Ratio", "Lower_Wick_Ratio", 'Two_Crows', 'Three_Crows', 'Three_Inside', 'Three_Strike', 'Three_Outside', 'Three_Stars_South', 'Three_Soldiers', 'Abandoned_Baby', 'Advance_Block', 'Belt_Hold', 'Breakaway', 'Closing_Marubozu',
+               'Baby_Swallow', 'Counterattack', 'Dark_Cloud', 'Doji', 'Doji_Star', 'Dragonfly_Doji', 'Engulfing', 'Evening_Doji', 'Evening_Star', 'Up_Down_Gap', 'Gravestone_Doji', 'Hammer', 'Hanging_Man', 'Harami', 'Harami_Cross', 'High_Wave', 'Hikkake',
+               'Modified_Hikkake', 'Homing_Pigeon', 'Identical_Crows', 'In_Neck', 'Inverted_Hammer', 'Kicking', 'Kicking_Length', 'Ladder_Bottom', 'Long_Doji', 'Long_Candle', 'Marubozu', 'Matching_Low', 'Mat_Hold', 'Morning_Doji', 'Morning_Star', 'On_Neck',
+               'Piercing', 'Rickshaw_Man', 'Rising_Falling', 'Separating_Lines', 'Shooting_Star', 'Short_Candle', 'Spinning_Top', 'Stalled', 'Stick_Sandwich', 'Takuri', 'Tasuki_Gap', 'Thrusting', 'Tristar', 'Unique_River', 'Upside_Gap_Crows', 'Up_Down_3Gap',
+               'Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3', 'Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2', 'Wavelet_Volume_Coef3', 'Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1',
+               'Wavelet_Returns_Coef2', 'Wavelet_Returns_Coef3', 'Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2', 'Wavelet_Volatility_Coef3', 'Price_Diff', 'BTC/ETH_Corr', 'Fractal_Dimension', 'State', "Label"]
 agg_features = ["Open_Mean", "High_Mean", "Low_Mean", "Close_Mean", "Volume_Mean", "OBV_Mean", "A/D_Mean", "CMF_Mean", "VWAP_Mean", "Returns_Mean", "Volatility_Mean", "LOW_EMA_Mean", "HIGH_EMA_Mean", "RSI_Mean", "Aroon_Mean", 'Fast_%K_Mean', 'Fast_%D_Mean',
                 'WILLR_Mean', 'CCI_Mean', 'ATR_Mean', 'ADX_Mean', 'TSI_Mean', 'BB_Upper_Mean', 'BB_Middle_Mean', 'BB_Lower_Mean', "BB_Width_Mean", "MACD_Mean", "MACDSignal_Mean", "MACDHist_Mean", "PP_Mean", "R1_Mean", "R2_Mean", "S1_Mean", "S2_Mean", 'Tenkan_Sen_Mean',
                 'Kijun_Sen_Mean', 'Senkou_Span_A_Mean', 'Senkou_Span_B_Mean', 'Chikou_Span_Mean', 'KC_Upper_Mean', 'KC_Middle_Mean', 'KC_Lower_Mean', 'KC_Width_Mean', 'Volume-ATR_Mean', 'VWAP-ATR_Mean', 'RSI-MACD_Mean', 'Stochastic-RSI_Mean', 'BB-KC_Mean', 'Ichimoku_Overlap_Mean',
-                'LOW-HIGH_EMA_Mean', "Wave_Direction_Mean", "Wave_Amplitude_Mean", "Wave_Velocity_Mean", "Wave_Frequency_Mean", "Wave_Sharpness_Mean", "Wave_Slope_Mean", "Wave_Energy_Mean", "Wave_Acceleration_Mean", "Wave_Strength_Mean", "Open_Dev", "High_Dev", "Low_Dev",
+                'LOW-HIGH_EMA_Mean', "Extrema_Unconfirmed_Mean", "Confirmed_Fractal_Peak_Mean", "Confirmed_Fractal_Trough_Mean", "Body_Size_Mean", "Upper_Wick_Mean", "Lower_Wick_Mean", "Range_Mean", "Body_Ratio_Mean", "Upper_Wick_Ratio_Mean", "Lower_Wick_Ratio_Mean", 'Price_Diff_Mean', 'BTC/ETH_Corr_Mean', 'Fractal_Dimension_Mean', "Open_Dev", "High_Dev", "Low_Dev",
                 "Close_Dev", "Volume_Dev", "OBV_Dev", "A/D_Dev", "CMF_Dev", "VWAP_Dev", "Returns_Dev", "Volatility_Dev", "LOW_EMA_Dev", "HIGH_EMA_Dev", "RSI_Dev", "Aroon_Dev", 'Fast_%K_Dev', 'Fast_%D_Dev', 'WILLR_Dev', 'CCI_Dev', 'ATR_Dev', 'ADX_Dev', 'TSI_Dev', 'BB_Upper_Dev',
                 'BB_Middle_Dev', 'BB_Lower_Dev', "BB_Width_Dev", "MACD_Dev", "MACDSignal_Dev", "MACDHist_Dev", "PP_Dev", "R1_Dev", "R2_Dev", "S1_Dev", "S2_Dev", 'Tenkan_Sen_Dev', 'Kijun_Sen_Dev', 'Senkou_Span_A_Dev', 'Senkou_Span_B_Dev', 'Chikou_Span_Dev', 'KC_Upper_Dev', 'KC_Middle_Dev',
-                'KC_Lower_Dev', 'KC_Width_Dev', 'Volume-ATR_Dev', 'VWAP-ATR_Dev', 'RSI-MACD_Dev', 'Stochastic-RSI_Dev', 'BB-KC_Dev', 'Ichimoku_Overlap_Dev', 'LOW-HIGH_EMA_Dev', "Wave_Direction_Dev", "Wave_Amplitude_Dev", "Wave_Velocity_Dev", "Wave_Frequency_Dev", "Wave_Sharpness_Dev",
-                "Wave_Slope_Dev", "Wave_Energy_Dev", "Wave_Acceleration_Dev", "Wave_Strength_Dev", "Open_Drawdown", "High_Drawdown", "Low_Drawdown", "Close_Drawdown", "Volume_Drawdown", "OBV_Drawdown", "A/D_Drawdown", "Volatility_Drawdown", "LOW_EMA_Drawdown", "HIGH_EMA_Drawdown",
+                'KC_Lower_Dev', 'KC_Width_Dev', 'Volume-ATR_Dev', 'VWAP-ATR_Dev', 'RSI-MACD_Dev', 'Stochastic-RSI_Dev', 'BB-KC_Dev', 'Ichimoku_Overlap_Dev', 'LOW-HIGH_EMA_Dev', "Extrema_Unconfirmed_Dev", "Confirmed_Fractal_Peak_Dev", "Confirmed_Fractal_Trough_Dev", "Body_Size_Dev", "Upper_Wick_Dev", "Lower_Wick_Dev",
+                "Range_Dev", "Body_Ratio_Dev", "Upper_Wick_Ratio_Dev", "Lower_Wick_Ratio_Dev", 'Price_Diff_Dev', 'BTC/ETH_Corr_Dev', 'Fractal_Dimension_Dev', "Open_Drawdown", "High_Drawdown", "Low_Drawdown", "Close_Drawdown", "Volume_Drawdown", "OBV_Drawdown", "A/D_Drawdown", "Volatility_Drawdown", "LOW_EMA_Drawdown", "HIGH_EMA_Drawdown",
                 "RSI_Drawdown", 'Fast_%K_Drawdown', 'Fast_%D_Drawdown', 'CCI_Drawdown', 'ATR_Drawdown', 'ADX_Drawdown', 'TSI_Drawdown', 'BB_Upper_Drawdown', 'BB_Middle_Drawdown', 'BB_Lower_Drawdown', "BB_Width_Drawdown", "MACD_Drawdown","MACDSignal_Drawdown", "MACDHist_Drawdown",
                 "PP_Drawdown", "R1_Drawdown", "R2_Drawdown", "S1_Drawdown", "S2_Drawdown", 'Tenkan_Sen_Drawdown', 'Kijun_Sen_Drawdown', 'Senkou_Span_A_Drawdown', 'Senkou_Span_B_Drawdown', 'Chikou_Span_Drawdown', 'KC_Upper_Drawdown', 'KC_Middle_Drawdown', 'KC_Lower_Drawdown',
-                'KC_Width_Drawdown', 'Volume-ATR_Drawdown', 'VWAP-ATR_Drawdown', 'RSI-MACD_Drawdown', 'BB-KC_Drawdown', 'LOW-HIGH_EMA_Drawdown']
+                'KC_Width_Drawdown', 'Volume-ATR_Drawdown', 'VWAP-ATR_Drawdown', 'RSI-MACD_Drawdown', 'BB-KC_Drawdown', 'LOW-HIGH_EMA_Drawdown', 'Body_Size_Drawdown', 'Body_Ratio_Drawdown', 'Range_Drawdown', 'Price_Diff_Drawdown', 'BTC/ETH_Corr_Drawdown', 'Fractal_Dimension_Drawdown']
 
-hmm_path = train_hmm(data_train, hmm_features, scaler, 12)
+hmm_path = train_hmm(data_train, hmm_features, scaler, 3)
 hmm_model = load_hmm(hmm_path)
 print("Predicting states...")
 states = predict_states(hmm_model, data_train, hmm_features, scaler)
@@ -1040,8 +1340,8 @@ xg_labels_test = [int(x) for x in xg_labels_test]
 
 print("Unique labels:", set(xg_labels_train))
 
-xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, 10, 30)
-#xgboost_path = "xgboost_pipeline.pkl"
+#xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, 7, 50)
+xgboost_path = "models/juicer_model1.pkl"
 xgboost_model = load_xgboost(xgboost_path)
 xg_labels_pred = xgboost_model.predict(xg_data_test)
 xg_labels_pred = xg_labels_pred.tolist()
@@ -1078,11 +1378,11 @@ for probability in probabilities:
     probability_1.append(probability[1])
     probability_2.append(probability[2])
 
-print(f"75th percentile of sells: {np.percentile(probability_0, 57)}")
-print(f"75th percentile of holds: {np.percentile(probability_1, 57)}")
-print(f"75th percentile of buys: {np.percentile(probability_2, 57)}")
+print(f"75th percentile of sells: {np.percentile(probability_0, 1)}")
+print(f"75th percentile of holds: {np.percentile(probability_1, 1)}")
+print(f"75th percentile of buys: {np.percentile(probability_2, 1)}")
 closes = recent_df['Close_t-1'].tolist()
-trading_simulation(probabilities, closes, np.percentile(probability_2, 55), np.percentile(probability_0, 55), starting_money=1500, spend_percentage=0.2)
+trading_simulation(probabilities, closes, np.percentile(probability_2, 80), np.percentile(probability_0, 80), 100, starting_money=1500, spend_percentage=0.15)
 #while True:
 #     start_time = time.time()
 #
