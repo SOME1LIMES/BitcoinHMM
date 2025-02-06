@@ -2,15 +2,14 @@ import pandas as pd
 import numpy as np
 from hmmlearn import hmm
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import talib
 from datetime import datetime
-from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
 from skopt import BayesSearchCV
 from skopt.space import Real, Integer, Categorical
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 from xgboost import plot_importance
 from sklearn.model_selection import TimeSeriesSplit
@@ -24,7 +23,6 @@ import hashlib
 import hmac
 import datetime
 import pywt
-from hurst import compute_Hc
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
@@ -42,17 +40,29 @@ def load_and_preprocess_data(filepath, window_size=2):
     eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'High', 'Low', 'Close'])
     eth_df.drop(0, inplace=True)
     eth_df = eth_df.astype(float)
-
     df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
 
+    halving_dates = [
+        datetime.datetime(2020, 5, 11),
+        datetime.datetime(2024, 4, 20),
+        datetime.datetime(2028, 2, 19) #next estimated halving
+    ]
+    halving_cycle_duration = datetime.timedelta(days=365)
+
+    quarters = []
+    months = []
     days = []
     hours = []
     sessions = []
+    in_halving_cycle = []
+
     for timestamp in df['Timestamp']:
-        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp)/1000)
-        days.append(utc_time.weekday())
+        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
+        month = utc_time.month
+        quarter = (month - 1) // 3 + 1
+        day = utc_time.weekday()
         hour = utc_time.hour
-        hours.append(hour)
+
         if 0 <= hour < 9:
             session = 0
         elif 7 <= hour < 16:
@@ -61,13 +71,27 @@ def load_and_preprocess_data(filepath, window_size=2):
             session = 2
         else:
             session = 0
-        sessions.append(session)
-    df['Day'] = days
-    df['Session'] = sessions
 
+        in_cycle = False
+        for halving_date in halving_dates:
+            if halving_date <= utc_time <= halving_date + halving_cycle_duration:
+                in_cycle = True
+                break
+
+        quarters.append(quarter)
+        months.append(month)
+        days.append(day)
+        hours.append(hour)
+        sessions.append(session)
+        in_halving_cycle.append(in_cycle)
+
+    df['Quarter'] = quarters
+    df['Month'] = months
+    df['Day'] = days
     df['Hour'] = hours
-    df['Hour_Sin'] = np.sin(2 * np.pi * df['Hour'] / 24.0)
-    df['Hour_Cos'] = np.cos(2 * np.pi * df['Hour'] / 24.0)
+    df['Session'] = sessions
+    df['In_Halving_Cycle'] = in_halving_cycle
+    df['In_Halving_Cycle'] = df['In_Halving_Cycle'].astype(int)
 
     #Intramarket Difference
     period = 24
@@ -75,8 +99,15 @@ def load_and_preprocess_data(filepath, window_size=2):
     eth_cmma = cmma(eth_df['High'], eth_df['Low'], eth_df['Close'], period)
     df['BTC-ETC_Diff'] = btc_cmma - eth_cmma
 
+    df['Price_Diff'] = df['Close'].diff()
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
+    df['Price_Diff_Future'] = df['Price_Diff'].shift(-1)
+    df['Price_Diff_Future_Abs'] = df['Price_Diff_Future'].abs()
+
+    #prob(buy) - prob(sell) = prob(total)
+    #if prob(total) is positive that means the buy signal is stronger, if negative that means the sell signal is stronger
+    #prob(total) * price_diff
 
     #Replaces 0's with a number close to 0 to avoid infinity being present in Volume_Change
     #Since the label column has 0's present, we need to make sure that they are not replaced
@@ -181,7 +212,6 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].astype(int)
     df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].shift(2)
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].shift(2)
-    df['Price_Diff'] = df['Close'].diff()
 
     #Candlestick patterns
     df['Body_Size'] = abs(df['Close'] - df['Open'])
@@ -257,13 +287,6 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
     df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
 
-    #Calculate correlations
-    # df['Close_Corr1'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
-    # df['Returns_Corr1'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
-    # df['Close_Corr2'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
-    # df['Returns_Corr2'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
-    # df['Close_Corr3'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
-    # df['Returns_Corr3'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
     #
     # #Fractal Dimension
     # df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
@@ -355,11 +378,30 @@ def load_and_preprocess_data(filepath, window_size=2):
     #defragmenting dataframe
     df = df.copy()
 
-    training_df = df[(df.index >= 35805)] #January 1st 2023 12am #765
-    eval_df = df[((df.index >= 1153) & (df.index <= 15261))] #January 4 2022 7:45 PM to June 1st 2022 12am
-    out_of_training_df = df[((df.index >= 15262) & (df.index <= 35804))] #June 1st 2022 12:15am to January 1st 2023 12:15am
+    # PCA + k-means
+    scaler = StandardScaler()
+    df_scaled = scaler.fit_transform(df)
+    pca = PCA(n_components=6)
+    pca_data = pca.fit_transform(df_scaled)
+    pca_df = pd.DataFrame(pca_data, columns=['PC1', 'PC2', 'PC3', 'PC4', 'PC5', 'PC6'])
 
-    return training_df, eval_df, out_of_training_df
+    kmeans = KMeans(n_clusters=8, random_state=42)
+    cluster_labels = kmeans.fit_predict(df_scaled)
+    df['Cluster'] = cluster_labels
+
+    df = pd.concat([df, pca_df], axis=1)
+    df.dropna(inplace=True)
+
+    training_df = df[df['Timestamp'] > 1672549200000] #January 1st 2023 12:15 am to present
+    eval_df = df[((df['Timestamp'] > 1654056000000) & (df['Timestamp'] <= 1672549200000))] #June 1st 12:15am 2022 to Jan 1st 2023 12am
+    test_df = df[((df['Timestamp'] >= 1641013200000) & (df['Timestamp'] <= 1654056000000))] #Jan 1st 12am 2022 to June 1st 12am 2022
+
+    ms = MinMaxScaler(feature_range=(0, 1))
+    training_df['Weights'] = ms.fit_transform(training_df[['Price_Diff_Future_Abs']]) * 10
+    eval_df['Weights'] = ms.fit_transform(eval_df[['Price_Diff_Future_Abs']]) * 10
+    test_df['Weights'] = ms.fit_transform(test_df[['Price_Diff_Future_Abs']]) * 10
+
+    return training_df, eval_df, test_df
 
 def cmma(High, Low, Close, period, atr_period = 168):
     atr = talib.ATR(High, Low, Close, atr_period)
@@ -455,18 +497,31 @@ def plot_results_rf(data, labels_true, labels_pred):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     plt.savefig('plots/rf' + str(timestamp))
 
-def train_xgboost(data_train, labels_train, data_test, labels_test, splits, iters):
-    tscv = TimeSeriesSplit(n_splits=splits)
+def custom_pnl_objective(y_true, y_pred):
+    y_true[y_true == 0] = -1
+    p_buy = 1.0 / (1.0 + np.exp(-y_pred))
+    prob_diff = 2.0 * p_buy - 1.0
+    loss = -(prob_diff * y_true)
 
-    pipeline = ImbPipeline(steps=[
-        ('smote', SMOTE(random_state=42)),
-        ('xgb', XGBClassifier(random_state=42, eval_metric='auc', early_stopping_rounds=40, tree_method='hist',
-                              device='cuda', predictor='gpu_predictor'))
-    ])
+    grad = -((2 * np.exp(-y_pred) * y_true) / ((np.exp(-y_pred) + 1) ** 2))
+    hess = -((2 * np.exp(-2 * y_pred) * y_true * (-np.exp(y_pred) + 1)) / (np.exp(-y_pred) + 1) ** 3)
+    hess = np.maximum(hess, 1e-6)
+
+    #print(f"y_true:{y_true}, y_pred:{y_pred}, p_buy:{p_buy}, prob_diff:{prob_diff}, grad:{grad}, hess:{hess}")
+    #print(f"grad counts:{np.unique(grad, return_counts=True)}, true counts:{np.unique(y_true, return_counts=True)}, pred counts: {np.unique(y_pred, return_counts=True)}")
+
+    return grad.astype(np.float32), hess.astype(np.float32)
+
+def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
+    tscv = TimeSeriesSplit(n_splits=splits)
+    scale_weight = labels_train.count(1)/labels_train.count(0)
+    print(scale_weight)
+
+    pipeline = Pipeline(steps=[('xgb', XGBClassifier(random_state=42, eval_metric='auc', early_stopping_rounds=100, tree_method='hist', device='cuda', objective='binary:logistic'))])
 
     search_space = {
-        'xgb__max_depth': Integer(1, 6),
-        'xgb__learning_rate': Real(0.001, 1.0, prior='log-uniform'),
+        'xgb__max_depth': Integer(3, 14),
+        'xgb__learning_rate': Real(0.0005, 1.0, prior='log-uniform'),
         'xgb__subsample': Real(0.15, 1.0),
         'xgb__colsample_bytree': Real(0.5, 1.0),
         'xgb__colsample_bylevel': Real(0.5, 1.0),
@@ -474,15 +529,17 @@ def train_xgboost(data_train, labels_train, data_test, labels_test, splits, iter
         'xgb__reg_alpha': Real(0.0, 8.0),
         'xgb__reg_lambda': Real(0.0, 13.0),
         'xgb__gamma': Real(0.0, 12.0),
-        'xgb__n_estimators': Integer(100, 2000),
+        'xgb__n_estimators': Integer(100, 5000),
         'xgb__min_child_weight': Integer(1, 15),
         'xgb__max_bin': Integer(128, 512),
         'xgb__grow_policy': Categorical(["depthwise", "lossguide"]),
-        'xgb__max_delta_step': Integer(0, 10)
+        'xgb__max_delta_step': Integer(0, 10),
+        'xgb__scale_pos_weight': Real(0.97, 1.03)
+        #'xgb__booster': Categorical(["gbtree", "dart"])
     }
     opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='roc_auc', random_state=42)
 
-    opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)])
+    opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)], xgb__sample_weight=weights)
     print("Best estimator: ", opt.best_estimator_)
     print("Best score: ", opt.best_score_)
     print("Best params: ", opt.best_params_)
@@ -493,7 +550,7 @@ def train_xgboost(data_train, labels_train, data_test, labels_test, splits, iter
     print(labels_pred.count(1))
     print(opt.best_estimator_.steps)
 
-    xgboost_step = opt.best_estimator_.steps[1]
+    xgboost_step = opt.best_estimator_.steps[0]
     xgboost_model = xgboost_step[1]
     plot_importance(xgboost_model, max_num_features=100)
     plt.show()
@@ -504,6 +561,56 @@ def train_xgboost(data_train, labels_train, data_test, labels_test, splits, iter
         pickle.dump(opt.best_estimator_, f)
 
     return filepath
+
+# def train_xgboost(data_train, labels_train, data_test, labels_test, splits, iters):
+#     tscv = TimeSeriesSplit(n_splits=splits)
+#
+#     pipeline = ImbPipeline(steps=[
+#         ('smote', SMOTE(random_state=42)),
+#         ('xgb', XGBClassifier(random_state=42, eval_metric='auc', early_stopping_rounds=50, tree_method='hist',
+#                               device='cuda', predictor='gpu_predictor'))
+#     ])
+#
+#     search_space = {
+#         'xgb__max_depth': Integer(1, 12),
+#         'xgb__learning_rate': Real(0.0005, 1.0, prior='log-uniform'),
+#         'xgb__subsample': Real(0.15, 1.0),
+#         'xgb__colsample_bytree': Real(0.5, 1.0),
+#         'xgb__colsample_bylevel': Real(0.5, 1.0),
+#         'xgb__colsample_bynode': Real(0.5, 1.0),
+#         'xgb__reg_alpha': Real(0.0, 8.0),
+#         'xgb__reg_lambda': Real(0.0, 13.0),
+#         'xgb__gamma': Real(0.0, 12.0),
+#         'xgb__n_estimators': Integer(100, 4250),
+#         'xgb__min_child_weight': Integer(1, 15),
+#         'xgb__max_bin': Integer(128, 512),
+#         'xgb__grow_policy': Categorical(["depthwise", "lossguide"]),
+#         'xgb__max_delta_step': Integer(0, 10)
+#     }
+#     opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='roc_auc', random_state=42)
+#
+#     opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)])
+#     print("Best estimator: ", opt.best_estimator_)
+#     print("Best score: ", opt.best_score_)
+#     print("Best params: ", opt.best_params_)
+#     print(opt.score(data_test, labels_test))
+#     labels_pred = opt.predict(data_test)
+#     labels_pred = labels_pred.tolist()
+#     print(labels_pred.count(0))
+#     print(labels_pred.count(1))
+#     print(opt.best_estimator_.steps)
+#
+#     xgboost_step = opt.best_estimator_.steps[1]
+#     xgboost_model = xgboost_step[1]
+#     plot_importance(xgboost_model, max_num_features=100)
+#     plt.show()
+#
+#     # save the model
+#     filepath = "xgboost_pipeline.pkl"
+#     with open(filepath, "wb") as f:
+#         pickle.dump(opt.best_estimator_, f)
+#
+#     return filepath
 
 def load_xgboost(filepath):
     with open(filepath, "rb") as f:
@@ -585,13 +692,29 @@ def calculate_indicators(df, window_size=2):
     eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'High', 'Low', 'Close'])
     eth_df.drop(0, inplace=True)
     eth_df = eth_df.astype(float)
+    df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
 
+    halving_dates = [
+        datetime.datetime(2020, 5, 11),
+        datetime.datetime(2024, 4, 20),
+        datetime.datetime(2028, 2, 19)  # next estimated halving
+    ]
+    halving_cycle_duration = datetime.timedelta(days=365)
+
+    quarters = []
+    months = []
+    days = []
     hours = []
     sessions = []
+    in_halving_cycle = []
+
     for timestamp in df['Timestamp']:
         utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
+        month = utc_time.month
+        quarter = (month - 1) // 3 + 1
+        day = utc_time.weekday()
         hour = utc_time.hour
-        hours.append(hour)
+
         if 0 <= hour < 9:
             session = 0
         elif 7 <= hour < 16:
@@ -600,25 +723,48 @@ def calculate_indicators(df, window_size=2):
             session = 2
         else:
             session = 0
+
+        in_cycle = False
+        for halving_date in halving_dates:
+            if halving_date <= utc_time <= halving_date + halving_cycle_duration:
+                in_cycle = True
+                break
+
+        quarters.append(quarter)
+        months.append(month)
+        days.append(day)
+        hours.append(hour)
         sessions.append(session)
-    df['Session'] = sessions
+        in_halving_cycle.append(in_cycle)
 
+    df['Quarter'] = quarters
+    df['Month'] = months
+    df['Day'] = days
     df['Hour'] = hours
-    df['Hour_Sin'] = np.sin(2 * np.pi * df['Hour'] / 24.0)
-    df['Hour_Cos'] = np.cos(2 * np.pi * df['Hour'] / 24.0)
+    df['Session'] = sessions
+    df['In_Halving_Cycle'] = in_halving_cycle
+    df['In_Halving_Cycle'] = df['In_Halving_Cycle'].astype(int)
 
-    #Intramarket Difference
+    # Intramarket Difference
     period = 24
     btc_cmma = cmma(df['High'], df['Low'], df['Close'], period)
     eth_cmma = cmma(eth_df['High'], eth_df['Low'], eth_df['Close'], period)
     df['BTC-ETC_Diff'] = btc_cmma - eth_cmma
 
+    df['Price_Diff'] = df['Close'].diff()
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
+    df['Price_Diff_Future'] = df['Price_Diff'].shift(-1)
+    df['Price_Diff_Future_Abs'] = df['Price_Diff_Future'].abs()
+
+    # prob(buy) - prob(sell) = prob(total)
+    # if prob(total) is positive that means the buy signal is stronger, if negative that means the sell signal is stronger
+    # prob(total) * price_diff
 
     # Replaces 0's with a number close to 0 to avoid infinity being present in Volume_Change
     # Since the label column has 0's present, we need to make sure that they are not replaced
     df['Volume'] = df['Volume'].replace(0, 0.00000000000000001)
+    df["Volume_Change"] = df["Volume"].pct_change()
 
     # Need this because there was a weird error were the data in these columns were not classified as floats, this caused a problem with the pipeline as I'm not using a target encoder
     df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
@@ -632,6 +778,7 @@ def calculate_indicators(df, window_size=2):
     for i in range(2, len(df)):
         currentMFV = df.loc[i, 'MFV']
         df.loc[i, 'A/D'] = df.loc[i - 1, 'A/D'] + currentMFV
+    df['CMF'] = df['MFV'].rolling(window=21).sum() / df['Volume'].rolling(window=21).sum()
 
     df['CumulativeVolume'] = 0
     for i in range(2, len(df)):
@@ -642,10 +789,15 @@ def calculate_indicators(df, window_size=2):
 
     df['VWAP'] = (((df['High'] + df['Low'] + df['Close']) / 3) * df['Volume']) / df['CumulativeVolume']
 
+    df['LOW_EMA'] = talib.EMA(df['Close'], timeperiod=9)
+    df['HIGH_EMA'] = talib.EMA(df['Close'], timeperiod=21)
     df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
+    df['Aroon'] = talib.AROONOSC(df['High'], df['Low'], timeperiod=14)
     df['Fast_%K'], df['Fast_%D'] = talib.STOCHF(df['High'], df['Low'], df['Close'], fastk_period=14)
     df['WILLR'] = talib.WILLR(df['High'], df['Low'], df['Close'])
+    df['CCI'] = talib.CCI(df['High'], df['Low'], df['Close'])
     df['ATR'] = talib.ATR(df['High'], df['Low'], df['Close'])
+    df['ADX'] = talib.ADX(df['High'], df['Low'], df['Close'])
 
     df['Momentum'] = df['Close'].diff()
     df['Absolute_Momentum'] = df['Momentum'].abs()
@@ -656,15 +808,31 @@ def calculate_indicators(df, window_size=2):
     df['TSI'] = 100 * (df['Double_EMA_Momentum'] / df['Double_EMA_Absolute'])
 
     df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = talib.BBANDS(df['Close'], 20)
+    df['BB_Width'] = df['BB_Upper'] - df['BB_Lower']
 
     macd, macdsignal, macdhist = talib.MACDFIX(df['Close'])
     df['MACD'] = macd
     df['MACDSignal'] = macdsignal
     df['MACDHist'] = macdhist
 
+    df['PP'] = (df['High'].shift(1) + df['Low'].shift(1) + df['Close'].shift(1)) / 3
+    df['R1'] = 2 * df['PP'] - df['Low'].shift(1)
+    df['R2'] = df['PP'] + (df['High'].shift(1) - df['Low'].shift(1))
+    df['S1'] = 2 * df['PP'] - df['High'].shift(1)
+    df['S2'] = df['PP'] - (df['High'].shift(1) - df['Low'].shift(1))
+
     # Ichimoku Cloud
+    df['Tenkan_Sen'] = (df['High'].rolling(window=9).max() + df['Low'].rolling(window=9).min()) / 2
     df['Kijun_Sen'] = (df['High'].rolling(window=26).max() + df['Low'].rolling(window=26).min()) / 2
+    df['Senkou_Span_A'] = (df['Tenkan_Sen'] + df['Kijun_Sen']) / 2
     df['Senkou_Span_B'] = (df['High'].rolling(window=52).max() + df['Low'].rolling(window=52).min()) / 2
+    df['Chikou_Span'] = df['Close'].shift(-26)
+
+    # Keltner Channels
+    df['KC_Middle'] = talib.EMA(df['Close'], timeperiod=20)
+    df['KC_Upper'] = df['KC_Middle'] + df['ATR'] * 2
+    df['KC_Lower'] = df['KC_Middle'] - df['ATR'] * 2
+    df['KC_Width'] = df['KC_Upper'] - df['KC_Lower']
 
     # max/min points
     close = df['Close'].values
@@ -696,29 +864,94 @@ def calculate_indicators(df, window_size=2):
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].astype(int)
     df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].shift(2)
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].shift(2)
-    df['Price_Diff'] = df['Close'].diff()
 
     # Candlestick patterns
+    df['Body_Size'] = abs(df['Close'] - df['Open'])
     df['Upper_Wick'] = df['High'] - df[['Open', 'Close']].max(axis=1)
     df['Lower_Wick'] = df[['Open', 'Close']].min(axis=1) - df['Low']
     df['Range'] = df['High'] - df['Low']
 
     # Add small number to avoid division by zero
+    df['Body_Ratio'] = df['Body_Size'] / (df['Range'] + 1e-9)
     df['Upper_Wick_Ratio'] = df['Upper_Wick'] / (df['Range'] + 1e-9)
     df['Lower_Wick_Ratio'] = df['Lower_Wick'] / (df['Range'] + 1e-9)
 
+    df['Two_Crows'] = talib.CDL2CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Inside'] = talib.CDL3INSIDE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Strike'] = talib.CDL3LINESTRIKE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Outside'] = talib.CDL3OUTSIDE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Stars_South'] = talib.CDL3STARSINSOUTH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Soldiers'] = talib.CDL3WHITESOLDIERS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Abandoned_Baby'] = talib.CDLABANDONEDBABY(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Advance_Block'] = talib.CDLADVANCEBLOCK(df['Open'], df['High'], df['Low'], df['Close'])
     df['Belt_Hold'] = talib.CDLBELTHOLD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Breakaway'] = talib.CDLBREAKAWAY(df['Open'], df['High'], df['Low'], df['Close'])
     df['Closing_Marubozu'] = talib.CDLCLOSINGMARUBOZU(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Baby_Swallow'] = talib.CDLCONCEALBABYSWALL(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Counterattack'] = talib.CDLCOUNTERATTACK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Dark_Cloud'] = talib.CDLDARKCLOUDCOVER(df['Open'], df['High'], df['Low'], df['Close'])
     df['Doji'] = talib.CDLDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Doji_Star'] = talib.CDLDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
     df['Dragonfly_Doji'] = talib.CDLDRAGONFLYDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Engulfing'] = talib.CDLENGULFING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Evening_Doji'] = talib.CDLEVENINGDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Evening_Star'] = talib.CDLEVENINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Up_Down_Gap'] = talib.CDLGAPSIDESIDEWHITE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Gravestone_Doji'] = talib.CDLGRAVESTONEDOJI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hammer'] = talib.CDLHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hanging_Man'] = talib.CDLHANGINGMAN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Harami'] = talib.CDLHARAMI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Harami_Cross'] = talib.CDLHARAMICROSS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['High_Wave'] = talib.CDLHIGHWAVE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Hikkake'] = talib.CDLHIKKAKE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Modified_Hikkake'] = talib.CDLHIKKAKEMOD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Homing_Pigeon'] = talib.CDLHOMINGPIGEON(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Identical_Crows'] = talib.CDLIDENTICAL3CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['In_Neck'] = talib.CDLINNECK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Inverted_Hammer'] = talib.CDLINVERTEDHAMMER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Kicking'] = talib.CDLKICKING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Kicking_Length'] = talib.CDLKICKINGBYLENGTH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Ladder_Bottom'] = talib.CDLLADDERBOTTOM(df['Open'], df['High'], df['Low'], df['Close'])
     df['Long_Doji'] = talib.CDLLONGLEGGEDDOJI(df['Open'], df['High'], df['Low'], df['Close'])
-    df['Marubozu'] = talib.CDLMARUBOZU(df['Open'], df['High'], df['Low'], df['Close'])
     df['Long_Candle'] = talib.CDLLONGLINE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Marubozu'] = talib.CDLMARUBOZU(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Matching_Low'] = talib.CDLMATCHINGLOW(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Mat_Hold'] = talib.CDLMATHOLD(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Morning_Doji'] = talib.CDLMORNINGDOJISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Morning_Star'] = talib.CDLMORNINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['On_Neck'] = talib.CDLONNECK(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Piercing'] = talib.CDLPIERCING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Rickshaw_Man'] = talib.CDLRICKSHAWMAN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Rising_Falling'] = talib.CDLRISEFALL3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Separating_Lines'] = talib.CDLSEPARATINGLINES(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Shooting_Star'] = talib.CDLSHOOTINGSTAR(df['Open'], df['High'], df['Low'], df['Close'])
     df['Short_Candle'] = talib.CDLSHORTLINE(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Spinning_Top'] = talib.CDLSPINNINGTOP(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Stalled'] = talib.CDLSTALLEDPATTERN(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Stick_Sandwich'] = talib.CDLSTICKSANDWICH(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Takuri'] = talib.CDLTAKURI(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Tasuki_Gap'] = talib.CDLTASUKIGAP(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Thrusting'] = talib.CDLTHRUSTING(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Tristar'] = talib.CDLTRISTAR(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Unique_River'] = talib.CDLUNIQUE3RIVER(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Upside_Gap_Crows'] = talib.CDLUPSIDEGAP2CROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
+    df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
+
+    #
+    # #Fractal Dimension
+    # df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
+    # df['Fractal_Dimension'] = 2 - df['Hurst']
 
     # calculate interaction features
+    df['Volume-ATR'] = df['Volume'] / df['ATR']
     df['VWAP-ATR'] = (df['Close'] - df['VWAP']) / df['ATR']
+    df['RSI-MACD'] = df['RSI'] * df['MACD']
     df['Stochastic-RSI'] = df['Fast_%K'] / df['RSI']
+    df['BB-KC'] = df['BB_Width'] / df['KC_Width']
+    df['Ichimoku_Overlap'] = (df['Close'] - df['Kijun_Sen']) / (df['Senkou_Span_B'] - df['Senkou_Span_A'])
+    df['LOW-HIGH_EMA'] = df['LOW_EMA'] / df['HIGH_EMA']
 
     # Candlestick interactions
     df['Closing_Marubozu-OBV'] = df['Closing_Marubozu'] * df['OBV']
@@ -746,35 +979,66 @@ def calculate_indicators(df, window_size=2):
     df['Belt_Hold-ATR'] = df['Belt_Hold'] * df['ATR']
     df['Belt_Hold-RSI'] = df['Belt_Hold'] * df['RSI']
 
+    # drop temporary columns
+    df.drop(['MFV', 'CumulativeVolume', 'Absolute_Momentum', 'Short_EMA_Momentum', 'Short_EMA_Absolute',
+             'Double_EMA_Momentum', 'Double_EMA_Absolute'], axis=1, inplace=True)
     df.replace([np.inf, -np.inf], 0, inplace=True)
     df.dropna(inplace=True)
 
-    # calculate aggregate features
-    df['Confirmed_Fractal_Peak_Mean'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).mean()
-    df['Confirmed_Fractal_Trough_Mean'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).mean()
+    agg_excluded = ['Timestamp', 'Day', 'Session', 'Hour', 'Hour_Sin', 'Hour_Cos', 'Label']
+    agg_period = [4, 16, 48, 96, 384, 1152]  # 1h, 4h, 12h, 1d, 4d, 12d
+    agg_df = pd.DataFrame()
+    for period in agg_period:
+        for feature in df.columns:
+            if feature not in agg_excluded:
+                print(f"Calculating {feature} for period {period}...")
+                agg_df[f'{feature}_Mean_{period}'] = df[feature].rolling(window=period).mean()
+                agg_df[f'{feature}_Dev_{period}'] = df[feature].rolling(window=period).std()
+                agg_df[f'{feature}_Drawdown_{period}'] = (
+                            df[feature] / df[feature].rolling(window=window_size).max() - 1).rolling(
+                    window=window_size).min()
 
-    df['Confirmed_Fractal_Peak_Dev'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).std()
-    df['Confirmed_Fractal_Trough_Dev'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).std()
-    df['Senkou_Span_B_Dev'] = df['Senkou_Span_B'].rolling(window=window_size).std()
-    df['Kijun_Sen_Dev'] = df['Kijun_Sen'].rolling(window=window_size).std()
-    df['Extrema_Unconfirmed_Dev'] = df['Extrema_Unconfirmed'].rolling(window=window_size).std()
+    df['Label_Mean_4'] = df['Label'].shift(1).rolling(window=4).mean()
+    df['Label_Mean_16'] = df['Label'].shift(1).rolling(window=16).mean()
+    df['Label_Mean_48'] = df['Label'].shift(1).rolling(window=48).mean()
+    df['Label_Mean_96'] = df['Label'].shift(1).rolling(window=96).mean()
+    df['Label_Mean_384'] = df['Label'].shift(1).rolling(window=384).mean()
+    df['Label_Mean_1152'] = df['Label'].shift(1).rolling(window=1152).mean()
+    df['Label_Dev_4'] = df['Label'].shift(1).rolling(window=4).std()
+    df['Label_Dev_16'] = df['Label'].shift(1).rolling(window=16).std()
+    df['Label_Dev_48'] = df['Label'].shift(1).rolling(window=48).std()
+    df['Label_Dev_96'] = df['Label'].shift(1).rolling(window=96).std()
+    df['Label_Dev_384'] = df['Label'].shift(1).rolling(window=384).std()
+    df['Label_Dev_1152'] = df['Label'].shift(1).rolling(window=1152).std()
+    df['Label_Drawdown_4'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=4).max() - 1).rolling(
+        window=4).min()
+    df['Label_Drawdown_16'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=16).max() - 1).rolling(
+        window=16).min()
+    df['Label_Drawdown_48'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=48).max() - 1).rolling(
+        window=48).min()
+    df['Label_Drawdown_96'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=96).max() - 1).rolling(
+        window=96).min()
+    df['Label_Drawdown_384'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=384).max() - 1).rolling(
+        window=384).min()
+    df['Label_Drawdown_1152'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=1152).max() - 1).rolling(
+        window=1152).min()
 
-    df['Volatility_Drawdown'] = (df['Volatility'] / df['Volatility'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['MACD_Drawdown'] = (df['MACD'] / df['MACD'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['MACDSignal_Drawdown'] = (df['MACDSignal'] / df['MACDSignal'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['MACDHist_Drawdown'] = (df['MACDHist'] / df['MACDHist'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['OBV_Drawdown'] = (df['OBV'] / df['OBV'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['A/D_Drawdown'] = (df['A/D'] / df['A/D'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Senkou_Span_B_Drawdown'] = (
-            df['Senkou_Span_B'] / df['Senkou_Span_B'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['TSI_Drawdown'] = (df['TSI'] / df['TSI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BB_Lower_Drawdown'] = (df['BB_Lower'] / df['BB_Lower'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
+    df = pd.concat([df, agg_df], axis=1)
+    df = df.dropna(axis=1, thresh=len(df) - 1452)
+    df = df.fillna(0)
+
+    # PCA + k-means
+    scaler = StandardScaler()
+    df_scaled = scaler.fit_transform(df)
+    pca = PCA(n_components=6)
+    pca_data = pca.fit_transform(df_scaled)
+    pca_df = pd.DataFrame(pca_data, columns=['PC1', 'PC2', 'PC3', 'PC4', 'PC5', 'PC6'])
+
+    kmeans = KMeans(n_clusters=8, random_state=42)
+    cluster_labels = kmeans.fit_predict(df_scaled)
+    df['Cluster'] = cluster_labels
+
+    df = pd.concat([df, pca_df], axis=1)
 
     df.dropna(inplace=True)
     # defragmenting dataframe
@@ -788,7 +1052,7 @@ def convert_data_to_windows(data, window_size=2):
         row = {}
 
         for feature in data.columns:
-            if feature != 'Label':
+            if feature != 'Label' and feature != 'Weights':
                 for t in range(window_size):
                     row[f"{feature}_t-{window_size - t}"] = data[feature].iloc[i + t + 1]
 
@@ -796,48 +1060,59 @@ def convert_data_to_windows(data, window_size=2):
         rows.append(row)
 
     window_data = pd.DataFrame(rows)
+    window_data['Weights'] = data['Weights']
 
     return window_data
 
-def trading_simulation(probs, closes, buy_percentage, sell_percentage, overconfidence_mult, starting_money=500, spend_percentage=0.1):
+def trading_simulation(buy_probs, sell_probs, closes, buy_percentage, sell_percentage, overconfidence_mult, starting_money=500, spend_percentage=0.1, holdout_threshold=0.02):
     money = starting_money
     bitcoin = 0
-    probabilities = probs
+    buy_probabilities = buy_probs
+    sell_probabilities = sell_probs
     close_prices = closes
-    sell_order = False
     buy_order = False
-    previous_trade_assets = money
+    sell_order = False
 
     #0 is sell, 2 is buy
     count = 0
     day_count = 0
     overconfidence = 0
+    last_bought_price = 0
+    last_sold_price = 0
+    profitable_trade_count = 0
+    trade_count = 0
     historical_daily_starting_assets = []
-    for probability in probabilities:
-        #print("current probability: " + str(probability))
-        # if count % 96 == 0: #update daily starting assets at the start of each day
-        #     daily_starting_assets = money + (bitcoin * close_prices[count])
-        #     historical_daily_starting_assets.append(daily_starting_assets)
-        #     if len(historical_daily_starting_assets) >= 2:
-        #         if (historical_daily_starting_assets[day_count - 1] * 0.95) > historical_daily_starting_assets[day_count]:
-        #             print(f"Stop-loss triggered on Day {day_count}: more than 5% drop in a single day.")
-        #             print(f"Current money: {money}, Current bitcoin: {bitcoin}, Current count: {count}")
-        #             return
-        #     day_count += 1
+    for i, (buy_probability, sell_probability) in enumerate(zip(buy_probabilities, sell_probabilities)):
+        if count % 96 == 0: #update daily starting assets at the start of each day
+            daily_starting_assets = money + (bitcoin * close_prices[count])
+            historical_daily_starting_assets.append(daily_starting_assets)
+            # if len(historical_daily_starting_assets) >= 2:
+            #     if (historical_daily_starting_assets[day_count - 1] * 0.95) > historical_daily_starting_assets[day_count]:
+            #         print(f"Stop-loss triggered on Day {day_count}: more than 5% drop in a single day.")
+            #         print(f"Current money: {money}, Current bitcoin: {bitcoin}, Current count: {count}")
+            #         return
+            day_count += 1
 
-        if probability[0] >= sell_percentage and sell_order == False:
+        # hold = False
+        # if (probability[0] >= (0.5 - holdout_threshold) and (probability[0] <= (0.5 - holdout_threshold))) and (probability[1] >= (0.5 - holdout_threshold) and (probability[1] <= (0.5 - holdout_threshold))):
+        #     hold = True
+
+        if sell_probability[0] >= sell_percentage and sell_order == False:
             sell_order = True
-        elif probability[2] >= buy_percentage and buy_order == False:
-            overconfidence = (probability[2] - buy_percentage) * overconfidence_mult
+        elif buy_probability[1] >= buy_percentage and buy_order == False:
+            overconfidence = (buy_probability[1] - buy_percentage) * overconfidence_mult
             #print(f"Overconfidence on Day {count}: {overconfidence}")
             buy_order = True
 
-        if sell_order and probability[2] >= sell_percentage:
+        #print(hold)
+        #print(buy_sell)
+        if sell_order and buy_probability[1] >= buy_percentage:
             money += bitcoin * close_prices[count]
-            print(f"Day {day_count}: SOLD {bitcoin} BTC at {close_prices[count]} each.")
+            last_sold_price = close_prices[count]
+            print(f"Day {day_count}: SOLD {bitcoin} BTC at {last_sold_price} each.")
             bitcoin = 0
             sell_order = False
-        elif buy_order and probability[0] >= buy_percentage:
+        elif buy_order and sell_probability[0] >= sell_percentage:
             amount_to_spend = money * (spend_percentage + overconfidence)
             # Avoid spending more than we have if overconfidence is large
             amount_to_spend = min(amount_to_spend, money)
@@ -846,7 +1121,14 @@ def trading_simulation(probs, closes, buy_percentage, sell_percentage, overconfi
             bitcoin += bitcoin_bought
             money -= amount_to_spend
             buy_order = False
-            print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {close_prices[count]} each.")
+            last_bought_price = close_prices[count]
+            print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {last_bought_price} each.")
+
+        if last_sold_price > last_bought_price:
+            profitable_trade_count += 1
+            trade_count += 1
+        else:
+            trade_count += 1
 
         print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
         count += 1
@@ -854,26 +1136,27 @@ def trading_simulation(probs, closes, buy_percentage, sell_percentage, overconfi
     total_assets = money + bitcoin * close_prices[count-2]
     print("Final money: ", total_assets)
     print("Profit: ", total_assets - starting_money)
+    print("Percentage profitable: ", profitable_trade_count / trade_count)
 
 def get_next_interval(interval_seconds):
     now = time.time()
     next_interval = ((now // interval_seconds) + 1) * interval_seconds
     return next_interval - now
 
-window_size = 8
+window_size = 20
 data_train, data_eval, data_test = load_and_preprocess_data("BTCUSDC15m_2020-2025_labeled.csv", window_size)
 scaler = StandardScaler()
-hmm_features = ['Returns', 'Volatility', 'OBV', 'RSI', 'MACD', 'MACDSignal', 'MACDHist', 'BTC-ETC_Diff']
-xg_features = ['Returns', 'Volatility', 'Session', 'Stochastic-RSI', 'Lower_Wick', 'Closing_Marubozu', 'Fast_%K', 'Closing_Marubozu-OBV', 'Upper_Wick', 'Doji-RSI', 'Closing_Marubozu-RSI', 'WILLR', 'Upper_Wick_Ratio',
-               'Confirmed_Fractal_Trough', 'Confirmed_Fractal_Peak', 'Price_Diff', 'Open', 'High', 'Low', 'Close', 'BTC-ETC_Diff', 'State0', 'State1', 'State2', 'State3', 'State4', 'Label']
+hmm_features = ['Chikou_Span_Dev_48', 'Doji-RSI', 'Lower_Wick', 'Label_Mean_4', 'Upper_Wick_Ratio', 'Returns', 'Upper_Wick', 'Closing_Marubozu', 'Price_Diff', 'Chikou_Span_Drawdown_4', 'Closing_Marubozu-RSI', 'Returns_Mean_4',
+                'Chikou_Span_Dev_96', 'Doji_Mean_4', 'BTC-ETC_Diff', 'Stochastic-RSI', 'WILLR', 'BB_Middle_Drawdown_4', 'Fast_%K', 'Price_Diff_Mean_4', 'Label_Dev_4', 'Volume_Change_Mean_4', 'RSI_Drawdown_4', 'Chikou_Span_Dev_4']
+xg_features = ['Returns', 'Volatility', 'Session', 'Stochastic-RSI', 'Lower_Wick', 'Closing_Marubozu', 'Fast_%K', 'Closing_Marubozu-OBV', 'Upper_Wick', 'Doji-RSI', 'Marubozu-RSI', 'WILLR', 'Upper_Wick_Ratio',
+               'Confirmed_Fractal_Trough', 'Confirmed_Fractal_Peak', 'Price_Diff', 'Open', 'High', 'Low', 'Close', 'BTC-ETC_Diff', 'Cluster', 'PC1', 'PC2', 'PC3', 'PC4', 'PC5', 'PC6', 'Weights', 'Label']
 agg_features = ['Label_Mean_4', 'Label_Mean_16', 'Volume_Mean_4', 'Returns_Mean_4', 'Volume_Drawdown_4', 'Volume_Dev_4', 'Close_Dev_4', 'Label_Mean_96', 'High_Dev_4', 'Label_Dev_4', 'Volume_Mean_16', 'Close_Drawdown_4',
-                'Volume_Change_Drawdown_4', 'Volume_Change_Dev_4', 'Label_Mean_48', 'Returns_Mean_16', 'Volume_Change_Mean_1152', 'Volume_Change_Mean_4', 'Volume_Mean_96', 'Volume_Drawdown_16', 'Low_Drawdown_4',
+                'Volume_Change_Dev_4', 'Label_Mean_48', 'Returns_Mean_16', 'Volume_Change_Mean_1152', 'Volume_Change_Mean_4', 'Volume_Mean_96', 'Volume_Drawdown_16', 'Low_Drawdown_4',
                 'Open_Drawdown_4', 'Label_Dev_16', 'Returns_Dev_4', 'Label_Dev_96', 'Returns_Dev_384', 'Volume_Change_Dev_1152', 'High_Dev_48', 'Label_Mean_384', 'Label_Dev_48', 'Returns_Dev_48', 'Returns_Dev_16',
-                'Volume_Dev_16', 'Open_Dev_16', 'Returns_Mean_96', 'Volume_Change_Mean_96', 'Volume_Mean_1152', 'Returns_Dev_1152', 'Volume_Dev_96', 'Close_Dev_384', 'Low_Dev_16', 'Returns_Mean_48', 'Volume_Change_Drawdown_16',
+                'Volume_Dev_16', 'Open_Dev_16', 'Returns_Mean_96', 'Volume_Change_Mean_96', 'Volume_Mean_1152', 'Returns_Dev_1152', 'Volume_Dev_96', 'Close_Dev_384', 'Low_Dev_16', 'Returns_Mean_48',
                 'Volume_Drawdown_48', 'Low_Drawdown_48', 'High_Drawdown_4', 'Label_Dev_384', 'Volatility_Dev_1152', 'Volatility_Dev_96', 'Volatility_Dev_48', 'Returns_Dev_96', 'High_Dev_96', 'Open_Dev_48', 'Volatility_Mean_384',
                 'Aroon_Dev_4', 'VWAP_Dev_4', 'RSI_Dev_4', 'A/D_Dev_16', 'ADX_Dev_4', 'MACDHist_Drawdown_4', 'A/D_Drawdown_4', 'VWAP_Drawdown_4', 'RSI_Drawdown_4', 'Aroon_Mean_16', 'VWAP_Mean_4', 'HIGH_EMA_Drawdown_4', 'MACDHist_Dev_4',
-                'ADX_Mean_96', 'ADX_Drawdown_4', 'A/D_Dev_4', 'ATR_Drawdown_4', 'Fast_%K_Drawdown_4', 'CMF_Dev_4', 'A/D_Dev_96', 'RSI_Dev_16', 'ADX_Dev_16', 'Fast_%K_Dev_384', 'HIGH_EMA_Dev_4', 'CCI_Mean_16', 'ADX_Dev_1152', 'CCI_Dev_384',
-                'Aroon_Dev_384', 'A/D_Dev_48', 'Fast_%D_Dev_4', 'ADX_Mean_384', 'Aroon_Dev_48', 'ADX_Dev_48', 'CCI_Dev_48', 'Fast_%D_Dev_384', 'CCI_Dev_16', 'ADX_Mean_4', 'Aroon_Dev_16', 'MACDSignal_Dev_4', 'TSI_Dev_16', 'CCI_Dev_96',
+                'ADX_Mean_96', 'ADX_Drawdown_4', 'Fast_%D_Dev_384', 'CCI_Dev_16', 'ADX_Mean_4', 'Aroon_Dev_16', 'MACDSignal_Dev_4', 'TSI_Dev_16', 'CCI_Dev_96',
                 'Fast_%K_Dev_96', 'Aroon_Dev_96', 'Fast_%D_Drawdown_4', 'CCI_Dev_4', 'ATR_Drawdown_16', 'CMF_Drawdown_4', 'Fast_%K_Mean_1152',
                 'Chikou_Span_Dev_48', 'Chikou_Span_Dev_96', 'Chikou_Span_Dev_4', 'Senkou_Span_B_Dev_4', 'KC_Middle_Dev_4', 'Tenkan_Sen_Dev_4', 'BB_Upper_Dev_4', 'Kijun_Sen_Dev_4', 'Chikou_Span_Drawdown_4', 'KC_Width_Drawdown_4',
                 'Senkou_Span_B_Dev_48', 'Chikou_Span_Mean_16', 'BB_Middle_Drawdown_4', 'KC_Upper_Dev_4', 'BB_Upper_Dev_16', 'KC_Width_Dev_4', 'BB_Width_Dev_384', 'BB_Width_Dev_4', 'BB_Lower_Drawdown_4', 'Chikou_Span_Dev_16',
@@ -885,7 +1168,7 @@ agg_features = ['Label_Mean_4', 'Label_Mean_16', 'Volume_Mean_4', 'Returns_Mean_
                 'Lower_Wick_Ratio_Mean_4', 'Confirmed_Fractal_Trough_Mean_4', 'Confirmed_Fractal_Trough_Dev_4', 'Price_Diff_Mean_16', 'Upper_Wick_Ratio_Dev_48', 'Upper_Wick_Ratio_Dev_16', 'Extrema_Unconfirmed_Dev_48',
                 'Confirmed_Fractal_Trough_Mean_16', 'Confirmed_Fractal_Peak_Mean_48', 'Body_Ratio_Mean_48', 'Confirmed_Fractal_Peak_Dev_48', 'Lower_Wick_Mean_16', 'Upper_Wick_Mean_4', 'Body_Size_Mean_4', 'Lower_Wick_Ratio_Dev_48', 'Range_Mean_4',
                 'Short_Candle_Dev_4', 'Stochastic-RSI_Mean_16', 'Long_Candle_Mean_4', 'Ichimoku_Overlap_Dev_4', 'Volume-ATR_Dev_4', 'LOW-HIGH_EMA_Mean_16', 'Doji_Mean_4', 'Short_Candle_Dev_16', 'Dragonfly_Doji_Mean_96',
-                'VWAP-ATR_Dev_4', 'Doji_Mean_16', 'Stochastic-RSI_Mean_48', 'Stochastic-RSI_Dev_1152', 'Stochastic-RSI_Drawdown_4', 'LOW-HIGH_EMA_Dev_384', 'Belt_Hold_Mean_1152', 'Dragonfly_Doji_Dev_96', 'Ichimoku_Overlap_Mean_4',
+                'VWAP-ATR_Dev_4', 'Doji_Mean_16', 'Stochastic-RSI_Mean_48', 'Stochastic-RSI_Dev_1152', 'LOW-HIGH_EMA_Dev_384', 'Belt_Hold_Mean_1152', 'Dragonfly_Doji_Dev_96', 'Ichimoku_Overlap_Mean_4',
                 'Stochastic-RSI_Mean_1152', 'Stochastic-RSI_Mean_384', 'VWAP-ATR_Dev_16', 'Ichimoku_Overlap_Mean_96', 'BB-KC_Mean_96', 'Long_Candle_Dev_384', 'LOW-HIGH_EMA_Mean_96', 'VWAP-ATR_Mean_4', 'Stochastic-RSI_Dev_96',
                 'Belt_Hold_Mean_96', 'LOW-HIGH_EMA_Mean_48', 'Marubozu_Mean_16', 'Volume-ATR_Dev_96', 'Ichimoku_Overlap_Mean_16', 'LOW-HIGH_EMA_Drawdown_4', 'BB-KC_Drawdown_4', 'LOW-HIGH_EMA_Dev_4', 'BB-KC_Dev_384',
                 'Long_Candle_Dev_4', 'Long_Doji_Dev_16', 'Closing_Marubozu_Dev_384', 'Doji-RSI_Mean_16', 'Doji-RSI_Mean_4', 'Short_Candle-OBV_Dev_4', 'Belt_Hold-ATR_Dev_4', 'Closing_Marubozu-RSI_Dev_384', 'Short_Candle-ATR_Mean_1152', 'Belt_Hold-RSI_Dev_384', 'Belt_Hold-RSI_Mean_48',
@@ -894,100 +1177,94 @@ agg_features = ['Label_Mean_4', 'Label_Mean_16', 'Volume_Mean_4', 'Returns_Mean_
                 'Belt_Hold-ATR_Mean_4', 'Dragonfly_Doji-OBV_Mean_96', 'Closing_Marubozu-OBV_Mean_16', 'Doji-OBV_Dev_4', 'Long_Candle-RSI_Dev_96', 'Belt_Hold-OBV_Mean_48', 'Doji-RSI_Mean_48', 'Doji-ATR_Mean_384',
                 'Doji-ATR_Mean_96', 'Doji-ATR_Mean_16', 'Long_Candle-OBV_Mean_1152', 'Short_Candle-ATR_Mean_16']
 
-#Closing_Marubozu-OBV, Closing_Marubozu-ATR, Closing_Marubozu-RSI, Marubozu-OBV, Marubozu-ATR, Marubozu-RSI, Short_Candle-OBV, Short_Candle-ATR, Short_Candle-RSI, Long_Candle-OBV, Long_Candle-ATR, Long_Candle-RSI, Doji-OBV, Doji-ATR, Doji-RSI, Long_Doji-OBV, Long_Doji-ATR, Long_Doji-RSI, Dragonfly_Doji-OBV, Dragonfly_Doji-ATR, Dragonfly_Doji-RSI, Belt_Hold-OBV, Belt_Hold-ATR, Belt_Hold-RSI
-#4, 16, 48, 96, 384, 1152
-#feature_Mean_period, Mean, Dev, Drawdown
+#2 window size
+#Best score:  0.5892879682007117
+#Best params:  OrderedDict({'xgb__colsample_bylevel': 1.0, 'xgb__colsample_bynode': 1.0, 'xgb__colsample_bytree': 0.927616651458385, 'xgb__gamma': 0.0, 'xgb__grow_policy': 'depthwise', 'xgb__learning_rate': 0.04007596439288112, 'xgb__max_bin': 128, 'xgb__max_delta_step': 0, 'xgb__max_depth': 5, 'xgb__min_child_weight': 8, 'xgb__n_estimators': 3500, 'xgb__reg_alpha': 4.572326770338605, 'xgb__reg_lambda': 13.0, 'xgb__subsample': 1.0})
+#0.595203405239336
+#Accuracy of sells: 0.5953649770727476
+#Accuracy of buys: 0.5053729948606136
+#Combined accuracy: 1.1007379719333612
 
-#Label_Mean_4, Label_Mean_16, Volume_Mean_4, Returns_Mean_4, Volume_Drawdown_4, Volume_Dev_4, Close_Dev_4, Label_Mean_96, High_Dev_4, Label_Dev_4, Volume_Mean_16, Close_Drawdown_4,
-#Volume_Change_Drawdown_4, Volume_Change_Dev_4, Label_Mean_48, Returns_Mean_16, Volume_Change_Mean_1152, Volume_Change_Mean_4, Volume_Mean_96, Volume_Drawdown_16, Low_Drawdown_4,
-#Open_Drawdown_4, Label_Dev_16, Returns_Dev_4, Label_Dev_96, Returns_Dev_384, Volume_Change_Dev_1152, High_Dev_48, Label_Mean_384, Label_Dev_48, Returns_Dev_48, Returns_Dev_16,
-#Volume_Dev_16, Open_Dev_16, Returns_Mean_96, Volume_Change_Mean_96, Volume_Mean_1152, Returns_Dev_1152, Volume_Dev_96, Close_Dev_384, Low_Dev_16, Returns_Mean_48, Volume_Change_Drawdown_16,
-#Volume_Drawdown_48, Low_Drawdown_48, High_Drawdown_4, Label_Dev_384, Volatility_Dev_1152, Volatility_Dev_96, Volatility_Dev_48, Returns_Dev_96, High_Dev_96, Open_Dev_48, Volatility_Mean_384
+#17 window size
+#Best score:  0.594385968803643
+#Best params:  OrderedDict({'xgb__colsample_bylevel': 0.8085396792511581, 'xgb__colsample_bynode': 0.8876821894139413, 'xgb__colsample_bytree': 0.679511465960702, 'xgb__gamma': 10.491903544013493, 'xgb__grow_policy': 'lossguide', 'xgb__learning_rate': 0.0607939140657759, 'xgb__max_bin': 377, 'xgb__max_delta_step': 4, 'xgb__max_depth': 5, 'xgb__min_child_weight': 10, 'xgb__n_estimators': 3243, 'xgb__reg_alpha': 5.262822058376219, 'xgb__reg_lambda': 7.952680423784649, 'xgb__subsample': 0.44407959603876546})
+#0.5977116397645841
+#Accuracy of sells: 0.6535550316416429
+#Accuracy of buys: 0.45339775561097256
+#Combined accuracy: 1.1069527872526155
 
-#Aroon_Dev_4, VWAP_Dev_4, RSI_Dev_4, A/D_Dev_16, ADX_Dev_4, MACDHist_Drawdown_4, A/D_Drawdown_4, VWAP_Drawdown_4, RSI_Drawdown_4, Aroon_Mean_16, VWAP_Mean_4, HIGH_EMA_Drawdown_4, MACDHist_Dev_4,
-#ADX_Mean_96, ADX_Drawdown_4, A/D_Dev_4, ATR_Drawdown_4, Fast_%K_Drawdown_4, CMF_Dev_4, A/D_Dev_96, RSI_Dev_16, ADX_Dev_16, Fast_%K_Dev_384, HIGH_EMA_Dev_4, CCI_Mean_16, ADX_Dev_1152, CCI_Dev_384,
-#Aroon_Dev_384, A/D_Dev_48, Fast_%D_Dev_4, ADX_Mean_384, Aroon_Dev_48, ADX_Dev_48, CCI_Dev_48, Fast_%D_Dev_384, CCI_Dev_16, ADX_Mean_4, Aroon_Dev_16, MACDSignal_Dev_4, TSI_Dev_16, CCI_Dev_96,
-#Fast_%K_Dev_96, Aroon_Dev_96, Fast_%D_Drawdown_4, CCI_Dev_4, ATR_Drawdown_16, CMF_Drawdown_4, Fast_%K_Mean_1152
+#22 window size
+#Best score:  0.5952416836047983
+#Best params:  OrderedDict({'xgb__colsample_bylevel': 0.8670140089927842, 'xgb__colsample_bynode': 0.9696848688013859, 'xgb__colsample_bytree': 0.5818035893192751, 'xgb__gamma': 2.261103501185162, 'xgb__grow_policy': 'lossguide', 'xgb__learning_rate': 0.013114125453903001, 'xgb__max_bin': 304, 'xgb__max_delta_step': 5, 'xgb__max_depth': 5, 'xgb__min_child_weight': 9, 'xgb__n_estimators': 2102, 'xgb__reg_alpha': 4.516802985129322, 'xgb__reg_lambda': 0.2906144030671843, 'xgb__subsample': 0.5734473370937962})
+#0.6016256115225544
+#Accuracy of sells: 0.6287380568308724
+#Accuracy of buys: 0.4803615960099751
+#Combined accuracy: 1.1090996528408474
 
-#Chikou_Span_Dev_48, Chikou_Span_Dev_96, Chikou_Span_Dev_4, Senkou_Span_B_Dev_4, KC_Middle_Dev_4, Tenkan_Sen_Dev_4, BB_Upper_Dev_4, Kijun_Sen_Dev_4, Chikou_Span_Drawdown_4, KC_Width_Drawdown_4
-#Senkou_Span_B_Dev_48, Chikou_Span_Mean_16, BB_Middle_Drawdown_4, KC_Upper_Dev_4, BB_Upper_Dev_16, KC_Width_Dev_4, BB_Width_Dev_384, BB_Width_Dev_4, BB_Lower_Drawdown_4, Chikou_Span_Dev_16,
-#R2_Dev_4, Chikou_Span_Mean_4, Senkou_Span_A_Dev_4, PP_Dev_4, BB_Width_Dev_16, Senkou_Span_B_Dev_16, BB_Lower_Dev_4, Senkou_Span_B_Drawdown_4, R1_Dev_4, Tenkan_Sen_Dev_16, BB_Middle_Dev_4
+#6 window size
+#Best score:  0.5906738361580068
+#Best params:  OrderedDict({'xgb__colsample_bylevel': 0.8670140089927842, 'xgb__colsample_bynode': 0.9696848688013859, 'xgb__colsample_bytree': 0.5818035893192751, 'xgb__gamma': 2.261103501185162, 'xgb__grow_policy': 'lossguide', 'xgb__learning_rate': 0.013114125453903001, 'xgb__max_bin': 304, 'xgb__max_delta_step': 5, 'xgb__max_depth': 5, 'xgb__min_child_weight': 9, 'xgb__n_estimators': 2102, 'xgb__reg_alpha': 4.516802985129322, 'xgb__reg_lambda': 0.2906144030671843, 'xgb__subsample': 0.5734473370937962})
+#0.5936321584673754
+#Accuracy of sells: 0.5836846020332259
+#Accuracy of buys: 0.5073208722741434
+#Combined accuracy: 1.0910054743073694
 
-#Price_Diff_Mean_4, Extrema_Unconfirmed_Mean_96, Body_Ratio_Mean_4, Extrema_Unconfirmed_Mean_48, Extrema_Unconfirmed_Dev_16, Body_Ratio_Mean_16, Confirmed_Fractal_Peak_Mean_16, Confirmed_Fractal_Peak_Mean_4,
-#Extrema_Unconfirmed_Mean_1152, Confirmed_Fractal_Peak_Dev_4, Body_Ratio_Dev_4, Price_Diff_Mean_1152, Lower_Wick_Ratio_Dev_16, Confirmed_Fractal_Trough_Mean_48, Extrema_Unconfirmed_Dev_384,
-#Upper_Wick_Ratio_Dev_384, Extrema_Unconfirmed_Mean_384, Confirmed_Fractal_Peak_Dev_16, Price_Diff_Mean_96, Body_Ratio_Mean_96, Price_Diff_Mean_384, Extrema_Unconfirmed_Mean_16, Upper_Wick_Ratio_Mean_16,
-#Upper_Wick_Mean_16, Body_Ratio_Dev_16, Upper_Wick_Ratio_Dev_1152, Range_Dev_4, Body_Ratio_Mean_384, Price_Diff_Mean_48, Upper_Wick_Dev_4, Upper_Wick_Dev_16, Lower_Wick_Ratio_Dev_96,
-#Lower_Wick_Ratio_Mean_4, Confirmed_Fractal_Trough_Mean_4, Confirmed_Fractal_Trough_Dev_4, Price_Diff_Mean_16, Upper_Wick_Ratio_Dev_48, Upper_Wick_Ratio_Dev_16, Extrema_Unconfirmed_Dev_48,
-#Confirmed_Fractal_Trough_Mean_16, Confirmed_Fractal_Peak_Mean_48, Body_Ratio_Mean_48, Confirmed_Fractal_Peak_Dev_48, Lower_Wick_Mean_16, Upper_Wick_Mean_4, Body_Size_Mean_4, Lower_Wick_Ratio_Dev_48, Range_Mean_4
+#10 window size
+#Best score:  0.5908093241286209
+#est params:  OrderedDict({'xgb__colsample_bylevel': 0.8670140089927842, 'xgb__colsample_bynode': 0.9696848688013859, 'xgb__colsample_bytree': 0.5818035893192751, 'xgb__gamma': 2.261103501185162, 'xgb__grow_policy': 'lossguide', 'xgb__learning_rate': 0.013114125453903001, 'xgb__max_bin': 304, 'xgb__max_delta_step': 5, 'xgb__max_depth': 5, 'xgb__min_child_weight': 9, 'xgb__n_estimators': 2102, 'xgb__reg_alpha': 4.516802985129322, 'xgb__reg_lambda': 0.2906144030671843, 'xgb__subsample': 0.5734473370937962})
+#0.5948786979725137
+#Accuracy of sells: 0.5923859126984127
+#Accuracy of buys: 0.5057650358367093
+#Combined accuracy: 1.098150948535122
 
-#Short_Candle_Dev_4, Stochastic-RSI_Mean_16, Long_Candle_Mean_4, Ichimoku_Overlap_Dev_4, Volume_ATR_Dev_4, LOW-HIGH_EMA_Mean_16, Doji_Mean_4, Short_Candle_Dev_16, Dragonfly_Doji_Mean_96,
-#VWAP-ATR_Dev_4, Doji_Mean_16, Stochastic-RSI_Mean_48, Stochastic-RSI_Dev_1152, Stochastic-RSI_Drawdown_4, LOW-HIGH_EMA_Dev_384, Belt_Hold_Mean_1152, Dragonfly_Doji_Dev_96, Ichimoku_Overlap_Mean_4,
-#Stochastic-RSI_Mean_1152, Stochastic-RSI_Mean_384, VWAP-ATR_Dev_16, Ichimoku_Overlap_Mean_96, BB-KC_Mean_96, Long_Candle_Dev_384, LOW-HIGH_EMA_Mean_96, VWAP-ATR_Mean_4, Stochastic-RSI_Dev_96,
-#Belt_Hold_Mean_96, LOW-HIGH_EMA_Mean_48, Marubozu_Mean_16, Volume-ATR_Dev_96, Ichimoku_Overlap_Mean_16, LOW-HIGH_EMA_Drawdown_4, BB-KC_Drawdown_4, LOW-HIGH_EMA_Dev_4, BB-KC_Dev_384,
-#Long_Candle_Dev_4, Long_Doji_Dev_16, Closing_Marubozu_Dev_384, BB-KC_Dev_4, Stochastic-RSI_Dev_16, VWAP-ATR_Dev_96, Long_Doji_Dev_4, BB-KC_Mean_4, Marubozu_Mean_1152, Volume-ATR_Drawdown_4
-#Belt_Hold_Dev_384, LOW-HIGH_EMA_Mean_4, Long_Candle_Mean_16, Ichimoku_Overlap_Dev_96, BB-KC_Dev_48, Short_Candle_Dev_96, RSI-MACD_Mean_384, Dragonfly_Doji_Mean_16, LOW-HIGH_EMA_Dev_48
-
-#Doji-RSI_Mean_16, Doji-RSI_Mean_4, Short_Candle-OBV_Dev_4, Belt_Hold-ATR_Dev_4, Closing_Marubozu-RSI_Dev_384, Short_Candle-ATR_Mean_1152, Belt_Hold-RSI_Dev_384, Belt_Hold-RSI_Mean_48,
-#Long_Candle-RSI_Mean_4, Long_Candle-OBV_Mean_4, Long_Candle-RSI_Dev_384, Short_Candle-ATR_Dev_1152, Belt_Hold-ATR_Mean_1152, Belt_Hold-OBV_Mean_1152, Short_Candle-RSI_Dev_4,
-#Closing_Marubozu-RSI_Dev_4, Belt_Hold-RSI_Mean_1152, Belt_Hold-OBV_Mean_96, Marubozu-RSI_Mean_1152, Closing_Marubozu-RSI_Mean_16, Short_Candle-RSI_Dev_16, Closing_Marubozu-RSI_Dev_16,
-#Belt_Hold-ATR_Mean_4, Dragonfly_Doji-OBV_Mean_96, Closing_Marubozu-OBV_Mean_16, Doji-OBV_Dev_4, Long_Candle-RSI_Dev_96, Belt_Hold-OBV_Mean_48, Doji-RSI_Mean_48, Doji-ATR_Mean_384,
-#Doji-ATR_Mean_96, Doji-ATR_Mean_16, Long_Candle-OBV_Mean_1152, Short_Candle-ATR_Mean_16
-
-hmm_path = train_hmm(data_train, hmm_features, scaler, 5)
+hmm_comps = 2
+hmm_path = train_hmm(pd.concat([data_test, data_eval, data_train], ignore_index=True), hmm_features, scaler, hmm_comps)
 hmm_model = load_hmm(hmm_path)
-states = predict_states(hmm_model, data_train, hmm_features, scaler)
-states_eval = predict_states(hmm_model, data_eval, hmm_features, scaler)
-states_test = predict_states(hmm_model, data_test, hmm_features, scaler)
 
-data_train_states0 = []
-data_train_states1 = []
-data_train_states2 = []
-data_train_states3 = []
-data_train_states4 = []
-data_eval_states0 = []
-data_eval_states1 = []
-data_eval_states2 = []
-data_eval_states3 = []
-data_eval_states4 = []
-data_test_states0 = []
-data_test_states1 = []
-data_test_states2 = []
-data_test_states3 = []
-data_test_states4 = []
-for i in range(len(states)):
-    data_train_states0.append(states[i][0])
-    data_train_states1.append(states[i][1])
-    data_train_states2.append(states[i][2])
-    data_train_states3.append(states[i][3])
-    data_train_states4.append(states[i][4])
-for i in range(len(states_eval)):
-    data_eval_states0.append(states_eval[i][0])
-    data_eval_states1.append(states_eval[i][1])
-    data_eval_states2.append(states_eval[i][2])
-    data_eval_states3.append(states_eval[i][3])
-    data_eval_states4.append(states_eval[i][4])
-for i in range(len(states_test)):
-    data_test_states0.append(states_test[i][0])
-    data_test_states1.append(states_test[i][1])
-    data_test_states2.append(states_test[i][2])
-    data_test_states3.append(states_test[i][3])
-    data_test_states4.append(states_test[i][4])
+#walk forward hmm prediction
+states = []
+data_train_current = pd.DataFrame(columns=data_train[hmm_features].columns)
+train_count = 0
+for index, row in data_train[hmm_features].iterrows():
+    train_count += 1
+    print(train_count)
+    data_train_current = pd.concat([data_train_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+    states.append(predict_states(hmm_model, data_train_current, hmm_features, scaler)[-1])
+    #keeps a window of 500 to improve computational efficiency
+    if train_count >= 1000:
+        data_train_current = data_train_current.drop(data_train_current.index[0])
 
-data_train['State0'] = data_train_states0
-data_train['State1'] = data_train_states1
-data_train['State2'] = data_train_states2
-data_train['State3'] = data_train_states3
-data_train['State4'] = data_train_states4
-data_eval['State0'] = data_eval_states0
-data_eval['State1'] = data_eval_states1
-data_eval['State2'] = data_eval_states2
-data_eval['State3'] = data_eval_states3
-data_eval['State4'] = data_eval_states4
-data_test['State0'] = data_test_states0
-data_test['State1'] = data_test_states1
-data_test['State2'] = data_test_states2
-data_test['State3'] = data_test_states3
-data_test['State4'] = data_test_states4
+states_eval = []
+data_eval_current = pd.DataFrame(columns=data_eval[hmm_features].columns)
+eval_count = 0
+for index, row in data_eval[hmm_features].iterrows():
+    eval_count += 1
+    print(eval_count)
+    data_eval_current = pd.concat([data_eval_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+    states_eval.append(predict_states(hmm_model, data_eval_current, hmm_features, scaler)[-1])
+    if eval_count >= 1000:
+        data_eval_current = data_eval_current.drop(data_eval_current.index[0])
+
+states_test = []
+data_test_current = pd.DataFrame(columns=data_test[hmm_features].columns)
+test_count = 0
+for index, row in data_test[hmm_features].iterrows():
+    test_count += 1
+    print(test_count)
+    data_test_current = pd.concat([data_test_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+    states_test.append(predict_states(hmm_model, data_test_current, hmm_features, scaler)[-1])
+    if test_count >= 1000:
+         data_test_current = data_test_current.drop(data_test_current.index[0])
+
+data_train_states = list(zip(*states))
+data_eval_states = list(zip(*states_eval))
+data_test_states = list(zip(*states_test))
+
+for i in range(hmm_comps):
+    data_train[f'State{i}'] = data_train_states[i]
+    data_eval[f'State{i}'] = data_eval_states[i]
+    data_test[f'State{i}'] = data_test_states[i]
+    xg_features.append(f'State{i}')
 
 #defragmenting the dataframes
 data_train = data_train.copy()
@@ -1003,9 +1280,6 @@ xg_data_test = convert_data_to_windows(data_test[xg_features], window_size)
 data_train = data_train.drop(index=data_train.index[:window_size])
 data_eval = data_eval.drop(index=data_eval.index[:window_size])
 data_test = data_test.drop(index=data_test.index[:window_size])
-
-print(len(data_train))
-print(len(xg_data_train))
 
 #need to reset index so that the concat works properly
 xg_data_train = xg_data_train.reset_index(drop=True)
@@ -1029,8 +1303,12 @@ xg_labels_eval = [int(x) for x in xg_labels_eval]
 xg_labels_test = xg_data_test.pop('Label').tolist()
 xg_labels_test = [int(x) for x in xg_labels_test]
 
-xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, 10, 15)
-#xgboost_path = "xgboost_pipeline.pkl"
+weights = xg_data_train['Weights'].tolist()
+xg_data_train.drop(columns='Weights', inplace=True)
+xg_data_eval.drop(columns='Weights', inplace=True)
+xg_data_test.drop(columns='Weights', inplace=True)
+xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, weights, 15, 40)
+#xgboost_path = "models/buy_pipeline.pkl"
 xgboost_model = load_xgboost(xgboost_path)
 xg_labels_pred = xgboost_model.predict(xg_data_test)
 xg_labels_pred = xg_labels_pred.tolist()
@@ -1047,30 +1325,53 @@ accuracy0 = count0 / xg_labels_test.count(0)
 accuracy1 = count1 / xg_labels_test.count(1)
 ratio0 = xg_labels_test.count(0) / len(xg_labels_test)
 ratio1 = xg_labels_test.count(1) / len(xg_labels_test)
+predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
+predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
 print(f"Accuracy of sells: {accuracy0}")
 print(f"Accuracy of buys: {accuracy1}")
+print(f"Combined accuracy: {accuracy0 + accuracy1}")
 print(f"Ratio of sells: {ratio0}")
 print(f"Ratio of buys: {ratio1}")
+print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
+print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
+print(xg_labels_test.count(0))
+print(xg_labels_pred.count(0))
+print(xg_labels_test.count(1))
+print(xg_labels_pred.count(1))
 
-# recent_df = get_historical_data(1709355600000, 1730433600000)
+# buy_path = "models/buy_pipeline.pkl"
+# sell_path = "models/sell_pipeline.pkl"
+# buy_model = load_xgboost(buy_path)
+# sell_model = load_xgboost(sell_path)
+#
+# recent_df = get_historical_data(1735732800000, 1738411200000)
+# #1735732800000, 1738411200000 -> Jan 2025
+# #1648728000000, 1738324800000 -> March 2023 to now
+# recent_df.to_csv('recent_data.csv')
 # closes = recent_df['Close'].tolist()
 # recent_df = calculate_indicators(recent_df)
 # recent_df = recent_df.dropna()
+# #
+# recent_states = []
+# recent_df_current = pd.DataFrame(columns=recent_df[hmm_features].columns)
+# recent_count = 0
+# for index, row in recent_df[hmm_features].iterrows():
+#     recent_count += 1
+#     recent_df_current = pd.concat([recent_df_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+#     recent_states.append(predict_states(hmm_model, recent_df_current, hmm_features, scaler)[-1])
+#     #keeps a window of 500 to improve computational efficiency
+#     if recent_count >= 1000:
+#         recent_df_current = recent_df_current.drop(recent_df_current.index[0])
 #
-# recent_states = predict_states(hmm_model, recent_df, hmm_features, scaler)
-# recent_state0 = []
-# recent_state1 = []
-# recent_state2 = []
-# for i in range(len(recent_states)):
-#     recent_state0.append(recent_states[i][0])
-#     recent_state1.append(recent_states[i][1])
-#     recent_state2.append(recent_states[i][2])
-# recent_df['State0'] = recent_state0
-# recent_df['State1'] = recent_state1
-# recent_df['State2'] = recent_state2
+# recent_states = list(zip(*recent_states))
+#
+# for i in range(hmm_comps):
+#     xg_features.append(f'State{i}')
+#     recent_df[f'State{i}'] = recent_states[i]
 #
 # #Need this to make recent_df compatible with convert_data_to_windows method
 # recent_df['Label'] = 0
+# recent_df['Weights'] = 0
 # recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
 #
 # recent_df = recent_df.drop(index=recent_df.index[:window_size])
@@ -1078,32 +1379,21 @@ print(f"Ratio of buys: {ratio1}")
 # recent_df_windowed = recent_df_windowed.reset_index(drop=True)
 # recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
 # recent_df.drop(['Label'], axis=1, inplace=True)
+# recent_df.drop(['Weights'], axis=1, inplace=True)
 #
-# probabilities = xgboost_model.predict_proba(recent_df).tolist()
-# probability_0 = []
-# probability_1 = []
-# probability_2 = []
-# count0, count1, count2 = 0, 0, 0
-# for probability in probabilities:
-#     probability_0.append(probability[0])
-#     probability_1.append(probability[1])
-#     probability_2.append(probability[2])
-#     if probability[0] > max(probability[1], probability[2]):
-#         count0 += 1
-#     elif probability[1] > max(probability[0], probability[2]):
-#         count1 += 1
-#     elif probability[2] > max(probability[0], probability[1]):
-#         count2 += 1
-#     else:
-#         count0 += 1
+# buy_probabilities = buy_model.predict_proba(recent_df).tolist()
+# buy_probability_1 = []
+# for probability in buy_probabilities:
+#     buy_probability_1.append(probability[1])
 #
-# print(count0)
-# print(count1)
-# print(count2)
-# print(f"75th percentile of sells: {np.percentile(probability_0, 80)}")
-# print(f"75th percentile of holds: {np.percentile(probability_1, 80)}")
-# print(f"75th percentile of buys: {np.percentile(probability_2, 80)}")
-# trading_simulation(probabilities, closes, np.percentile(probability_2, 91), np.percentile(probability_0, 98), 0, starting_money=1500, spend_percentage=1)
+# sell_probabilities = sell_model.predict_proba(recent_df).tolist()
+# sell_probability_0 = []
+# for probability in sell_probabilities:
+#     sell_probability_0.append(probability[0])
+#
+# print(f"percentile of sells: {np.percentile(sell_probability_0, 80)}")
+# print(f"percentile of buys: {np.percentile(buy_probability_1, 80)}")
+# trading_simulation(buy_probabilities, sell_probabilities, closes, np.percentile(buy_probability_1, 53), np.percentile(sell_probability_0, 53), 20, starting_money=1500, spend_percentage=0.05, holdout_threshold=1)
 #while True:
 #     start_time = time.time()
 #
