@@ -2,16 +2,16 @@ import pandas as pd
 import numpy as np
 from hmmlearn import hmm
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import talib
 from datetime import datetime
-from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
 from skopt import BayesSearchCV
 from skopt.space import Real, Integer, Categorical
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.pipeline import Pipeline
 from xgboost import plot_importance
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.model_selection import TimeSeriesSplit
 import pickle
 import requests
@@ -23,14 +23,18 @@ import hashlib
 import hmac
 import datetime
 import pywt
-from hurst import compute_Hc
+import tkinter as tk
+from tkinter import messagebox
+import warnings
 
+warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
+pd.options.display.float_format = '{:.0f}'.format
 
 api_key = 'IbIgJihiEgl4rEjWnOFazg7F4YVzJXVG8if3iKcGsurgspgblDN2F73XMPdUzOcH'
 
-def load_and_preprocess_data(filepath, window_size=2):
+def load_and_preprocess_data(filepath):
     print(f"Loading data from {filepath}...")
     df = pd.read_csv(filepath, names=['Index', 'Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'Label'])
     df.drop(['Index'], axis=1, inplace=True)
@@ -38,18 +42,32 @@ def load_and_preprocess_data(filepath, window_size=2):
     #Drop useless row
     df = df.astype(float)
 
-    eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'Close'])
+    eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'High', 'Low', 'Close'])
     eth_df.drop(0, inplace=True)
     eth_df = eth_df.astype(float)
-    eth_prices = eth_df['Close'].values
-    df['ETH_Close'] = eth_prices
+    df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
 
+    halving_dates = [
+        datetime.datetime(2020, 5, 11),
+        datetime.datetime(2024, 4, 20),
+        datetime.datetime(2028, 2, 19) #next estimated halving
+    ]
+    halving_cycle_duration = datetime.timedelta(days=365)
+
+    quarters = []
+    months = []
     days = []
+    hours = []
     sessions = []
+    in_halving_cycle = []
+
     for timestamp in df['Timestamp']:
-        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp)/1000)
-        days.append(utc_time.weekday())
+        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
+        month = utc_time.month
+        quarter = (month - 1) // 3 + 1
+        day = utc_time.weekday()
         hour = utc_time.hour
+
         if 0 <= hour < 9:
             session = 0
         elif 7 <= hour < 16:
@@ -58,16 +76,43 @@ def load_and_preprocess_data(filepath, window_size=2):
             session = 2
         else:
             session = 0
-        sessions.append(session)
-    df['Day'] = days
-    df['Session'] = sessions
 
+        in_cycle = False
+        for halving_date in halving_dates:
+            if halving_date <= utc_time <= halving_date + halving_cycle_duration:
+                in_cycle = True
+                break
+
+        quarters.append(quarter)
+        months.append(month)
+        days.append(day)
+        hours.append(hour)
+        sessions.append(session)
+        in_halving_cycle.append(in_cycle)
+
+    df['Quarter'] = quarters
+    df['Month'] = months
+    df['Day'] = days
+    df['Hour'] = hours
+    df['Session'] = sessions
+    df['In_Halving_Cycle'] = in_halving_cycle
+    df['In_Halving_Cycle'] = df['In_Halving_Cycle'].astype(int)
+
+    #Intramarket Difference
+    period = 24
+    btc_cmma = cmma(df['High'], df['Low'], df['Close'], period)
+    eth_cmma = cmma(eth_df['High'], eth_df['Low'], eth_df['Close'], period)
+    df['BTC-ETC_Diff'] = btc_cmma - eth_cmma
+
+    df['Price_Diff'] = df['Close'].diff()
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
-    df['ETH_Returns'] = df['ETH_Close'].pct_change()
+    df['Price_Diff_Future'] = df['Price_Diff'].shift(-1)
+    df['Price_Diff_Future_Abs'] = df['Price_Diff_Future'].abs()
 
-    df['BTC/ETH_Corr'] = df['Returns'].rolling(30).corr(df['ETH_Returns'])
-    df['BTC/ETH_Corr'] = df['BTC/ETH_Corr'].fillna(0)
+    #prob(buy) - prob(sell) = prob(total)
+    #if prob(total) is positive that means the buy signal is stronger, if negative that means the sell signal is stronger
+    #prob(total) * price_diff
 
     #Replaces 0's with a number close to 0 to avoid infinity being present in Volume_Change
     #Since the label column has 0's present, we need to make sure that they are not replaced
@@ -134,7 +179,7 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['Kijun_Sen'] = (df['High'].rolling(window=26).max() + df['Low'].rolling(window=26).min()) / 2
     df['Senkou_Span_A'] = (df['Tenkan_Sen'] + df['Kijun_Sen']) / 2
     df['Senkou_Span_B'] = (df['High'].rolling(window=52).max() + df['Low'].rolling(window=52).min()) / 2
-    df['Chikou_Span'] = df['Close'].shift(-26)
+    df['Chikou_Span'] = df['Close'].shift(26)
 
     #Keltner Channels
     df['KC_Middle'] = talib.EMA(df['Close'], timeperiod=20)
@@ -172,7 +217,6 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].astype(int)
     df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].shift(2)
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].shift(2)
-    df['Price_Diff'] = df['Close'].diff()
 
     #Candlestick patterns
     df['Body_Size'] = abs(df['Close'] - df['Open'])
@@ -248,23 +292,10 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
     df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
 
-    #Calculate correlations
-    df['Close_Corr1'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
-    df['Returns_Corr1'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
-    df['Close_Corr2'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
-    df['Returns_Corr2'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
-    df['Close_Corr3'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
-    df['Returns_Corr3'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
-
-    #Calculate wavelet transforms
-    df[['Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3']] = rolling_wavelet(df['Close'])
-    df[['Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2', 'Wavelet_Volume_Coef3']] = rolling_wavelet(df['Volume'])
-    df[['Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1', 'Wavelet_Returns_Coef2','Wavelet_Returns_Coef3']] = rolling_wavelet(df['Returns'])
-    df[['Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2','Wavelet_Volatility_Coef3']] = rolling_wavelet(df['Volatility'])
-
-    #Fractal Dimension
-    df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
-    df['Fractal_Dimension'] = 2 - df['Hurst']
+    #
+    # #Fractal Dimension
+    # df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
+    # df['Fractal_Dimension'] = 2 - df['Hurst']
 
     #calculate interaction features
     df['Volume-ATR'] = df['Volume'] / df['ATR']
@@ -275,235 +306,315 @@ def load_and_preprocess_data(filepath, window_size=2):
     df['Ichimoku_Overlap'] = (df['Close'] - df['Kijun_Sen']) / (df['Senkou_Span_B'] - df['Senkou_Span_A'])
     df['LOW-HIGH_EMA'] = df['LOW_EMA'] / df['HIGH_EMA']
 
+    #Candlestick interactions
+    df['Closing_Marubozu-OBV'] = df['Closing_Marubozu'] * df['OBV']
+    df['Closing_Marubozu-ATR'] = df['Closing_Marubozu'] * df['ATR']
+    df['Closing_Marubozu-RSI'] = df['Closing_Marubozu'] * df['RSI']
+    df['Marubozu-OBV'] = df['Marubozu'] * df['OBV']
+    df['Marubozu-ATR'] = df['Marubozu'] * df['ATR']
+    df['Marubozu-RSI'] = df['Marubozu'] * df['RSI']
+    df['Short_Candle-OBV'] = df['Short_Candle'] * df['OBV']
+    df['Short_Candle-ATR'] = df['Short_Candle'] * df['ATR']
+    df['Short_Candle-RSI'] = df['Short_Candle'] * df['RSI']
+    df['Long_Candle-OBV'] = df['Long_Candle'] * df['OBV']
+    df['Long_Candle-ATR'] = df['Long_Candle'] * df['ATR']
+    df['Long_Candle-RSI'] = df['Long_Candle'] * df['RSI']
+    df['Doji-OBV'] = df['Doji'] * df['OBV']
+    df['Doji-ATR'] = df['Doji'] * df['ATR']
+    df['Doji-RSI'] = df['Doji'] * df['RSI']
+    df['Long_Doji-OBV'] = df['Long_Doji'] * df['OBV']
+    df['Long_Doji-ATR'] = df['Long_Doji'] * df['ATR']
+    df['Long_Doji-RSI'] = df['Long_Doji'] * df['RSI']
+    df['Dragonfly_Doji-OBV'] = df['Dragonfly_Doji'] * df['OBV']
+    df['Dragonfly_Doji-ATR'] = df['Dragonfly_Doji'] * df['ATR']
+    df['Dragonfly_Doji-RSI'] = df['Dragonfly_Doji'] * df['RSI']
+    df['Belt_Hold-OBV'] = df['Belt_Hold'] * df['OBV']
+    df['Belt_Hold-ATR'] = df['Belt_Hold'] * df['ATR']
+    df['Belt_Hold-RSI'] = df['Belt_Hold'] * df['RSI']
+
+    #Donchain Breakout
+    df['Upper'] = df['Close'].rolling(288 - 1).max().shift(1)
+    df['Lower'] = df['Close'].rolling(288 - 1).min().shift(1)
+    df['Don_Signal'] = np.nan
+    df.loc[df['Close'] > df['Upper'], 'Don_Signal'] = 1
+    df.loc[df['Close'] < df['Lower'], 'Don_Signal'] = -1
+    df['Don_Signal'] = df['Don_Signal'].ffill()
+    df.drop(['Upper', 'Lower'], axis=1, inplace=True)
+
+    # Generate Scree Plot
+    # explained_variance_ratio = pca.explained_variance_ratio_
+    # components = range(1, len(explained_variance_ratio) + 1)
+    #
+    # plt.figure(figsize=(8, 5))
+    # plt.bar(components, explained_variance_ratio, color='blue', alpha=0.7, label='Explained Variance Ratio')
+    # plt.plot(components, explained_variance_ratio, 'ro-', label='Cumulative Explained Variance')
+    # plt.xlabel('Principal Components')
+    # plt.ylabel('Explained Variance Ratio')
+    # plt.title('Scree Plot for RSI PCA Analysis')
+    # plt.legend()
+    # plt.show()
+
+    #drop temporary columns
+    df.drop(['CumulativeVolume', 'Absolute_Momentum', 'Short_EMA_Momentum', 'Short_EMA_Absolute', 'Double_EMA_Momentum', 'Double_EMA_Absolute'], axis=1, inplace=True)
     df.replace([np.inf, -np.inf], 0, inplace=True)
     df.dropna(inplace=True)
 
-    #calculate aggregate features
-    df['Close_Mean'] = df['Close'].rolling(window=window_size).mean()
-    df['High_Mean'] = df['High'].rolling(window=window_size).mean()
-    df['Open_Mean'] = df['Open'].rolling(window=window_size).mean()
-    df['Low_Mean'] = df['Low'].rolling(window=window_size).mean()
-    df['Volume_Mean'] = df['Volume'].rolling(window=window_size).mean()
-    df['OBV_Mean'] = df['OBV'].rolling(window=window_size).mean()
-    df['A/D_Mean'] = df['A/D'].rolling(window=window_size).mean()
-    df['CMF_Mean'] = df['CMF'].rolling(window=window_size).mean()
-    df['VWAP_Mean'] = df['VWAP'].rolling(window=window_size).mean()
-    df['Returns_Mean'] = df['Returns'].rolling(window=window_size).mean()
-    df['Volatility_Mean'] = df['Volatility'].rolling(window=window_size).mean()
-    df['LOW_EMA_Mean'] = df['LOW_EMA'].rolling(window=window_size).mean()
-    df['HIGH_EMA_Mean'] = df['HIGH_EMA'].rolling(window=window_size).mean()
-    df['RSI_Mean'] = df['RSI'].rolling(window=window_size).mean()
-    df['Aroon_Mean'] = df['Aroon'].rolling(window=window_size).mean()
-    df['Fast_%K_Mean'] = df['Fast_%K'].rolling(window=window_size).mean()
-    df['Fast_%D_Mean'] = df['Fast_%D'].rolling(window=window_size).mean()
-    df['WILLR_Mean'] = df['WILLR'].rolling(window=window_size).mean()
-    df['CCI_Mean'] = df['CCI'].rolling(window=window_size).mean()
-    df['ATR_Mean'] = df['ATR'].rolling(window=window_size).mean()
-    df['ADX_Mean'] = df['ADX'].rolling(window=window_size).mean()
-    df['TSI_Mean'] = df['TSI'].rolling(window=window_size).mean()
-    df['BB_Width_Mean'] = df['BB_Width'].rolling(window=window_size).mean()
-    df['BB_Upper_Mean'] = df['BB_Upper'].rolling(window=window_size).mean()
-    df['BB_Middle_Mean'] = df['BB_Middle'].rolling(window=window_size).mean()
-    df['BB_Lower_Mean'] = df['BB_Lower'].rolling(window=window_size).mean()
-    df['MACD_Mean'] = df['MACD'].rolling(window=window_size).mean()
-    df['MACDSignal_Mean'] = df['MACDSignal'].rolling(window=window_size).mean()
-    df['MACDHist_Mean'] = df['MACDHist'].rolling(window=window_size).mean()
-    df['PP_Mean'] = df['PP'].rolling(window=window_size).mean()
-    df['S1_Mean'] = df['S1'].rolling(window=window_size).mean()
-    df['S2_Mean'] = df['S2'].rolling(window=window_size).mean()
-    df['R1_Mean'] = df['R1'].rolling(window=window_size).mean()
-    df['R2_Mean'] = df['R2'].rolling(window=window_size).mean()
-    df['Tenkan_Sen_Mean'] = df['Tenkan_Sen'].rolling(window=window_size).mean()
-    df['Kijun_Sen_Mean'] = df['Kijun_Sen'].rolling(window=window_size).mean()
-    df['Senkou_Span_A_Mean'] = df['Senkou_Span_A'].rolling(window=window_size).mean()
-    df['Senkou_Span_B_Mean'] = df['Senkou_Span_B'].rolling(window=window_size).mean()
-    df['Chikou_Span_Mean'] = df['Chikou_Span'].rolling(window=window_size).mean()
-    df['KC_Width_Mean'] = df['KC_Width'].rolling(window=window_size).mean()
-    df['KC_Upper_Mean'] = df['KC_Upper'].rolling(window=window_size).mean()
-    df['KC_Middle_Mean'] = df['KC_Middle'].rolling(window=window_size).mean()
-    df['KC_Lower_Mean'] = df['KC_Lower'].rolling(window=window_size).mean()
-    df['Volume-ATR_Mean'] = df['Volume-ATR'].rolling(window=window_size).mean()
-    df['VWAP-ATR_Mean'] = df['VWAP-ATR'].rolling(window=window_size).mean()
-    df['RSI-MACD_Mean'] = df['RSI-MACD'].rolling(window=window_size).mean()
-    df['Stochastic-RSI_Mean'] = df['Stochastic-RSI'].rolling(window=window_size).mean()
-    df['BB-KC_Mean'] = df['BB-KC'].rolling(window=window_size).mean()
-    df['Ichimoku_Overlap_Mean'] = df['Ichimoku_Overlap'].rolling(window=window_size).mean()
-    df['LOW-HIGH_EMA_Mean'] = df['LOW-HIGH_EMA'].rolling(window=window_size).mean()
-    df['Extrema_Unconfirmed_Mean'] = df['Extrema_Unconfirmed'].rolling(window=window_size).mean()
-    df['Confirmed_Fractal_Peak_Mean'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).mean()
-    df['Confirmed_Fractal_Trough_Mean'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).mean()
-    df['Body_Size_Mean'] = df['Body_Size'].rolling(window=window_size).mean()
-    df['Upper_Wick_Mean'] = df['Upper_Wick'].rolling(window=window_size).mean()
-    df['Lower_Wick_Mean'] = df['Lower_Wick'].rolling(window=window_size).mean()
-    df['Range_Mean'] = df['Range'].rolling(window=window_size).mean()
-    df['Body_Ratio_Mean'] = df['Body_Ratio'].rolling(window=window_size).mean()
-    df['Upper_Wick_Ratio_Mean'] = df['Upper_Wick_Ratio'].rolling(window=window_size).mean()
-    df['Lower_Wick_Ratio_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
-    df['Price_Diff_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
-    df['BTC/ETH_Corr_Mean'] = df['BTC/ETH_Corr'].rolling(window=window_size).mean()
-    df['Fractal_Dimension_Mean'] = df['Fractal_Dimension'].rolling(window=window_size).mean()
+    agg_excluded = ['Timestamp', 'Day', 'Session', 'Hour', 'Hour_Sin', 'Hour_Cos', 'Label', 'Price_Diff_Future_Abs', 'Price_Diff_Future']
+    agg_period = [4, 16, 48, 96, 384, 1152] #1h, 4h, 12h, 1d, 4d, 12d
+    agg_df = pd.DataFrame()
+    for period in agg_period:
+        for feature in df.columns:
+            if feature not in agg_excluded:
+                agg_df[f'{feature}_Mean_{period}'] = df[feature].rolling(window=period).mean()
+                agg_df[f'{feature}_Dev_{period}'] = df[feature].rolling(window=period).std()
+                agg_df[f'{feature}_Drawdown_{period}'] = (df[feature] / df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
 
-    df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
-    df['High_Dev'] = df['High'].rolling(window=window_size).std()
-    df['Open_Dev'] = df['Open'].rolling(window=window_size).std()
-    df['Low_Dev'] = df['Low'].rolling(window=window_size).std()
-    df['Volume_Dev'] = df['Volume'].rolling(window=window_size).std()
-    df['OBV_Dev'] = df['OBV'].rolling(window=window_size).std()
-    df['A/D_Dev'] = df['A/D'].rolling(window=window_size).std()
-    df['CMF_Dev'] = df['CMF'].rolling(window=window_size).std()
-    df['VWAP_Dev'] = df['VWAP'].rolling(window=window_size).std()
-    df['Returns_Dev'] = df['Returns'].rolling(window=window_size).std()
-    df['Volatility_Dev'] = df['Volatility'].rolling(window=window_size).std()
-    df['LOW_EMA_Dev'] = df['LOW_EMA'].rolling(window=window_size).std()
-    df['HIGH_EMA_Dev'] = df['HIGH_EMA'].rolling(window=window_size).std()
-    df['RSI_Dev'] = df['RSI'].rolling(window=window_size).std()
-    df['Aroon_Dev'] = df['Aroon'].rolling(window=window_size).std()
-    df['Fast_%K_Dev'] = df['Fast_%K'].rolling(window=window_size).std()
-    df['Fast_%D_Dev'] = df['Fast_%D'].rolling(window=window_size).std()
-    df['WILLR_Dev'] = df['WILLR'].rolling(window=window_size).std()
-    df['CCI_Dev'] = df['CCI'].rolling(window=window_size).std()
-    df['ATR_Dev'] = df['ATR'].rolling(window=window_size).std()
-    df['ADX_Dev'] = df['ADX'].rolling(window=window_size).std()
-    df['TSI_Dev'] = df['TSI'].rolling(window=window_size).std()
-    df['BB_Width_Dev'] = df['BB_Width'].rolling(window=window_size).std()
-    df['BB_Upper_Dev'] = df['BB_Upper'].rolling(window=window_size).std()
-    df['BB_Middle_Dev'] = df['BB_Middle'].rolling(window=window_size).std()
-    df['BB_Lower_Dev'] = df['BB_Lower'].rolling(window=window_size).std()
-    df['MACD_Dev'] = df['MACD'].rolling(window=window_size).std()
-    df['MACDSignal_Dev'] = df['MACDSignal'].rolling(window=window_size).std()
-    df['MACDHist_Dev'] = df['MACDHist'].rolling(window=window_size).std()
-    df['PP_Dev'] = df['PP'].rolling(window=window_size).std()
-    df['S1_Dev'] = df['S1'].rolling(window=window_size).std()
-    df['S2_Dev'] = df['S2'].rolling(window=window_size).std()
-    df['R1_Dev'] = df['R1'].rolling(window=window_size).std()
-    df['R2_Dev'] = df['R2'].rolling(window=window_size).std()
-    df['Tenkan_Sen_Dev'] = df['Tenkan_Sen'].rolling(window=window_size).std()
-    df['Kijun_Sen_Dev'] = df['Kijun_Sen'].rolling(window=window_size).std()
-    df['Senkou_Span_A_Dev'] = df['Senkou_Span_A'].rolling(window=window_size).std()
-    df['Senkou_Span_B_Dev'] = df['Senkou_Span_B'].rolling(window=window_size).std()
-    df['Chikou_Span_Dev'] = df['Chikou_Span'].rolling(window=window_size).std()
-    df['KC_Width_Dev'] = df['KC_Width'].rolling(window=window_size).std()
-    df['KC_Upper_Dev'] = df['KC_Upper'].rolling(window=window_size).std()
-    df['KC_Middle_Dev'] = df['KC_Middle'].rolling(window=window_size).std()
-    df['KC_Lower_Dev'] = df['KC_Lower'].rolling(window=window_size).std()
-    df['Volume-ATR_Dev'] = df['Volume-ATR'].rolling(window=window_size).std()
-    df['VWAP-ATR_Dev'] = df['VWAP-ATR'].rolling(window=window_size).std()
-    df['RSI-MACD_Dev'] = df['RSI-MACD'].rolling(window=window_size).std()
-    df['Stochastic-RSI_Dev'] = df['Stochastic-RSI'].rolling(window=window_size).std()
-    df['BB-KC_Dev'] = df['BB-KC'].rolling(window=window_size).std()
-    df['Ichimoku_Overlap_Dev'] = df['Ichimoku_Overlap'].rolling(window=window_size).std()
-    df['LOW-HIGH_EMA_Dev'] = df['LOW-HIGH_EMA'].rolling(window=window_size).std()
-    df['Extrema_Unconfirmed_Dev'] = df['Extrema_Unconfirmed'].rolling(window=window_size).std()
-    df['Confirmed_Fractal_Peak_Dev'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).std()
-    df['Confirmed_Fractal_Trough_Dev'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).std()
-    df['Body_Size_Dev'] = df['Body_Size'].rolling(window=window_size).std()
-    df['Upper_Wick_Dev'] = df['Upper_Wick'].rolling(window=window_size).std()
-    df['Lower_Wick_Dev'] = df['Lower_Wick'].rolling(window=window_size).std()
-    df['Range_Dev'] = df['Range'].rolling(window=window_size).std()
-    df['Body_Ratio_Dev'] = df['Body_Ratio'].rolling(window=window_size).std()
-    df['Upper_Wick_Ratio_Dev'] = df['Upper_Wick_Ratio'].rolling(window=window_size).std()
-    df['Lower_Wick_Ratio_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
-    df['Price_Diff_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
-    df['BTC/ETH_Corr_Dev'] = df['BTC/ETH_Corr'].rolling(window=window_size).std()
-    df['Fractal_Dimension_Dev'] = df['Fractal_Dimension'].rolling(window=window_size).std()
+    df['Label_Mean_4'] = df['Label'].shift(1).rolling(window=4).mean()
+    df['Label_Mean_16'] = df['Label'].shift(1).rolling(window=16).mean()
+    df['Label_Mean_48'] = df['Label'].shift(1).rolling(window=48).mean()
+    df['Label_Mean_96'] = df['Label'].shift(1).rolling(window=96).mean()
+    df['Label_Mean_384'] = df['Label'].shift(1).rolling(window=384).mean()
+    df['Label_Mean_1152'] = df['Label'].shift(1).rolling(window=1152).mean()
+    df['Label_Dev_4'] = df['Label'].shift(1).rolling(window=4).std()
+    df['Label_Dev_16'] = df['Label'].shift(1).rolling(window=16).std()
+    df['Label_Dev_48'] = df['Label'].shift(1).rolling(window=48).std()
+    df['Label_Dev_96'] = df['Label'].shift(1).rolling(window=96).std()
+    df['Label_Dev_384'] = df['Label'].shift(1).rolling(window=384).std()
+    df['Label_Dev_1152'] = df['Label'].shift(1).rolling(window=1152).std()
+    df['Label_Drawdown_4'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=4).max() - 1).rolling(window=4).min()
+    df['Label_Drawdown_16'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=16).max() - 1).rolling(window=16).min()
+    df['Label_Drawdown_48'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=48).max() - 1).rolling(window=48).min()
+    df['Label_Drawdown_96'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=96).max() - 1).rolling(window=96).min()
+    df['Label_Drawdown_384'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=384).max() - 1).rolling(window=384).min()
+    df['Label_Drawdown_1152'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=1152).max() - 1).rolling(window=1152).min()
 
-    df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['High_Drawdown'] = (df['High'] / df['High'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Open_Drawdown'] = (df['Open'] / df['Open'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Low_Drawdown'] = (df['Low'] / df['Low'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Volume_Drawdown'] = (df['Volume'] / df['Volume'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['OBV_Drawdown'] = (df['OBV'] / df['OBV'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['A/D_Drawdown'] = (df['A/D'] / df['A/D'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Volatility_Drawdown'] = (df['Volatility'] / df['Volatility'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['LOW_EMA_Drawdown'] = (df['LOW_EMA'] / df['LOW_EMA'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['HIGH_EMA_Drawdown'] = (df['HIGH_EMA'] / df['HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['RSI_Drawdown'] = (df['RSI'] / df['RSI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Fast_%K_Drawdown'] = (df['Fast_%K'] / df['Fast_%K'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Fast_%D_Drawdown'] = (df['Fast_%D'] / df['Fast_%D'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['CCI_Drawdown'] = (df['CCI'] / df['CCI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['ATR_Drawdown'] = (df['ATR'] / df['ATR'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['ADX_Drawdown'] = (df['ADX'] / df['ADX'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['TSI_Drawdown'] = (df['TSI'] / df['TSI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BB_Width_Drawdown'] = (df['BB_Width'] / df['BB_Width'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BB_Upper_Drawdown'] = (df['BB_Upper'] / df['BB_Upper'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BB_Middle_Drawdown'] = (df['BB_Middle'] / df['BB_Middle'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BB_Lower_Drawdown'] = (df['BB_Lower'] / df['BB_Lower'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['MACD_Drawdown'] = (df['MACD'] / df['MACD'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['MACDSignal_Drawdown'] = (df['MACDSignal'] / df['MACDSignal'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['MACDHist_Drawdown'] = (df['MACDHist'] / df['MACDHist'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['PP_Drawdown'] = (df['PP'] / df['PP'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['S1_Drawdown'] = (df['S1'] / df['S1'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['S2_Drawdown'] = (df['S2'] / df['S2'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['R1_Drawdown'] = (df['R1'] / df['R1'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['R2_Drawdown'] = (df['R2'] / df['R2'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Tenkan_Sen_Drawdown'] = (df['Tenkan_Sen'] / df['Tenkan_Sen'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Kijun_Sen_Drawdown'] = (df['Kijun_Sen'] / df['Kijun_Sen'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Senkou_Span_A_Drawdown'] = (df['Senkou_Span_A'] / df['Senkou_Span_A'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Senkou_Span_B_Drawdown'] = (df['Senkou_Span_B'] / df['Senkou_Span_B'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Chikou_Span_Drawdown'] = (df['Chikou_Span'] / df['Chikou_Span'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['KC_Width_Drawdown'] = (df['KC_Width'] / df['KC_Width'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['KC_Upper_Drawdown'] = (df['KC_Upper'] / df['KC_Upper'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['KC_Middle_Drawdown'] = (df['KC_Middle'] / df['KC_Middle'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['KC_Lower_Drawdown'] = (df['KC_Lower'] / df['KC_Lower'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Volume-ATR_Drawdown'] = (df['Volume-ATR'] / df['Volume-ATR'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['VWAP-ATR_Drawdown'] = (df['VWAP-ATR'] / df['VWAP-ATR'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['RSI-MACD_Drawdown'] = (df['RSI-MACD'] / df['RSI-MACD'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BB-KC_Drawdown'] = (df['BB-KC'] / df['BB-KC'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['LOW-HIGH_EMA_Drawdown'] = (df['LOW-HIGH_EMA'] / df['LOW-HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Body_Size_Drawdown'] = (df['Body_Size'] / df['Body_Size'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Range_Drawdown'] = (df['Range'] / df['Range'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Body_Ratio_Drawdown'] = (df['Body_Ratio'] / df['Body_Ratio'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Price_Diff_Drawdown'] = (df['Price_Diff'] / df['Price_Diff'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BTC/ETH_Corr_Drawdown'] = (df['BTC/ETH_Corr'] / df['BTC/ETH_Corr'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Fractal_Dimension_Drawdown'] = (df['Fractal_Dimension'] / df['Fractal_Dimension'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
+    df = pd.concat([df, agg_df], axis=1)
+    df = df.dropna(axis=1, thresh=len(df) - 1452)
+    df = df.fillna(0)
 
-    df['Fast_%K_Drawdown'] = df['Fast_%K_Drawdown'].fillna(0)
-    df['CCI_Drawdown'] = df['CCI_Drawdown'].fillna(0)
-    df['Range_Drawdown'] = df['Range_Drawdown'].fillna(0)
-    df['Body_Ratio_Drawdown'] = df['Body_Ratio_Drawdown'].fillna(0)
-    df['Body_Size_Drawdown'] = df['Body_Size_Drawdown'].fillna(0)
-    df['Price_Diff_Drawdown'] = df['Price_Diff_Drawdown'].fillna(0)
-    df['BTC/ETH_Corr_Drawdown'] = df['BTC/ETH_Corr_Drawdown'].fillna(0)
-
-    print(df[df.isna().any(axis=1)])
-
-    df.dropna(inplace=True)
     #defragmenting dataframe
     df = df.copy()
 
-    training_df = df[(df.index >= 35805)] #January 1st 2023 12am #765
-    eval_df = df[((df.index >= 765) & (df.index <= 15261))] #January 1st 2022 12am to June 1st 2022 12am
-    out_of_training_df = df[((df.index >= 48250) & (df.index <= 68796))] #June 1st 2022 12:15am to January 1st 2023 12:15am
+    training_df = df[df['Timestamp'] > 1680307200000] #January 1st 2023 12:15 am to present
+    pca_training_df = df[((df['Timestamp'] > 1672549200000) & (df['Timestamp'] <= 1680307200000))]
+    eval_df = df[((df['Timestamp'] > 1654056000000) & (df['Timestamp'] <= 1672549200000))] #June 1st 12:15am 2022 to Jan 1st 2023 12am
+    test_df = df[((df['Timestamp'] >= 1641013200000) & (df['Timestamp'] <= 1654056000000))] #Jan 1st 12am 2022 to June 1st 12am 2022
 
-    return training_df, eval_df, out_of_training_df
+    training_df.reset_index(drop=True, inplace=True)
+    pca_training_df.reset_index(drop=True, inplace=True)
+    eval_df.reset_index(drop=True, inplace=True)
+    test_df.reset_index(drop=True, inplace=True)
 
-def rolling_wavelet(series, window_size=128, wavelet='db4', level=3):
-    wavelet_features = []
+    # RSI PCA analysis
+    rsis = pd.DataFrame()
+    for p in range(2, 33):
+        rsis[p] = talib.RSI(pca_training_df['Close'], timeperiod=p)
 
-    for i in range(window_size, len(series)):
-        window_data = series.iloc[i-window_size:i]
-        coeffs = pywt.wavedec(window_data.values, wavelet=wavelet, level=level)
+    rsi_means = rsis.mean()
+    rsis -= rsi_means
+    rsis = rsis.dropna()
 
-        # Example: Use the standard deviation of the approximation and detail coefficients
-        features = [np.std(coeff) for coeff in coeffs]
-        wavelet_features.append(features)
+    rsi_pca = PCA(n_components=3, random_state=42)
+    rsi_pca.fit(rsis)
 
-    wavelet_features = pd.DataFrame(wavelet_features, columns=[f"Wavelet_Coeff_{i}" for i in range(len(coeffs))])
-    wavelet_features.index = series.index[window_size:]
-    return wavelet_features
+    training_rsis = pd.DataFrame()
+    for p in range(2, 33):
+        training_rsis[p] = talib.RSI(training_df['Close'], timeperiod=p)
+
+    training_rsi_means = training_rsis.mean()
+    training_rsis -= training_rsi_means
+    training_rsis = training_rsis.dropna()
+
+    pca_data = rsi_pca.transform(training_rsis)
+    rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
+    training_df = pd.concat([training_df, rsi_pca_df], axis=1)
+
+    eval_rsis = pd.DataFrame()
+    for p in range(2, 33):
+        eval_rsis[p] = talib.RSI(eval_df['Close'], timeperiod=p)
+
+    eval_rsi_means = eval_rsis.mean()
+    eval_rsis -= eval_rsi_means
+    eval_rsis = eval_rsis.dropna()
+
+    pca_data = rsi_pca.transform(eval_rsis)
+    rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
+    eval_df = pd.concat([eval_df, rsi_pca_df], axis=1)
+
+    test_rsis = pd.DataFrame()
+    for p in range(2, 33):
+        test_rsis[p] = talib.RSI(test_df['Close'], timeperiod=p)
+
+    test_rsi_means = test_rsis.mean()
+    test_rsis -= test_rsi_means
+    test_rsis = test_rsis.dropna()
+
+    pca_data = rsi_pca.transform(test_rsis)
+    rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
+    test_df = pd.concat([test_df, rsi_pca_df], axis=1)
+
+    # ATR PCA analysis
+    atrs = pd.DataFrame()
+    for p in range(2, 33):
+        atrs[p] = talib.ATR(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
+
+    atr_means = atrs.mean()
+    atrs -= atr_means
+    atrs = atrs.dropna()
+
+    atr_pca = PCA(n_components=3, random_state=42)
+    atr_pca.fit(atrs)
+
+    training_atrs = pd.DataFrame()
+    for p in range(2, 33):
+        training_atrs[p] = talib.ATR(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
+
+    training_atr_means = training_atrs.mean()
+    training_atrs -= training_atr_means
+    training_atrs = training_atrs.dropna()
+
+    pca_data = atr_pca.transform(training_atrs)
+    atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
+    training_df = pd.concat([training_df, atr_pca_df], axis=1)
+
+    eval_atrs = pd.DataFrame()
+    for p in range(2, 33):
+        eval_atrs[p] = talib.ATR(eval_df['High'], eval_df['Low'], eval_df['Close'], timeperiod=p)
+
+    eval_atr_means = eval_atrs.mean()
+    eval_atrs -= eval_atr_means
+    eval_atrs = eval_atrs.dropna()
+
+    pca_data = atr_pca.transform(eval_atrs)
+    atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
+    eval_df = pd.concat([eval_df, atr_pca_df], axis=1)
+
+    test_atrs = pd.DataFrame()
+    for p in range(2, 33):
+        test_atrs[p] = talib.ATR(test_df['High'], test_df['Low'], test_df['Close'], timeperiod=p)
+
+    test_atr_means = test_atrs.mean()
+    test_atrs -= test_atr_means
+    test_atrs = test_atrs.dropna()
+
+    pca_data = atr_pca.transform(test_atrs)
+    atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
+    test_df = pd.concat([test_df, atr_pca_df], axis=1)
+
+    # ADX PCA analysis
+    adxs = pd.DataFrame()
+    for p in range(2, 33):
+        adxs[p] = talib.ADX(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
+
+    adx_means = adxs.mean()
+    adxs -= adx_means
+    adxs = adxs.dropna()
+
+    adx_pca = PCA(n_components=5, random_state=42)
+    adx_pca.fit(adxs)
+
+    training_adxs = pd.DataFrame()
+    for p in range(2, 33):
+        training_adxs[p] = talib.ADX(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
+
+    training_adx_means = training_adxs.mean()
+    training_adxs -= training_adx_means
+    training_adxs = training_adxs.dropna()
+
+    pca_data = adx_pca.transform(training_adxs)
+    adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
+    training_df = pd.concat([training_df, adx_pca_df], axis=1)
+
+    eval_adxs = pd.DataFrame()
+    for p in range(2, 33):
+        eval_adxs[p] = talib.ADX(eval_df['High'], eval_df['Low'], eval_df['Close'], timeperiod=p)
+
+    eval_adx_means = eval_adxs.mean()
+    eval_adxs -= eval_adx_means
+    eval_adxs = eval_adxs.dropna()
+
+    pca_data = adx_pca.transform(eval_adxs)
+    adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
+    eval_df = pd.concat([eval_df, adx_pca_df], axis=1)
+
+    test_adxs = pd.DataFrame()
+    for p in range(2, 33):
+        test_adxs[p] = talib.ADX(test_df['High'], test_df['Low'], test_df['Close'], timeperiod=p)
+
+    test_adx_means = test_adxs.mean()
+    test_adxs -= test_adx_means
+    test_adxs = test_adxs.dropna()
+
+    pca_data = adx_pca.transform(test_adxs)
+    adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
+    test_df = pd.concat([test_df, adx_pca_df], axis=1)
+
+    training_df.dropna(inplace=True)
+    eval_df.dropna(inplace=True)
+    test_df.dropna(inplace=True)
+
+    #calculate aggregate pca features
+    agg_included = ['RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5']
+    agg_period = [4, 16, 48, 96, 384, 1152]  # 1h, 4h, 12h, 1d, 4d, 12d
+    training_agg_df = pd.DataFrame()
+    eval_agg_df = pd.DataFrame()
+    test_agg_df = pd.DataFrame()
+    for period in agg_period:
+        for feature in training_df.columns:
+            if feature in agg_included:
+                training_agg_df[f'{feature}_Mean_{period}'] = training_df[feature].rolling(window=period).mean()
+                training_agg_df[f'{feature}_Dev_{period}'] = training_df[feature].rolling(window=period).std()
+                training_agg_df[f'{feature}_Drawdown_{period}'] = (training_df[feature] / training_df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
+        for feature in eval_df.columns:
+            if feature in agg_included:
+                eval_agg_df[f'{feature}_Mean_{period}'] = eval_df[feature].rolling(window=period).mean()
+                eval_agg_df[f'{feature}_Dev_{period}'] = eval_df[feature].rolling(window=period).std()
+                eval_agg_df[f'{feature}_Drawdown_{period}'] = (eval_df[feature] / eval_df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
+        for feature in test_df.columns:
+            if feature in agg_included:
+                test_agg_df[f'{feature}_Mean_{period}'] = test_df[feature].rolling(window=period).mean()
+                test_agg_df[f'{feature}_Dev_{period}'] = test_df[feature].rolling(window=period).std()
+                test_agg_df[f'{feature}_Drawdown_{period}'] = (test_df[feature] / test_df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
+
+    training_df = pd.concat([training_df, training_agg_df], axis=1)
+    training_df = training_df.dropna(axis=1, thresh=len(training_df) - 1452)
+    training_df = training_df.fillna(0)
+    eval_df = pd.concat([eval_df, eval_agg_df], axis=1)
+    eval_df = eval_df.dropna(axis=1, thresh=len(eval_df) - 1452)
+    eval_df = eval_df.fillna(0)
+    test_df = pd.concat([test_df, test_agg_df], axis=1)
+    test_df = test_df.dropna(axis=1, thresh=len(test_df) - 1452)
+    test_df = test_df.fillna(0)
+
+    ms = MinMaxScaler(feature_range=(0, 1))
+    training_df['Weights'] = ms.fit_transform(training_df[['Price_Diff_Future_Abs']]) * 10
+    eval_df['Weights'] = ms.fit_transform(eval_df[['Price_Diff_Future_Abs']]) * 10
+    test_df['Weights'] = ms.fit_transform(test_df[['Price_Diff_Future_Abs']]) * 10
+
+    training_df = training_df.copy()
+    eval_df = eval_df.copy()
+    test_df = test_df.copy()
+
+    # count = 0
+    # for column in df.columns:
+    #     count += 1
+    #     print(f"'{column}'", end=", ")
+    #     if count == 15:
+    #         count = 0
+    #         print()
+    return training_df, eval_df, test_df
+
+def cmma(High, Low, Close, period, atr_period = 168):
+    atr = talib.ATR(High, Low, Close, atr_period)
+    ma = Close.rolling(period).mean()
+    ind = (Close - ma) / (atr * period ** 0.5)
+    return ind
 
 def train_hmm(data, features, scaler, n_components=3):
-    print(f"Training HMM with {n_components} components...")
     X = data[features].values
-
-    print("Normalizing features...")
     X_scaled = scaler.fit_transform(X)
-
-    print("Fitting HMM model...")
-    model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=500, random_state=42, verbose=True)
+    model = hmm.GaussianHMM(n_components=n_components, covariance_type='full', n_iter=1000, random_state=42, verbose=True)
     model.fit(X_scaled)
-
-    print("HMM training complete")
 
     filepath = "hmm_model.pkl"
     with open("hmm_model.pkl", "wb") as f:
@@ -519,8 +630,7 @@ def load_hmm(filepath):
 def predict_states(model, data, features, scaler):
      X = data[features].values
      X_scaled = scaler.transform(X)
-     states = model.predict(X_scaled)
-     print(f"States precicted. Unique states: {np.unique(states)}")
+     states = model.predict_proba(X_scaled)
      return states
 
 def plot_results_hmm(data, states, n_components):
@@ -573,53 +683,117 @@ def plot_results_rf(data, labels_true, labels_pred):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     plt.savefig('plots/rf' + str(timestamp))
 
-def train_xgboost(data_train, labels_train, data_test, labels_test, splits, iters):
-    tscv = TimeSeriesSplit(n_splits=splits)
+def custom_pnl_objective(y_true, y_pred):
+    y_true[y_true == 0] = -1
+    p_buy = 1.0 / (1.0 + np.exp(-y_pred))
+    prob_diff = 2.0 * p_buy - 1.0
+    loss = -(prob_diff * y_true)
 
-    pipeline = ImbPipeline(steps=[
-        ('smote', SMOTE(random_state=42)),
-        ('xgb', XGBClassifier(random_state=42, eval_metric='mlogloss', early_stopping_rounds=40, tree_method='hist', device='cuda', predictor='gpu_predictor'))
-    ])
+    grad = -((2 * np.exp(-y_pred) * y_true) / ((np.exp(-y_pred) + 1) ** 2))
+    hess = -((2 * np.exp(-2 * y_pred) * y_true * (-np.exp(y_pred) + 1)) / (np.exp(-y_pred) + 1) ** 3)
+    hess = np.maximum(hess, 1e-6)
 
-    search_space = {
-        'xgb__max_depth': Integer(1, 6),
-        'xgb__learning_rate': Real(0.001, 1.0, prior='log-uniform'),
-        'xgb__subsample': Real(0.15, 1.0),
-        'xgb__colsample_bytree': Real(0.5, 1.0),
-        'xgb__colsample_bylevel': Real(0.5, 1.0),
-        'xgb__colsample_bynode': Real(0.5, 1.0),
-        'xgb__reg_alpha': Real(0.0, 8.0),
-        'xgb__reg_lambda': Real(0.0, 13.0),
-        'xgb__gamma': Real(0.0, 12.0),
-        'xgb__n_estimators': Integer(100, 2000),
-        'xgb__min_child_weight': Integer(1, 15),
-        'xgb__scale_pos_weight': Real(0.0, 10.0),
-        'xgb__max_bin': Integer(128, 512),
-        'xgb__grow_policy': Categorical(["depthwise", "lossguide"]),
-        'xgb__max_delta_step': Integer(0, 10)
+    #print(f"y_true:{y_true}, y_pred:{y_pred}, p_buy:{p_buy}, prob_diff:{prob_diff}, grad:{grad}, hess:{hess}")
+    #print(f"grad counts:{np.unique(grad, return_counts=True)}, true counts:{np.unique(y_true, return_counts=True)}, pred counts: {np.unique(y_pred, return_counts=True)}")
+
+    return grad.astype(np.float32), hess.astype(np.float32)
+
+# def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
+#     tscv = TimeSeriesSplit(n_splits=splits)
+#     scale_weight = labels_train.count(1)/labels_train.count(0)
+#     print(scale_weight)
+#
+#     pipeline = Pipeline(steps=[('xgb', XGBClassifier(random_state=42, eval_metric='auc', early_stopping_rounds=70, tree_method='hist', device='cuda', objective='binary:logistic'))])
+#
+#     search_space = {
+#         'xgb__max_depth': Integer(3, 14),
+#         'xgb__learning_rate': Real(0.0005, 1.0, prior='log-uniform'),
+#         'xgb__subsample': Real(0.15, 1.0),
+#         'xgb__colsample_bytree': Real(0.5, 1.0),
+#         'xgb__colsample_bylevel': Real(0.5, 1.0),
+#         'xgb__colsample_bynode': Real(0.5, 1.0),
+#         'xgb__reg_alpha': Real(0.0, 8.0),
+#         'xgb__reg_lambda': Real(0.0, 13.0),
+#         'xgb__gamma': Real(0.0, 12.0),
+#         'xgb__n_estimators': Integer(100, 5000),
+#         'xgb__min_child_weight': Integer(1, 15),
+#         'xgb__max_bin': Integer(128, 512),
+#         'xgb__grow_policy': Categorical(["depthwise", "lossguide"]),
+#         'xgb__max_delta_step': Integer(0, 10),
+#         'xgb__scale_pos_weight': Real(1.03, 1.07),
+#         'xgb__booster': Categorical(["gbtree", "dart"])
+#     }
+#     opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='roc_auc', random_state=42)
+#
+#     opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)], xgb__sample_weight=weights)
+#     print("Best estimator: ", opt.best_estimator_)
+#     print("Best score: ", opt.best_score_)
+#     print("Best params: ", opt.best_params_)
+#     print(opt.score(data_test, labels_test))
+#     labels_pred = opt.predict(data_test)
+#     labels_pred = labels_pred.tolist()
+#     print(labels_pred.count(0))
+#     print(labels_pred.count(1))
+#     print(opt.best_estimator_.steps)
+#
+#     xgboost_step = opt.best_estimator_.steps[0]
+#     xgboost_model = xgboost_step[1]
+#     plot_importance(xgboost_model, max_num_features=100)
+#     plt.show()
+#
+#     # save the model
+#     filepath = "xgboost_pipeline.pkl"
+#     with open(filepath, "wb") as f:
+#         pickle.dump(opt.best_estimator_, f)
+#
+#     return filepath
+
+def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
+    params = {
+        'max_depth': 14,
+        'learning_rate': 0.029317166919399066,
+        'subsample': 1.0,
+        'colsample_bytree': 0.7587347450548942,
+        'colsample_bylevel': 0.840082181391577,
+        'colsample_bynode': 0.7635282333655302,
+        'reg_alpha': 0.0,
+        'reg_lambda': 13.0,
+        'gamma': 0.0,
+        'n_estimators': 5000,
+        'min_child_weight': 1,
+        'max_bin': 470,
+        'grow_policy': "depthwise",
+        'max_delta_step': 9,
+        'scale_pos_weight': 1.05,
+        'booster': 'gbtree'
     }
-    opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='balanced_accuracy', random_state=42)
 
-    opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)])
-    print("Best estimator: ", opt.best_estimator_)
-    print("Best score: ", opt.best_score_)
-    print("Best params: ", opt.best_params_)
-    print(opt.score(data_test, labels_test))
-    labels_pred = opt.predict(data_test)
-    labels_pred = labels_pred.tolist()
-    print(labels_pred.count(0))
-    print(labels_pred.count(1))
-    print(labels_pred.count(2))
+    # Create the XGBClassifier directly with these parameters (plus any fixed ones)
+    model = XGBClassifier(
+        random_state=42,
+        eval_metric='auc',
+        early_stopping_rounds=100,
+        tree_method='hist',
+        device='cuda',
+        objective='binary:logistic',
+        **params
+    )
 
-    xgboost_step = opt.best_estimator_.steps[1]
-    xgboost_model = xgboost_step[1]
-    plot_importance(xgboost_model, max_num_features=100)
+    # Fit the model (pass the eval_set and sample_weight as needed)
+    model.fit(
+        data_train,
+        labels_train,
+        eval_set=[(data_test, labels_test)],
+        sample_weight=weights
+    )
+
+    plot_importance(model, max_num_features=100)
     plt.show()
 
     #save the model
     filepath = "xgboost_pipeline.pkl"
     with open(filepath, "wb") as f:
-        pickle.dump(opt.best_estimator_, f)
+        pickle.dump(model, f)
 
     return filepath
 
@@ -654,13 +828,13 @@ def exchange_btc(side, quoteOrderQty):
     req = requests.post(('https://api.binance.us/api/v3/order'), headers=headers, data=payload)
     return req.text
 
-def get_historical_data(start_time, end_time):
+def get_historical_data(start_time, end_time, symbol='BTCUSDC'):
     url = 'https://api.binance.us/api/v3/klines'
     headers = {
         'X-MBX-APIKEY': api_key,
     }
     parameters = {
-        'symbol': 'BTCUSDC',
+        'symbol': symbol,
         'interval': '15m',
         'startTime': str(start_time),
         'limit': '1000'
@@ -699,19 +873,65 @@ def get_historical_data(start_time, end_time):
     combined_df = pd.concat(dataframes, ignore_index=True)
     return combined_df
 
-def calculate_indicators(df, window_size=2):
-    eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'Close'])
+def get_recent_data(count='1000', symbol='BTCUSDC'):
+    url = 'https://api.binance.us/api/v3/klines'
+    headers = {
+        'X-MBX-APIKEY': api_key,
+    }
+    parameters = {
+        'symbol': symbol,
+        'interval': '15m',
+        'limit': count
+    }
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    try:
+        response = session.get(url, params=parameters)
+        data = json.loads(response.text)
+    except (ConnectionError, requests.Timeout, requests.TooManyRedirects) as e:
+        print(e)
+
+    df = pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+
+    for i in range(len(data)):
+        df.loc[len(df)] = {"Timestamp": int(data[i][0]),
+                            "Open": float(data[i][1]),
+                            "High": float(data[i][2]),
+                            "Low": float(data[i][3]),
+                            "Close": float(data[i][4]),
+                            "Volume": float(data[i][5])}
+
+    return df
+
+def calculate_indicators(df, pca_training_df):
+    eth_df = pd.read_csv('ETHUSDC15m_2020-2025.csv', names=['Timestamp', 'High', 'Low', 'Close'])
     eth_df.drop(0, inplace=True)
     eth_df = eth_df.astype(float)
-    eth_prices = eth_df['Close'].values
-    df['ETH_Close'] = eth_prices
+    df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
 
+    halving_dates = [
+        datetime.datetime(2020, 5, 11),
+        datetime.datetime(2024, 4, 20),
+        datetime.datetime(2028, 2, 19)  # next estimated halving
+    ]
+    halving_cycle_duration = datetime.timedelta(days=365)
+
+    quarters = []
+    months = []
     days = []
+    hours = []
     sessions = []
+    in_halving_cycle = []
+
     for timestamp in df['Timestamp']:
         utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
-        days.append(utc_time.weekday())
+        month = utc_time.month
+        quarter = (month - 1) // 3 + 1
+        day = utc_time.weekday()
         hour = utc_time.hour
+
         if 0 <= hour < 9:
             session = 0
         elif 7 <= hour < 16:
@@ -720,16 +940,41 @@ def calculate_indicators(df, window_size=2):
             session = 2
         else:
             session = 0
-        sessions.append(session)
-    df['Day'] = days
-    df['Session'] = sessions
 
+        in_cycle = False
+        for halving_date in halving_dates:
+            if halving_date <= utc_time <= halving_date + halving_cycle_duration:
+                in_cycle = True
+                break
+
+        quarters.append(quarter)
+        months.append(month)
+        days.append(day)
+        hours.append(hour)
+        sessions.append(session)
+        in_halving_cycle.append(in_cycle)
+
+    df['Quarter'] = quarters
+    df['Month'] = months
+    df['Day'] = days
+    df['Hour'] = hours
+    df['Session'] = sessions
+    df['In_Halving_Cycle'] = in_halving_cycle
+    df['In_Halving_Cycle'] = df['In_Halving_Cycle'].astype(int)
+
+    # Intramarket Difference
+    period = 24
+    btc_cmma = cmma(df['High'], df['Low'], df['Close'], period)
+    eth_cmma = cmma(eth_df['High'], eth_df['Low'], eth_df['Close'], period)
+    df['BTC-ETC_Diff'] = btc_cmma - eth_cmma
+
+    df['Price_Diff'] = df['Close'].diff()
     df["Returns"] = df["Close"].pct_change()
     df["Volatility"] = df["Returns"].rolling(window=24).std()
-    df['ETH_Returns'] = df['ETH_Close'].pct_change()
 
-    df['BTC/ETH_Corr'] = df['Returns'].rolling(30).corr(df['ETH_Returns'])
-    df['BTC/ETH_Corr'] = df['BTC/ETH_Corr'].fillna(0)
+    # prob(buy) - prob(sell) = prob(total)
+    # if prob(total) is positive that means the buy signal is stronger, if negative that means the sell signal is stronger
+    # prob(total) * price_diff
 
     # Replaces 0's with a number close to 0 to avoid infinity being present in Volume_Change
     # Since the label column has 0's present, we need to make sure that they are not replaced
@@ -796,7 +1041,7 @@ def calculate_indicators(df, window_size=2):
     df['Kijun_Sen'] = (df['High'].rolling(window=26).max() + df['Low'].rolling(window=26).min()) / 2
     df['Senkou_Span_A'] = (df['Tenkan_Sen'] + df['Kijun_Sen']) / 2
     df['Senkou_Span_B'] = (df['High'].rolling(window=52).max() + df['Low'].rolling(window=52).min()) / 2
-    df['Chikou_Span'] = df['Close'].shift(-26)
+    df['Chikou_Span'] = df['Close'].shift(26)
 
     # Keltner Channels
     df['KC_Middle'] = talib.EMA(df['Close'], timeperiod=20)
@@ -834,7 +1079,6 @@ def calculate_indicators(df, window_size=2):
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].astype(int)
     df['Confirmed_Fractal_Peak'] = df['Confirmed_Fractal_Peak'].shift(2)
     df['Confirmed_Fractal_Trough'] = df['Confirmed_Fractal_Trough'].shift(2)
-    df['Price_Diff'] = df['Close'].diff()
 
     # Candlestick patterns
     df['Body_Size'] = abs(df['Close'] - df['Open'])
@@ -910,27 +1154,10 @@ def calculate_indicators(df, window_size=2):
     df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
     df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
 
-    # Calculate correlations
-    df['Close_Corr1'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
-    df['Returns_Corr1'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=1), raw=False)
-    df['Close_Corr2'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
-    df['Returns_Corr2'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=2), raw=False)
-    df['Close_Corr3'] = df['Close'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
-    df['Returns_Corr3'] = df['Returns'].rolling(window=window_size).apply(lambda x: x.autocorr(lag=3), raw=False)
-
-    # Calculate wavelet transforms
-    df[['Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3']] = rolling_wavelet(
-        df['Close'])
-    df[['Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2',
-        'Wavelet_Volume_Coef3']] = rolling_wavelet(df['Volume'])
-    df[['Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1', 'Wavelet_Returns_Coef2',
-        'Wavelet_Returns_Coef3']] = rolling_wavelet(df['Returns'])
-    df[['Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2',
-        'Wavelet_Volatility_Coef3']] = rolling_wavelet(df['Volatility'])
-
-    # Fractal Dimension
-    df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
-    df['Fractal_Dimension'] = 2 - df['Hurst']
+    #
+    # #Fractal Dimension
+    # df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
+    # df['Fractal_Dimension'] = 2 - df['Hurst']
 
     # calculate interaction features
     df['Volume-ATR'] = df['Volume'] / df['ATR']
@@ -941,240 +1168,159 @@ def calculate_indicators(df, window_size=2):
     df['Ichimoku_Overlap'] = (df['Close'] - df['Kijun_Sen']) / (df['Senkou_Span_B'] - df['Senkou_Span_A'])
     df['LOW-HIGH_EMA'] = df['LOW_EMA'] / df['HIGH_EMA']
 
+    # Candlestick interactions
+    df['Closing_Marubozu-OBV'] = df['Closing_Marubozu'] * df['OBV']
+    df['Closing_Marubozu-ATR'] = df['Closing_Marubozu'] * df['ATR']
+    df['Closing_Marubozu-RSI'] = df['Closing_Marubozu'] * df['RSI']
+    df['Marubozu-OBV'] = df['Marubozu'] * df['OBV']
+    df['Marubozu-ATR'] = df['Marubozu'] * df['ATR']
+    df['Marubozu-RSI'] = df['Marubozu'] * df['RSI']
+    df['Short_Candle-OBV'] = df['Short_Candle'] * df['OBV']
+    df['Short_Candle-ATR'] = df['Short_Candle'] * df['ATR']
+    df['Short_Candle-RSI'] = df['Short_Candle'] * df['RSI']
+    df['Long_Candle-OBV'] = df['Long_Candle'] * df['OBV']
+    df['Long_Candle-ATR'] = df['Long_Candle'] * df['ATR']
+    df['Long_Candle-RSI'] = df['Long_Candle'] * df['RSI']
+    df['Doji-OBV'] = df['Doji'] * df['OBV']
+    df['Doji-ATR'] = df['Doji'] * df['ATR']
+    df['Doji-RSI'] = df['Doji'] * df['RSI']
+    df['Long_Doji-OBV'] = df['Long_Doji'] * df['OBV']
+    df['Long_Doji-ATR'] = df['Long_Doji'] * df['ATR']
+    df['Long_Doji-RSI'] = df['Long_Doji'] * df['RSI']
+    df['Dragonfly_Doji-OBV'] = df['Dragonfly_Doji'] * df['OBV']
+    df['Dragonfly_Doji-ATR'] = df['Dragonfly_Doji'] * df['ATR']
+    df['Dragonfly_Doji-RSI'] = df['Dragonfly_Doji'] * df['RSI']
+    df['Belt_Hold-OBV'] = df['Belt_Hold'] * df['OBV']
+    df['Belt_Hold-ATR'] = df['Belt_Hold'] * df['ATR']
+    df['Belt_Hold-RSI'] = df['Belt_Hold'] * df['RSI']
+
+    # Donchain Breakout
+    df['Upper'] = df['Close'].rolling(288 - 1).max().shift(1)
+    df['Lower'] = df['Close'].rolling(288 - 1).min().shift(1)
+    df['Don_Signal'] = np.nan
+    df.loc[df['Close'] > df['Upper'], 'Don_Signal'] = 1
+    df.loc[df['Close'] < df['Lower'], 'Don_Signal'] = -1
+    df['Don_Signal'] = df['Don_Signal'].ffill()
+    df.drop(['Upper', 'Lower'], axis=1, inplace=True)
+
+    # Generate Scree Plot
+    # explained_variance_ratio = pca.explained_variance_ratio_
+    # components = range(1, len(explained_variance_ratio) + 1)
+    #
+    # plt.figure(figsize=(8, 5))
+    # plt.bar(components, explained_variance_ratio, color='blue', alpha=0.7, label='Explained Variance Ratio')
+    # plt.plot(components, explained_variance_ratio, 'ro-', label='Cumulative Explained Variance')
+    # plt.xlabel('Principal Components')
+    # plt.ylabel('Explained Variance Ratio')
+    # plt.title('Scree Plot for RSI PCA Analysis')
+    # plt.legend()
+    # plt.show()
+
+    # drop temporary columns
+    df.drop(['CumulativeVolume', 'Absolute_Momentum', 'Short_EMA_Momentum', 'Short_EMA_Absolute', 'Double_EMA_Momentum',
+             'Double_EMA_Absolute'], axis=1, inplace=True)
     df.replace([np.inf, -np.inf], 0, inplace=True)
     df.dropna(inplace=True)
 
-    # calculate aggregate features
-    df['Close_Mean'] = df['Close'].rolling(window=window_size).mean()
-    df['High_Mean'] = df['High'].rolling(window=window_size).mean()
-    df['Open_Mean'] = df['Open'].rolling(window=window_size).mean()
-    df['Low_Mean'] = df['Low'].rolling(window=window_size).mean()
-    df['Volume_Mean'] = df['Volume'].rolling(window=window_size).mean()
-    df['OBV_Mean'] = df['OBV'].rolling(window=window_size).mean()
-    df['A/D_Mean'] = df['A/D'].rolling(window=window_size).mean()
-    df['CMF_Mean'] = df['CMF'].rolling(window=window_size).mean()
-    df['VWAP_Mean'] = df['VWAP'].rolling(window=window_size).mean()
-    df['Returns_Mean'] = df['Returns'].rolling(window=window_size).mean()
-    df['Volatility_Mean'] = df['Volatility'].rolling(window=window_size).mean()
-    df['LOW_EMA_Mean'] = df['LOW_EMA'].rolling(window=window_size).mean()
-    df['HIGH_EMA_Mean'] = df['HIGH_EMA'].rolling(window=window_size).mean()
-    df['RSI_Mean'] = df['RSI'].rolling(window=window_size).mean()
-    df['Aroon_Mean'] = df['Aroon'].rolling(window=window_size).mean()
-    df['Fast_%K_Mean'] = df['Fast_%K'].rolling(window=window_size).mean()
-    df['Fast_%D_Mean'] = df['Fast_%D'].rolling(window=window_size).mean()
-    df['WILLR_Mean'] = df['WILLR'].rolling(window=window_size).mean()
-    df['CCI_Mean'] = df['CCI'].rolling(window=window_size).mean()
-    df['ATR_Mean'] = df['ATR'].rolling(window=window_size).mean()
-    df['ADX_Mean'] = df['ADX'].rolling(window=window_size).mean()
-    df['TSI_Mean'] = df['TSI'].rolling(window=window_size).mean()
-    df['BB_Width_Mean'] = df['BB_Width'].rolling(window=window_size).mean()
-    df['BB_Upper_Mean'] = df['BB_Upper'].rolling(window=window_size).mean()
-    df['BB_Middle_Mean'] = df['BB_Middle'].rolling(window=window_size).mean()
-    df['BB_Lower_Mean'] = df['BB_Lower'].rolling(window=window_size).mean()
-    df['MACD_Mean'] = df['MACD'].rolling(window=window_size).mean()
-    df['MACDSignal_Mean'] = df['MACDSignal'].rolling(window=window_size).mean()
-    df['MACDHist_Mean'] = df['MACDHist'].rolling(window=window_size).mean()
-    df['PP_Mean'] = df['PP'].rolling(window=window_size).mean()
-    df['S1_Mean'] = df['S1'].rolling(window=window_size).mean()
-    df['S2_Mean'] = df['S2'].rolling(window=window_size).mean()
-    df['R1_Mean'] = df['R1'].rolling(window=window_size).mean()
-    df['R2_Mean'] = df['R2'].rolling(window=window_size).mean()
-    df['Tenkan_Sen_Mean'] = df['Tenkan_Sen'].rolling(window=window_size).mean()
-    df['Kijun_Sen_Mean'] = df['Kijun_Sen'].rolling(window=window_size).mean()
-    df['Senkou_Span_A_Mean'] = df['Senkou_Span_A'].rolling(window=window_size).mean()
-    df['Senkou_Span_B_Mean'] = df['Senkou_Span_B'].rolling(window=window_size).mean()
-    df['Chikou_Span_Mean'] = df['Chikou_Span'].rolling(window=window_size).mean()
-    df['KC_Width_Mean'] = df['KC_Width'].rolling(window=window_size).mean()
-    df['KC_Upper_Mean'] = df['KC_Upper'].rolling(window=window_size).mean()
-    df['KC_Middle_Mean'] = df['KC_Middle'].rolling(window=window_size).mean()
-    df['KC_Lower_Mean'] = df['KC_Lower'].rolling(window=window_size).mean()
-    df['Volume-ATR_Mean'] = df['Volume-ATR'].rolling(window=window_size).mean()
-    df['VWAP-ATR_Mean'] = df['VWAP-ATR'].rolling(window=window_size).mean()
-    df['RSI-MACD_Mean'] = df['RSI-MACD'].rolling(window=window_size).mean()
-    df['Stochastic-RSI_Mean'] = df['Stochastic-RSI'].rolling(window=window_size).mean()
-    df['BB-KC_Mean'] = df['BB-KC'].rolling(window=window_size).mean()
-    df['Ichimoku_Overlap_Mean'] = df['Ichimoku_Overlap'].rolling(window=window_size).mean()
-    df['LOW-HIGH_EMA_Mean'] = df['LOW-HIGH_EMA'].rolling(window=window_size).mean()
-    df['Extrema_Unconfirmed_Mean'] = df['Extrema_Unconfirmed'].rolling(window=window_size).mean()
-    df['Confirmed_Fractal_Peak_Mean'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).mean()
-    df['Confirmed_Fractal_Trough_Mean'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).mean()
-    df['Body_Size_Mean'] = df['Body_Size'].rolling(window=window_size).mean()
-    df['Upper_Wick_Mean'] = df['Upper_Wick'].rolling(window=window_size).mean()
-    df['Lower_Wick_Mean'] = df['Lower_Wick'].rolling(window=window_size).mean()
-    df['Range_Mean'] = df['Range'].rolling(window=window_size).mean()
-    df['Body_Ratio_Mean'] = df['Body_Ratio'].rolling(window=window_size).mean()
-    df['Upper_Wick_Ratio_Mean'] = df['Upper_Wick_Ratio'].rolling(window=window_size).mean()
-    df['Lower_Wick_Ratio_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
-    df['Price_Diff_Mean'] = df['Lower_Wick_Ratio'].rolling(window=window_size).mean()
-    df['BTC/ETH_Corr_Mean'] = df['BTC/ETH_Corr'].rolling(window=window_size).mean()
-    df['Fractal_Dimension_Mean'] = df['Fractal_Dimension'].rolling(window=window_size).mean()
+    # RSI PCA analysis
+    rsis = pd.DataFrame()
+    training_rsis = pd.DataFrame()
+    for p in range(2, 33):
+        rsis[p] = talib.RSI(df['Close'], timeperiod=p)
+        training_rsis[p] = talib.RSI(pca_training_df['Close'], timeperiod=p)
 
-    df['Close_Dev'] = df['Close'].rolling(window=window_size).std()
-    df['High_Dev'] = df['High'].rolling(window=window_size).std()
-    df['Open_Dev'] = df['Open'].rolling(window=window_size).std()
-    df['Low_Dev'] = df['Low'].rolling(window=window_size).std()
-    df['Volume_Dev'] = df['Volume'].rolling(window=window_size).std()
-    df['OBV_Dev'] = df['OBV'].rolling(window=window_size).std()
-    df['A/D_Dev'] = df['A/D'].rolling(window=window_size).std()
-    df['CMF_Dev'] = df['CMF'].rolling(window=window_size).std()
-    df['VWAP_Dev'] = df['VWAP'].rolling(window=window_size).std()
-    df['Returns_Dev'] = df['Returns'].rolling(window=window_size).std()
-    df['Volatility_Dev'] = df['Volatility'].rolling(window=window_size).std()
-    df['LOW_EMA_Dev'] = df['LOW_EMA'].rolling(window=window_size).std()
-    df['HIGH_EMA_Dev'] = df['HIGH_EMA'].rolling(window=window_size).std()
-    df['RSI_Dev'] = df['RSI'].rolling(window=window_size).std()
-    df['Aroon_Dev'] = df['Aroon'].rolling(window=window_size).std()
-    df['Fast_%K_Dev'] = df['Fast_%K'].rolling(window=window_size).std()
-    df['Fast_%D_Dev'] = df['Fast_%D'].rolling(window=window_size).std()
-    df['WILLR_Dev'] = df['WILLR'].rolling(window=window_size).std()
-    df['CCI_Dev'] = df['CCI'].rolling(window=window_size).std()
-    df['ATR_Dev'] = df['ATR'].rolling(window=window_size).std()
-    df['ADX_Dev'] = df['ADX'].rolling(window=window_size).std()
-    df['TSI_Dev'] = df['TSI'].rolling(window=window_size).std()
-    df['BB_Width_Dev'] = df['BB_Width'].rolling(window=window_size).std()
-    df['BB_Upper_Dev'] = df['BB_Upper'].rolling(window=window_size).std()
-    df['BB_Middle_Dev'] = df['BB_Middle'].rolling(window=window_size).std()
-    df['BB_Lower_Dev'] = df['BB_Lower'].rolling(window=window_size).std()
-    df['MACD_Dev'] = df['MACD'].rolling(window=window_size).std()
-    df['MACDSignal_Dev'] = df['MACDSignal'].rolling(window=window_size).std()
-    df['MACDHist_Dev'] = df['MACDHist'].rolling(window=window_size).std()
-    df['PP_Dev'] = df['PP'].rolling(window=window_size).std()
-    df['S1_Dev'] = df['S1'].rolling(window=window_size).std()
-    df['S2_Dev'] = df['S2'].rolling(window=window_size).std()
-    df['R1_Dev'] = df['R1'].rolling(window=window_size).std()
-    df['R2_Dev'] = df['R2'].rolling(window=window_size).std()
-    df['Tenkan_Sen_Dev'] = df['Tenkan_Sen'].rolling(window=window_size).std()
-    df['Kijun_Sen_Dev'] = df['Kijun_Sen'].rolling(window=window_size).std()
-    df['Senkou_Span_A_Dev'] = df['Senkou_Span_A'].rolling(window=window_size).std()
-    df['Senkou_Span_B_Dev'] = df['Senkou_Span_B'].rolling(window=window_size).std()
-    df['Chikou_Span_Dev'] = df['Chikou_Span'].rolling(window=window_size).std()
-    df['KC_Width_Dev'] = df['KC_Width'].rolling(window=window_size).std()
-    df['KC_Upper_Dev'] = df['KC_Upper'].rolling(window=window_size).std()
-    df['KC_Middle_Dev'] = df['KC_Middle'].rolling(window=window_size).std()
-    df['KC_Lower_Dev'] = df['KC_Lower'].rolling(window=window_size).std()
-    df['Volume-ATR_Dev'] = df['Volume-ATR'].rolling(window=window_size).std()
-    df['VWAP-ATR_Dev'] = df['VWAP-ATR'].rolling(window=window_size).std()
-    df['RSI-MACD_Dev'] = df['RSI-MACD'].rolling(window=window_size).std()
-    df['Stochastic-RSI_Dev'] = df['Stochastic-RSI'].rolling(window=window_size).std()
-    df['BB-KC_Dev'] = df['BB-KC'].rolling(window=window_size).std()
-    df['Ichimoku_Overlap_Dev'] = df['Ichimoku_Overlap'].rolling(window=window_size).std()
-    df['LOW-HIGH_EMA_Dev'] = df['LOW-HIGH_EMA'].rolling(window=window_size).std()
-    df['Extrema_Unconfirmed_Dev'] = df['Extrema_Unconfirmed'].rolling(window=window_size).std()
-    df['Confirmed_Fractal_Peak_Dev'] = df['Confirmed_Fractal_Peak'].rolling(window=window_size).std()
-    df['Confirmed_Fractal_Trough_Dev'] = df['Confirmed_Fractal_Trough'].rolling(window=window_size).std()
-    df['Body_Size_Dev'] = df['Body_Size'].rolling(window=window_size).std()
-    df['Upper_Wick_Dev'] = df['Upper_Wick'].rolling(window=window_size).std()
-    df['Lower_Wick_Dev'] = df['Lower_Wick'].rolling(window=window_size).std()
-    df['Range_Dev'] = df['Range'].rolling(window=window_size).std()
-    df['Body_Ratio_Dev'] = df['Body_Ratio'].rolling(window=window_size).std()
-    df['Upper_Wick_Ratio_Dev'] = df['Upper_Wick_Ratio'].rolling(window=window_size).std()
-    df['Lower_Wick_Ratio_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
-    df['Price_Diff_Dev'] = df['Lower_Wick_Ratio'].rolling(window=window_size).std()
-    df['BTC/ETH_Corr_Dev'] = df['BTC/ETH_Corr'].rolling(window=window_size).std()
-    df['Fractal_Dimension_Dev'] = df['Fractal_Dimension'].rolling(window=window_size).std()
+    rsi_means = rsis.mean()
+    rsis -= rsi_means
+    rsis = rsis.dropna()
+    training_rsi_means = training_rsis.mean()
+    training_rsis -= training_rsi_means
+    training_rsis = training_rsis.dropna()
 
-    df['Close_Drawdown'] = (df['Close'] / df['Close'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['High_Drawdown'] = (df['High'] / df['High'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Open_Drawdown'] = (df['Open'] / df['Open'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Low_Drawdown'] = (df['Low'] / df['Low'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Volume_Drawdown'] = (df['Volume'] / df['Volume'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['OBV_Drawdown'] = (df['OBV'] / df['OBV'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['A/D_Drawdown'] = (df['A/D'] / df['A/D'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Volatility_Drawdown'] = (df['Volatility'] / df['Volatility'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['LOW_EMA_Drawdown'] = (df['LOW_EMA'] / df['LOW_EMA'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['HIGH_EMA_Drawdown'] = (df['HIGH_EMA'] / df['HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['RSI_Drawdown'] = (df['RSI'] / df['RSI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Fast_%K_Drawdown'] = (df['Fast_%K'] / df['Fast_%K'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Fast_%D_Drawdown'] = (df['Fast_%D'] / df['Fast_%D'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['CCI_Drawdown'] = (df['CCI'] / df['CCI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['ATR_Drawdown'] = (df['ATR'] / df['ATR'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['ADX_Drawdown'] = (df['ADX'] / df['ADX'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['TSI_Drawdown'] = (df['TSI'] / df['TSI'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['BB_Width_Drawdown'] = (df['BB_Width'] / df['BB_Width'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['BB_Upper_Drawdown'] = (df['BB_Upper'] / df['BB_Upper'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['BB_Middle_Drawdown'] = (df['BB_Middle'] / df['BB_Middle'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['BB_Lower_Drawdown'] = (df['BB_Lower'] / df['BB_Lower'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['MACD_Drawdown'] = (df['MACD'] / df['MACD'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['MACDSignal_Drawdown'] = (df['MACDSignal'] / df['MACDSignal'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['MACDHist_Drawdown'] = (df['MACDHist'] / df['MACDHist'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['PP_Drawdown'] = (df['PP'] / df['PP'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['S1_Drawdown'] = (df['S1'] / df['S1'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['S2_Drawdown'] = (df['S2'] / df['S2'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['R1_Drawdown'] = (df['R1'] / df['R1'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['R2_Drawdown'] = (df['R2'] / df['R2'].rolling(window=window_size).max() - 1).rolling(window=window_size).min()
-    df['Tenkan_Sen_Drawdown'] = (df['Tenkan_Sen'] / df['Tenkan_Sen'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Kijun_Sen_Drawdown'] = (df['Kijun_Sen'] / df['Kijun_Sen'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Senkou_Span_A_Drawdown'] = (
-                df['Senkou_Span_A'] / df['Senkou_Span_A'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Senkou_Span_B_Drawdown'] = (
-                df['Senkou_Span_B'] / df['Senkou_Span_B'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Chikou_Span_Drawdown'] = (df['Chikou_Span'] / df['Chikou_Span'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['KC_Width_Drawdown'] = (df['KC_Width'] / df['KC_Width'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['KC_Upper_Drawdown'] = (df['KC_Upper'] / df['KC_Upper'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['KC_Middle_Drawdown'] = (df['KC_Middle'] / df['KC_Middle'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['KC_Lower_Drawdown'] = (df['KC_Lower'] / df['KC_Lower'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Volume-ATR_Drawdown'] = (df['Volume-ATR'] / df['Volume-ATR'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['VWAP-ATR_Drawdown'] = (df['VWAP-ATR'] / df['VWAP-ATR'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['RSI-MACD_Drawdown'] = (df['RSI-MACD'] / df['RSI-MACD'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['BB-KC_Drawdown'] = (df['BB-KC'] / df['BB-KC'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['LOW-HIGH_EMA_Drawdown'] = (
-                df['LOW-HIGH_EMA'] / df['LOW-HIGH_EMA'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Body_Size_Drawdown'] = (df['Body_Size'] / df['Body_Size'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Range_Drawdown'] = (df['Range'] / df['Range'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Body_Ratio_Drawdown'] = (df['Body_Ratio'] / df['Body_Ratio'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Price_Diff_Drawdown'] = (df['Price_Diff'] / df['Price_Diff'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['BTC/ETH_Corr_Drawdown'] = (
-                df['BTC/ETH_Corr'] / df['BTC/ETH_Corr'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
-    df['Fractal_Dimension_Drawdown'] = (
-                df['Fractal_Dimension'] / df['Fractal_Dimension'].rolling(window=window_size).max() - 1).rolling(
-        window=window_size).min()
+    rsi_pca = PCA(n_components=3, random_state=42)
+    rsi_pca.fit(training_rsis)
+    pca_data = rsi_pca.transform(rsis)
+    rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
+    df = pd.concat([df, rsi_pca_df], axis=1)
 
-    df['Fast_%K_Drawdown'] = df['Fast_%K_Drawdown'].fillna(0)
-    df['CCI_Drawdown'] = df['CCI_Drawdown'].fillna(0)
-    df['Range_Drawdown'] = df['Range_Drawdown'].fillna(0)
-    df['Body_Ratio_Drawdown'] = df['Body_Ratio_Drawdown'].fillna(0)
-    df['Body_Size_Drawdown'] = df['Body_Size_Drawdown'].fillna(0)
-    df['Price_Diff_Drawdown'] = df['Price_Diff_Drawdown'].fillna(0)
-    df['BTC/ETH_Corr_Drawdown'] = df['BTC/ETH_Corr_Drawdown'].fillna(0)
+    # ATR PCA analysis
+    atrs = pd.DataFrame()
+    training_atrs = pd.DataFrame()
+    for p in range(2, 33):
+        atrs[p] = talib.ATR(df['High'], df['Low'], df['Close'], timeperiod=p)
+        training_atrs[p] = talib.ATR(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
 
-    print(df[df.isna().any(axis=1)])
+    atr_means = atrs.mean()
+    atrs -= atr_means
+    atrs = atrs.dropna()
+    training_atr_means = training_atrs.mean()
+    training_atrs -= training_atr_means
+    training_atrs = training_atrs.dropna()
 
-    df.dropna(inplace=True)
+    atr_pca = PCA(n_components=3, random_state=42)
+    atr_pca.fit(training_atrs)
+    pca_data = atr_pca.transform(atrs)
+    atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
+    df = pd.concat([df, atr_pca_df], axis=1)
+
+    # ADX PCA analysis
+    adxs = pd.DataFrame()
+    training_adxs = pd.DataFrame()
+    for p in range(2, 33):
+        adxs[p] = talib.ADX(df['High'], df['Low'], df['Close'], timeperiod=p)
+        training_adxs[p] = talib.ADX(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
+
+    adx_means = adxs.mean()
+    adxs -= adx_means
+    adxs = adxs.dropna()
+    training_adx_means = training_adxs.mean()
+    training_adxs -= training_adx_means
+    training_adxs = training_adxs.dropna()
+
+    adx_pca = PCA(n_components=5, random_state=42)
+    adx_pca.fit(training_adxs)
+    pca_data = adx_pca.transform(adxs)
+    adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
+    df = pd.concat([df, adx_pca_df], axis=1)
+
+    agg_excluded = ['Timestamp', 'Day', 'Session', 'Hour', 'Hour_Sin', 'Hour_Cos', 'Label']
+    agg_period = [4, 16, 48, 96, 384, 1152]  # 1h, 4h, 12h, 1d, 4d, 12d
+    agg_df = pd.DataFrame()
+    for period in agg_period:
+        for feature in df.columns:
+            if feature not in agg_excluded:
+                agg_df[f'{feature}_Mean_{period}'] = df[feature].rolling(window=period).mean()
+                agg_df[f'{feature}_Dev_{period}'] = df[feature].rolling(window=period).std()
+                agg_df[f'{feature}_Drawdown_{period}'] = (df[feature] / df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
+
+    df['Label_Mean_4'] = df['Label'].shift(1).rolling(window=4).mean()
+    df['Label_Mean_16'] = df['Label'].shift(1).rolling(window=16).mean()
+    df['Label_Mean_48'] = df['Label'].shift(1).rolling(window=48).mean()
+    df['Label_Mean_96'] = df['Label'].shift(1).rolling(window=96).mean()
+    df['Label_Mean_384'] = df['Label'].shift(1).rolling(window=384).mean()
+    df['Label_Mean_1152'] = df['Label'].shift(1).rolling(window=1152).mean()
+    df['Label_Dev_4'] = df['Label'].shift(1).rolling(window=4).std()
+    df['Label_Dev_16'] = df['Label'].shift(1).rolling(window=16).std()
+    df['Label_Dev_48'] = df['Label'].shift(1).rolling(window=48).std()
+    df['Label_Dev_96'] = df['Label'].shift(1).rolling(window=96).std()
+    df['Label_Dev_384'] = df['Label'].shift(1).rolling(window=384).std()
+    df['Label_Dev_1152'] = df['Label'].shift(1).rolling(window=1152).std()
+    df['Label_Drawdown_4'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=4).max() - 1).rolling(
+        window=4).min()
+    df['Label_Drawdown_16'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=16).max() - 1).rolling(
+        window=16).min()
+    df['Label_Drawdown_48'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=48).max() - 1).rolling(
+        window=48).min()
+    df['Label_Drawdown_96'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=96).max() - 1).rolling(
+        window=96).min()
+    df['Label_Drawdown_384'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=384).max() - 1).rolling(
+        window=384).min()
+    df['Label_Drawdown_1152'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=1152).max() - 1).rolling(
+        window=1152).min()
+
+    df = pd.concat([df, agg_df], axis=1)
+    df = df.dropna(axis=1, thresh=len(df) - 1452)
+    df = df.fillna(0)
+
     # defragmenting dataframe
     df = df.copy()
 
@@ -1182,69 +1328,84 @@ def calculate_indicators(df, window_size=2):
 
 def convert_data_to_windows(data, window_size=2):
     rows = []
-    for i in range(len(data) - window_size - 1):
+    for i in range(len(data) - window_size):
+        print(f"window_step: {i}")
         row = {}
-
         for feature in data.columns:
-            if feature != 'Label':
+            if feature != 'Label' and feature != 'Weights':
                 for t in range(window_size):
-                    row[f"{feature}_t-{window_size-t}"] = data[feature].iloc[i + t + 1]
+                    row[f"{feature}_t-{window_size - t}"] = data[feature].iloc[i + t]
 
-        row['Label'] = data['Label'].iloc[i + window_size + 1]
+        row['Label'] = int(data['Label'].iloc[i + window_size])
+        row['Weights'] = float(data['Weights'].iloc[i + window_size])
         rows.append(row)
 
     window_data = pd.DataFrame(rows)
+    # window_data['Label'] = window_data['Label'].shift(1)
+    # window_data['Weights'] = window_data['Weights'].shift(1)
 
     return window_data
 
-def trading_simulation(probs, closes, buy_percentage, sell_percentage, overconfidence_mult, starting_money=500, spend_percentage=0.1):
+def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.1):
     money = starting_money
     bitcoin = 0
-    probabilities = probs
     close_prices = closes
-    sell_order = False
     buy_order = False
-    previous_trade_assets = money
+    sell_order = False
 
     #0 is sell, 2 is buy
     count = 0
     day_count = 0
     overconfidence = 0
+    last_bought_price = 0
+    last_sold_price = 0
+    profitable_trade_count = 0
+    trade_count = 0
     historical_daily_starting_assets = []
-    for probability in probabilities:
-        print("current probability: " + str(probability))
+    for label in labels:
+        print(f"close: {close_prices[count]}, label: {label}")
         if count % 96 == 0: #update daily starting assets at the start of each day
             daily_starting_assets = money + (bitcoin * close_prices[count])
             historical_daily_starting_assets.append(daily_starting_assets)
-            if len(historical_daily_starting_assets) >= 2:
-                if (historical_daily_starting_assets[day_count - 1] * 0.95) > historical_daily_starting_assets[day_count]:
-                    print(f"Stop-loss triggered on Day {day_count}: more than 5% drop in a single day.")
-                    print(f"Current money: {money}, Current bitcoin: {bitcoin}, Current count: {count}")
-                    return
+            # if len(historical_daily_starting_assets) >= 2:
+            #     if (historical_daily_starting_assets[day_count - 1] * 0.95) > historical_daily_starting_assets[day_count]:
+            #         print(f"Stop-loss triggered on Day {day_count}: more than 5% drop in a single day.")
+            #         print(f"Current money: {money}, Current bitcoin: {bitcoin}, Current count: {count}")
+            #         return
             day_count += 1
 
-        if probability[0] >= sell_percentage and sell_order == False:
+        # hold = False
+        # if (probability[0] >= (0.5 - holdout_threshold) and (probability[0] <= (0.5 - holdout_threshold))) and (probability[1] >= (0.5 - holdout_threshold) and (probability[1] <= (0.5 - holdout_threshold))):
+        #     hold = True
+
+        if label == 1 and sell_order == False:
             sell_order = True
-        elif probability[2] >= buy_percentage and buy_order == False:
-            overconfidence = (probability[2] - buy_percentage) * overconfidence_mult
-            print(f"Overconfidence on Day {count}: {overconfidence}")
+        elif label == 0 and buy_order == False:
+            #print(f"Overconfidence on Day {count}: {overconfidence}")
             buy_order = True
 
-        if sell_order and probability[2] >= sell_percentage:
+        #print(hold)
+        #print(buy_sell)
+        if sell_order and label == 0:
             money += bitcoin * close_prices[count]
-            print(f"Day {day_count}: SOLD {bitcoin} BTC at {close_prices[count]} each.")
+            last_sold_price = close_prices[count]
+            print(f"Day {day_count}: SOLD {bitcoin} BTC at {last_sold_price} each.")
             bitcoin = 0
             sell_order = False
-        elif buy_order and probability[0] >= buy_percentage:
-            amount_to_spend = money * (spend_percentage + overconfidence)
-            # Avoid spending more than we have if overconfidence is large
-            amount_to_spend = min(amount_to_spend, money)
-
+        elif buy_order and label == 1:
+            amount_to_spend = money * spend_percentage
             bitcoin_bought = amount_to_spend / close_prices[count]
             bitcoin += bitcoin_bought
             money -= amount_to_spend
             buy_order = False
-            print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {close_prices[count]} each.")
+            last_bought_price = close_prices[count]
+            print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {last_bought_price} each.")
+
+        if last_sold_price > last_bought_price:
+            profitable_trade_count += 1
+            trade_count += 1
+        else:
+            trade_count += 1
 
         print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
         count += 1
@@ -1252,55 +1413,95 @@ def trading_simulation(probs, closes, buy_percentage, sell_percentage, overconfi
     total_assets = money + bitcoin * close_prices[count-2]
     print("Final money: ", total_assets)
     print("Profit: ", total_assets - starting_money)
+    print("Percentage profitable: ", profitable_trade_count / trade_count)
 
 def get_next_interval(interval_seconds):
     now = time.time()
     next_interval = ((now // interval_seconds) + 1) * interval_seconds
     return next_interval - now
 
-print("Starting main execution...")
-window_size = 8
-data_train, data_eval, data_test = load_and_preprocess_data("BTCUSDC15m_2020-2025_labeled.csv", window_size)
-scaler = StandardScaler()
-hmm_features = ["Day", "Session", "Open", "High", "Low", "Close", "Volume", "Volume_Change", "OBV", "A/D", "CMF", "Returns", "Volatility", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", 'Fast_%K', 'Fast_%D', 'WILLR', 'CCI', 'ATR', 'ADX', 'TSI', 'BB_Upper', 'BB_Middle', 'BB_Lower',
-               "BB_Width", "MACD", "MACDSignal", "MACDHist", "PP", "R1", "R2", "S1", "S2", 'Tenkan_Sen', 'Kijun_Sen', 'Senkou_Span_A', 'Senkou_Span_B', 'Chikou_Span', 'KC_Upper', 'KC_Middle', 'KC_Lower', 'KC_Width', 'Close_Corr1', 'Returns_Corr1', 'Close_Corr2',
-               'Returns_Corr2', 'Close_Corr3', 'Returns_Corr3', 'Volume-ATR', 'VWAP-ATR', 'RSI-MACD', 'Stochastic-RSI', 'BB-KC', 'Ichimoku_Overlap', 'LOW-HIGH_EMA', "Confirmed_Fractal_Peak", "Confirmed_Fractal_Trough", "Extrema_Unconfirmed", "Body_Size", "Upper_Wick", "Lower_Wick", "Range",
-               "Body_Ratio", "Upper_Wick_Ratio", "Lower_Wick_Ratio", 'Two_Crows', 'Three_Crows', 'Three_Inside', 'Three_Strike', 'Three_Outside', 'Three_Stars_South', 'Three_Soldiers', 'Abandoned_Baby', 'Advance_Block', 'Belt_Hold', 'Breakaway', 'Closing_Marubozu',
-               'Baby_Swallow', 'Counterattack', 'Dark_Cloud', 'Doji', 'Doji_Star', 'Dragonfly_Doji', 'Engulfing', 'Evening_Doji', 'Evening_Star', 'Up_Down_Gap', 'Gravestone_Doji', 'Hammer', 'Hanging_Man', 'Harami', 'Harami_Cross', 'High_Wave', 'Hikkake',
-               'Modified_Hikkake', 'Homing_Pigeon', 'Identical_Crows', 'In_Neck', 'Inverted_Hammer', 'Kicking', 'Kicking_Length', 'Ladder_Bottom', 'Long_Doji', 'Long_Candle', 'Marubozu', 'Matching_Low', 'Mat_Hold', 'Morning_Doji', 'Morning_Star', 'On_Neck',
-               'Piercing', 'Rickshaw_Man', 'Rising_Falling', 'Separating_Lines', 'Shooting_Star', 'Short_Candle', 'Spinning_Top', 'Stalled', 'Stick_Sandwich', 'Takuri', 'Tasuki_Gap', 'Thrusting', 'Tristar', 'Unique_River', 'Upside_Gap_Crows', 'Up_Down_3Gap',
-               'Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3', 'Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2', 'Wavelet_Volume_Coef3', 'Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1',
-               'Wavelet_Returns_Coef2', 'Wavelet_Returns_Coef3', 'Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2', 'Wavelet_Volatility_Coef3', 'Price_Diff', 'BTC/ETH_Corr', 'Fractal_Dimension']
-xg_features = ["Day", "Session", "Open", "High", "Low", "Close", "Volume", "Volume_Change", "OBV", "A/D", "CMF", "Returns", "Volatility", "LOW_EMA", "HIGH_EMA", "RSI", "Aroon", 'Fast_%K', 'Fast_%D', 'WILLR', 'CCI', 'ATR', 'ADX', 'TSI', 'BB_Upper', 'BB_Middle', 'BB_Lower',
-               "BB_Width", "MACD", "MACDSignal", "MACDHist", "PP", "R1", "R2", "S1", "S2", 'Tenkan_Sen', 'Kijun_Sen', 'Senkou_Span_A', 'Senkou_Span_B', 'Chikou_Span', 'KC_Upper', 'KC_Middle', 'KC_Lower', 'KC_Width', 'Close_Corr1', 'Returns_Corr1', 'Close_Corr2',
-               'Returns_Corr2', 'Close_Corr3', 'Returns_Corr3', 'Volume-ATR', 'VWAP-ATR', 'RSI-MACD', 'Stochastic-RSI', 'BB-KC', 'Ichimoku_Overlap', 'LOW-HIGH_EMA', "Confirmed_Fractal_Peak", "Confirmed_Fractal_Trough", "Extrema_Unconfirmed", "Body_Size", "Upper_Wick", "Lower_Wick", "Range",
-               "Body_Ratio", "Upper_Wick_Ratio", "Lower_Wick_Ratio", 'Two_Crows', 'Three_Crows', 'Three_Inside', 'Three_Strike', 'Three_Outside', 'Three_Stars_South', 'Three_Soldiers', 'Abandoned_Baby', 'Advance_Block', 'Belt_Hold', 'Breakaway', 'Closing_Marubozu',
-               'Baby_Swallow', 'Counterattack', 'Dark_Cloud', 'Doji', 'Doji_Star', 'Dragonfly_Doji', 'Engulfing', 'Evening_Doji', 'Evening_Star', 'Up_Down_Gap', 'Gravestone_Doji', 'Hammer', 'Hanging_Man', 'Harami', 'Harami_Cross', 'High_Wave', 'Hikkake',
-               'Modified_Hikkake', 'Homing_Pigeon', 'Identical_Crows', 'In_Neck', 'Inverted_Hammer', 'Kicking', 'Kicking_Length', 'Ladder_Bottom', 'Long_Doji', 'Long_Candle', 'Marubozu', 'Matching_Low', 'Mat_Hold', 'Morning_Doji', 'Morning_Star', 'On_Neck',
-               'Piercing', 'Rickshaw_Man', 'Rising_Falling', 'Separating_Lines', 'Shooting_Star', 'Short_Candle', 'Spinning_Top', 'Stalled', 'Stick_Sandwich', 'Takuri', 'Tasuki_Gap', 'Thrusting', 'Tristar', 'Unique_River', 'Upside_Gap_Crows', 'Up_Down_3Gap',
-               'Wavelet_Close_Coef0', 'Wavelet_Close_Coef1', 'Wavelet_Close_Coef2', 'Wavelet_Close_Coef3', 'Wavelet_Volume_Coef0', 'Wavelet_Volume_Coef1', 'Wavelet_Volume_Coef2', 'Wavelet_Volume_Coef3', 'Wavelet_Returns_Coef0', 'Wavelet_Returns_Coef1',
-               'Wavelet_Returns_Coef2', 'Wavelet_Returns_Coef3', 'Wavelet_Volatility_Coef0', 'Wavelet_Volatility_Coef1', 'Wavelet_Volatility_Coef2', 'Wavelet_Volatility_Coef3', 'Price_Diff', 'BTC/ETH_Corr', 'Fractal_Dimension', 'State', "Label"]
-agg_features = ["Open_Mean", "High_Mean", "Low_Mean", "Close_Mean", "Volume_Mean", "OBV_Mean", "A/D_Mean", "CMF_Mean", "VWAP_Mean", "Returns_Mean", "Volatility_Mean", "LOW_EMA_Mean", "HIGH_EMA_Mean", "RSI_Mean", "Aroon_Mean", 'Fast_%K_Mean', 'Fast_%D_Mean',
-                'WILLR_Mean', 'CCI_Mean', 'ATR_Mean', 'ADX_Mean', 'TSI_Mean', 'BB_Upper_Mean', 'BB_Middle_Mean', 'BB_Lower_Mean', "BB_Width_Mean", "MACD_Mean", "MACDSignal_Mean", "MACDHist_Mean", "PP_Mean", "R1_Mean", "R2_Mean", "S1_Mean", "S2_Mean", 'Tenkan_Sen_Mean',
-                'Kijun_Sen_Mean', 'Senkou_Span_A_Mean', 'Senkou_Span_B_Mean', 'Chikou_Span_Mean', 'KC_Upper_Mean', 'KC_Middle_Mean', 'KC_Lower_Mean', 'KC_Width_Mean', 'Volume-ATR_Mean', 'VWAP-ATR_Mean', 'RSI-MACD_Mean', 'Stochastic-RSI_Mean', 'BB-KC_Mean', 'Ichimoku_Overlap_Mean',
-                'LOW-HIGH_EMA_Mean', "Extrema_Unconfirmed_Mean", "Confirmed_Fractal_Peak_Mean", "Confirmed_Fractal_Trough_Mean", "Body_Size_Mean", "Upper_Wick_Mean", "Lower_Wick_Mean", "Range_Mean", "Body_Ratio_Mean", "Upper_Wick_Ratio_Mean", "Lower_Wick_Ratio_Mean", 'Price_Diff_Mean', 'BTC/ETH_Corr_Mean', 'Fractal_Dimension_Mean', "Open_Dev", "High_Dev", "Low_Dev",
-                "Close_Dev", "Volume_Dev", "OBV_Dev", "A/D_Dev", "CMF_Dev", "VWAP_Dev", "Returns_Dev", "Volatility_Dev", "LOW_EMA_Dev", "HIGH_EMA_Dev", "RSI_Dev", "Aroon_Dev", 'Fast_%K_Dev', 'Fast_%D_Dev', 'WILLR_Dev', 'CCI_Dev', 'ATR_Dev', 'ADX_Dev', 'TSI_Dev', 'BB_Upper_Dev',
-                'BB_Middle_Dev', 'BB_Lower_Dev', "BB_Width_Dev", "MACD_Dev", "MACDSignal_Dev", "MACDHist_Dev", "PP_Dev", "R1_Dev", "R2_Dev", "S1_Dev", "S2_Dev", 'Tenkan_Sen_Dev', 'Kijun_Sen_Dev', 'Senkou_Span_A_Dev', 'Senkou_Span_B_Dev', 'Chikou_Span_Dev', 'KC_Upper_Dev', 'KC_Middle_Dev',
-                'KC_Lower_Dev', 'KC_Width_Dev', 'Volume-ATR_Dev', 'VWAP-ATR_Dev', 'RSI-MACD_Dev', 'Stochastic-RSI_Dev', 'BB-KC_Dev', 'Ichimoku_Overlap_Dev', 'LOW-HIGH_EMA_Dev', "Extrema_Unconfirmed_Dev", "Confirmed_Fractal_Peak_Dev", "Confirmed_Fractal_Trough_Dev", "Body_Size_Dev", "Upper_Wick_Dev", "Lower_Wick_Dev",
-                "Range_Dev", "Body_Ratio_Dev", "Upper_Wick_Ratio_Dev", "Lower_Wick_Ratio_Dev", 'Price_Diff_Dev', 'BTC/ETH_Corr_Dev', 'Fractal_Dimension_Dev', "Open_Drawdown", "High_Drawdown", "Low_Drawdown", "Close_Drawdown", "Volume_Drawdown", "OBV_Drawdown", "A/D_Drawdown", "Volatility_Drawdown", "LOW_EMA_Drawdown", "HIGH_EMA_Drawdown",
-                "RSI_Drawdown", 'Fast_%K_Drawdown', 'Fast_%D_Drawdown', 'CCI_Drawdown', 'ATR_Drawdown', 'ADX_Drawdown', 'TSI_Drawdown', 'BB_Upper_Drawdown', 'BB_Middle_Drawdown', 'BB_Lower_Drawdown', "BB_Width_Drawdown", "MACD_Drawdown","MACDSignal_Drawdown", "MACDHist_Drawdown",
-                "PP_Drawdown", "R1_Drawdown", "R2_Drawdown", "S1_Drawdown", "S2_Drawdown", 'Tenkan_Sen_Drawdown', 'Kijun_Sen_Drawdown', 'Senkou_Span_A_Drawdown', 'Senkou_Span_B_Drawdown', 'Chikou_Span_Drawdown', 'KC_Upper_Drawdown', 'KC_Middle_Drawdown', 'KC_Lower_Drawdown',
-                'KC_Width_Drawdown', 'Volume-ATR_Drawdown', 'VWAP-ATR_Drawdown', 'RSI-MACD_Drawdown', 'BB-KC_Drawdown', 'LOW-HIGH_EMA_Drawdown', 'Body_Size_Drawdown', 'Body_Ratio_Drawdown', 'Range_Drawdown', 'Price_Diff_Drawdown', 'BTC/ETH_Corr_Drawdown', 'Fractal_Dimension_Drawdown']
+def notify():
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showinfo("Notification", "Your code has finished running!")
+    root.destroy()
 
-hmm_path = train_hmm(data_train, hmm_features, scaler, 3)
-hmm_model = load_hmm(hmm_path)
-print("Predicting states...")
-states = predict_states(hmm_model, data_train, hmm_features, scaler)
-states_eval = predict_states(hmm_model, data_eval, hmm_features, scaler)
-states_out = predict_states(hmm_model, data_test, hmm_features, scaler)
-data_train['State'] = states
-data_eval['State'] = states_eval
-data_test['State'] = states_out
+window_size = 33
+data_train, data_eval, data_test = load_and_preprocess_data("BTCUSDC15m_2020-2025_labeled.csv")
+scaler = StandardScaler()
+hmm_features = ['Close', 'Session', 'BTC-ETC_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
+                'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD', 'Stochastic-RSI', 'RSI_Mean_4', 'Chikou_Span_Dev_48', 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4']
+xg_features = ['Timestamp', 'Close', 'Session', 'BTC-ETC_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Closing_Marubozu', 'Doji', 'Dragonfly_Doji', 'Engulfing', 'Hikkake', 'Long_Doji', 'Long_Candle', 'Short_Candle', 'Marubozu', 'Harami', 'Don_Signal',
+               'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K', 'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD',
+               'Stochastic-RSI',  'Belt_Hold', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'Weights', 'Label']
+agg_features = ['RSI_Mean_4', 'RSI_Mean_16', 'TSI_Mean_16', 'Volume_Change_Mean_4', 'Price_Diff_Mean_4', 'TSI_Mean_4', 'Returns_Mean_4', 'Lower_Wick_Ratio_Mean_4',
+                'BB-KC_Mean_96', 'Returns_Mean_16', 'Price_Diff_Mean_16', 'Body_Ratio_Mean_4', 'Label_Mean_16', 'Price_Diff_Mean_96', 'CCI_Mean_4', 'MACDHist_Mean_96', 'CCI_Mean_96', 'Doji-RSI_Mean_4', 'Belt_Hold-ATR_Mean_48', 'Label_Mean_96',
+                'VWAP_Mean_48', 'Long_Doji-RSI_Mean_4', 'Short_Candle-RSI_Mean_4', 'Aroon_Mean_4', 'CCI_Mean_16', 'Long_Candle-RSI_Mean_4', 'ADX_Mean_4', 'Aroon_Mean_16', 'Volume_Change_Mean_16', 'MACDSignal_Mean_4',
+                'Stochastic-RSI_Mean_48', 'MACDSignal_Mean_16', 'Closing_Marubozu-ATR_Mean_4', 'Volume-ATR_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Mean_4', 'Returns_Mean_48', 'Marubozu-OBV_Mean_16',
+                'Dragonfly_Doji-RSI_Mean_48', 'Ichimoku_Overlap_Mean_48', 'Lower_Wick_Ratio_Mean_48', 'RSI_Mean_48', 'Price_Diff_Mean_48', 'Fast_%K_Mean_4', 'Aroon_Mean_96', 'Hammer_Mean_16', 'Body_Ratio_Mean_16',
+                'Engulfing_Mean_4', 'VWAP_Mean_4', 'Belt_Hold-ATR_Mean_96', 'Returns_Mean_96', 'Marubozu-RSI_Mean_48', 'Hikkake_Mean_16', 'LOW-HIGH_EMA_Mean_4', 'Chikou_Span_Dev_48', 'Long_Doji-RSI_Dev_4',
+                'Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_48', 'Stochastic-RSI_Dev_96', 'Closing_Marubozu-RSI_Dev_48', 'ADX_Dev_4', 'Stochastic-RSI_Dev_4', 'Lower_Wick_Ratio_Dev_4', 'Long_Candle_Dev_384',
+                'ADX_Dev_96', 'High_Dev_4', 'TSI_Dev_48', 'Engulfing_Dev_48', 'VWAP_Dev_48', 'Volume-ATR_Dev_4', 'OBV_Dev_4', 'BB_Upper_Dev_4', 'TSI_Dev_4', 'BB_Lower_Dev_4', 'Fast_%D_Dev_4', 'KC_Lower_Dev_4',
+                'Volume_Dev_4', 'Long_Doji-RSI_Dev_16', 'Senkou_Span_A_Dev_4', 'Senkou_Span_B_Dev_16', 'CCI_Dev_4', 'Aroon_Dev_96', 'Stochastic-RSI_Dev_48', 'Lower_Wick_Ratio_Dev_48', 'BB-KC_Dev_16', 'Upper_Wick_Dev_4',
+                'Dragonfly_Doji-OBV_Dev_48', 'Belt_Hold-RSI_Dev_48', 'Kijun_Sen_Dev_16', 'Closing_Marubozu-RSI_Dev_4', 'Upper_Wick_Ratio_Dev_4', 'Short_Candle-RSI_Dev_96', 'Long_Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_16', 'Closing_Marubozu-RSI_Dev_16',
+                'Fast_%K_Dev_48', 'MACDSignal_Dev_4', 'CCI_Dev_48', 'Belt_Hold-RSI_Dev_4', 'RSI_Dev_48', 'Short_Candle-OBV_Dev_16', 'VWAP-ATR_Dev_4', 'Long_Candle-RSI_Dev_384', 'Closing_Marubozu-RSI_Dev_96', 'BTC-ETC_Diff_Dev_4', 'Doji-RSI_Dev_4',
+                'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4', 'Volatility_Drawdown_4', 'CMF_Drawdown_4', 'ADX_Drawdown_4', 'ATR_Drawdown_4', 'S2_Drawdown_4', 'KC_Upper_Drawdown_16', 'Open_Drawdown_4', 'Fast_%D_Drawdown_4', 'ADX_Drawdown_16', 'BB_Lower_Drawdown_4',
+                'RSI-MACD_Drawdown_4', 'Chikou_Span_Drawdown_16', 'BB_Upper_Drawdown_4', 'Volatility_Drawdown_16', 'R2_Drawdown_4', 'RSI_Drawdown_4', 'BB_Upper_Drawdown_16', 'BB-KC_Drawdown_4', 'BB_Lower_Drawdown_16', 'CMF_Drawdown_16', 'S1_Drawdown_4',
+                'Low_Drawdown_4', 'VWAP-ATR_Drawdown_16', 'BB_Middle_Drawdown_4', 'R2_Drawdown_16', 'Senkou_Span_B_Drawdown_4', 'High_Drawdown_4', 'Chikou_Span_Drawdown_48']
+
+# 'RSI_PC3_Mean_16', 'RSI_PC1_Mean_48', 'RSI_PC1_Mean_16', 'RSI_PC2_Mean_16', 'ATR_PC2_Mean_4',
+#                 'ADX_PC2_Mean_384', 'ATR_PC3_Mean_16', 'ADX_PC1_Mean_96', 'ADX_PC5_Mean_16', 'RSI_PC1_Mean_384', 'ADX_PC3_Mean_4', 'ADX_PC2_Mean_16', 'RSI_PC3_Mean_4', 'ATR_PC3_Mean_96', 'RSI_PC2_Dev_48', 'RSI_PC1_Dev_48', 'RSI_PC3_Dev_48', 'ADX_PC2_Mean_4', 'RSI_PC1_Dev_96',
+#                 'ATR_PC3_Dev_4', 'ADX_PC4_Dev_48', 'ADX_PC1_Dev_4', 'RSI_PC1_Dev_16', 'RSI_PC2_Dev_96', 'ADX_PC4_Dev_4', 'ADX_PC2_Dev_16', 'ADX_PC3_Dev_96', 'ADX_PC5_Dev_48', 'ADX_PC5_Dev_16', 'ATR_PC2_Drawdown_4', 'ADX_PC4_Drawdown_4', 'RSI_PC3_Drawdown_4', 'RSI_PC3_Drawdown_16',
+#                 'ATR_PC3_Drawdown_16', 'ATR_PC1_Drawdown_4', 'ADX_PC5_Drawdown_4'
+
+# hmm_comps = 2
+# hmm_path = train_hmm(pd.concat([data_test, data_eval, data_train], ignore_index=True), hmm_features, scaler, hmm_comps)
+# hmm_model = load_hmm(hmm_path)
+
+#walk forward hmm prediction
+# states = []
+# data_train_current = pd.DataFrame(columns=data_train[hmm_features].columns)
+# train_count = 0
+# for index, row in data_train[hmm_features].iterrows():
+#     train_count += 1
+#     print(train_count)
+#     data_train_current = pd.concat([data_train_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+#     states.append(predict_states(hmm_model, data_train_current, hmm_features, scaler)[-1])
+#     #keeps a window of 500 to improve computational efficiency
+#     if train_count >= 1000:
+#         data_train_current = data_train_current.drop(data_train_current.index[0])
+#
+# states_eval = []
+# data_eval_current = pd.DataFrame(columns=data_eval[hmm_features].columns)
+# eval_count = 0
+# for index, row in data_eval[hmm_features].iterrows():
+#     eval_count += 1
+#     print(eval_count)
+#     data_eval_current = pd.concat([data_eval_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+#     states_eval.append(predict_states(hmm_model, data_eval_current, hmm_features, scaler)[-1])
+#     if eval_count >= 1000:
+#         data_eval_current = data_eval_current.drop(data_eval_current.index[0])
+#
+# states_test = []
+# data_test_current = pd.DataFrame(columns=data_test[hmm_features].columns)
+# test_count = 0
+# for index, row in data_test[hmm_features].iterrows():
+#     test_count += 1
+#     print(test_count)
+#     data_test_current = pd.concat([data_test_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+#     states_test.append(predict_states(hmm_model, data_test_current, hmm_features, scaler)[-1])
+#     if test_count >= 1000:
+#          data_test_current = data_test_current.drop(data_test_current.index[0])
+#
+# data_train_states = list(zip(*states))
+# data_eval_states = list(zip(*states_eval))
+# data_test_states = list(zip(*states_test))
+#
+# for i in range(hmm_comps):
+#     data_train[f'State{i}'] = data_train_states[i]
+#     data_eval[f'State{i}'] = data_eval_states[i]
+#     data_test[f'State{i}'] = data_test_states[i]
+#     xg_features.append(f'State{i}')
 
 #defragmenting the dataframes
 data_train = data_train.copy()
@@ -1308,9 +1509,12 @@ data_eval = data_eval.copy()
 data_test = data_test.copy()
 
 #Build xgboost model
-xg_data_train = convert_data_to_windows(data_train[xg_features], window_size)
 xg_data_eval = convert_data_to_windows(data_eval[xg_features], window_size)
+xg_data_train = convert_data_to_windows(data_train[xg_features], window_size)
 xg_data_test = convert_data_to_windows(data_test[xg_features], window_size)
+
+print(xg_data_train[['Close_t-1', 'Label']].tail(50))
+
 #dropping the first few rows to line up data with the xgboost data
 data_train = data_train.drop(index=data_train.index[:window_size])
 data_eval = data_eval.drop(index=data_eval.index[:window_size])
@@ -1338,51 +1542,196 @@ xg_labels_eval = [int(x) for x in xg_labels_eval]
 xg_labels_test = xg_data_test.pop('Label').tolist()
 xg_labels_test = [int(x) for x in xg_labels_test]
 
-print("Unique labels:", set(xg_labels_train))
-
-#xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, 7, 50)
-xgboost_path = "models/juicer_model1.pkl"
+weights = xg_data_train['Weights'].tolist()
+xg_data_train.drop(columns='Weights', inplace=True)
+xg_data_eval.drop(columns='Weights', inplace=True)
+xg_data_test.drop(columns='Weights', inplace=True)
+xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, weights, 15, 45)
 xgboost_model = load_xgboost(xgboost_path)
 xg_labels_pred = xgboost_model.predict(xg_data_test)
 xg_labels_pred = xg_labels_pred.tolist()
 
-#Filtering lists so that there is only entries where either the real list or the predicted list has a 0 or 2 in them
-#Since buying and selling are the more important predictions in an actual algo trader I want to see only the buy/sell accuracy
-buy_sell_label, buy_sell_label_pred = zip(*[(x, y) for x, y in zip(xg_labels_test, xg_labels_pred) if (x in [0, 2] or y in [0, 2])])
-buy_sell_label = list(buy_sell_label)
-buy_sell_label_pred = list(buy_sell_label_pred)
-buy_sell_accuracy = accuracy_score(buy_sell_label, buy_sell_label_pred)
-print(f"buy_sell accuracy: {buy_sell_accuracy}")
+count0 = 0
+count1 = 0
+for i in range(len(xg_labels_pred)):
+    if xg_labels_pred[i] == 0 and xg_labels_test[i] == 0:
+        count0 += 1
+    if xg_labels_pred[i] == 1 and xg_labels_test[i] == 1:
+        count1 += 1
 
-recent_df = get_historical_data(1735707600000, 1737090000000)
-recent_df = calculate_indicators(recent_df)
-recent_df = recent_df.dropna()
-recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
+accuracy0 = count0 / xg_labels_test.count(0)
+accuracy1 = count1 / xg_labels_test.count(1)
+ratio0 = xg_labels_test.count(0) / len(xg_labels_test)
+ratio1 = xg_labels_test.count(1) / len(xg_labels_test)
+predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
+predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
+print(f"Accuracy of sells: {accuracy0}")
+print(f"Accuracy of buys: {accuracy1}")
+print(f"Combined accuracy: {accuracy0 + accuracy1}")
+print(f"Ratio of sells: {ratio0}")
+print(f"Ratio of buys: {ratio1}")
+print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
+print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
+print(xg_labels_test.count(0))
+print(xg_labels_pred.count(0))
+print(xg_labels_test.count(1))
+print(xg_labels_pred.count(1))
 
-#Need this to make recent_df compatible with convert_data_to_windows method
-recent_df['Label'] = 0
-recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+# xgboost_path = "xgboost_pipeline.pkl"
+# xgboost_model = load_xgboost(xgboost_path)
+# twenty_days_ms = 20 * 24 * 60 * 60 * 1000
+# pca_training_df = get_historical_data(1717200000000, 1735516800000)
+#
+#
+# current_time = int(time.time() * 1000)
+# while current_time % (15*60*1000) != 0:
+#     current_time = int(time.time() * 1000)
+#
+# print(f"Current time: {current_time}")
+# start_time = current_time - twenty_days_ms
+# recent_df = get_historical_data(start_time, current_time)
+# #1735732800000, 1738411200000 -> Jan 2025
+# #1648728000000, 1738324800000 -> March 2023 to now
+# recent_df = calculate_indicators(recent_df, pca_training_df)
+# recent_df = recent_df.dropna()
+#
+# recent_df['Label'] = 0
+# recent_df['Weights'] = 0
+# recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+#
+# recent_df = recent_df.drop(index=recent_df.index[:window_size])
+# recent_df = recent_df.reset_index(drop=True)
+# recent_df_windowed = recent_df_windowed.reset_index(drop=True)
+# recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
+# recent_df.drop(['Label'], axis=1, inplace=True)
+# recent_df.drop(['Weights'], axis=1, inplace=True)
+# recent_df = recent_df.loc[recent_df['Close_t-1'] != 0]
+# pred_labels = xgboost_model.predict(recent_df).tolist()
+# last_label = pred_labels[-1]
+# time.sleep(900)
+#
+# while True:
+#     current_time = int(time.time() * 1000)
+#     start_time = current_time - twenty_days_ms
+#     recent_df = get_historical_data(start_time, current_time)
+#     # 1735732800000, 1738411200000 -> Jan 2025
+#     # 1648728000000, 1738324800000 -> March 2023 to now
+#     recent_df = calculate_indicators(recent_df, pca_training_df)
+#     recent_df = recent_df.dropna()
+#
+#     recent_df['Label'] = 0
+#     recent_df['Weights'] = 0
+#     recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+#
+#     recent_df = recent_df.drop(index=recent_df.index[:window_size])
+#     recent_df = recent_df.reset_index(drop=True)
+#     recent_df_windowed = recent_df_windowed.reset_index(drop=True)
+#     recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
+#     recent_df.drop(['Label'], axis=1, inplace=True)
+#     recent_df.drop(['Weights'], axis=1, inplace=True)
+#     recent_df = recent_df.loc[recent_df['Close_t-1'] != 0]
+#
+#     #1740362400000
+#
+#     last_price = recent_df['Close_t-1'].iloc[-2]
+#     recent_price = recent_df['Close_t-1'].iloc[-1]
+#     last_timestamp = recent_df['Timestamp_t-1'].iloc[-2]
+#     recent_timestamp = recent_df['Timestamp_t-1'].iloc[-1]
+#     print(f"Last price: {last_price} at time {last_timestamp}")
+#     print(f"Recent price: {recent_price} at time {recent_timestamp}")
+#     print("Label: " + str(last_label))
+#     if last_price >= recent_price and last_label == 0:
+#         print("Sell prediction correct")
+#     elif last_price < recent_price and last_label == 1:
+#         print("Buy prediction correct")
+#     else:
+#         print("Prediction incorrect")
+#
+#     pred_labels = xgboost_model.predict(recent_df).tolist()
+#     last_label = pred_labels[-1]
+#     time.sleep(900)
 
-recent_df = recent_df.drop(index=recent_df.index[:window_size])
-recent_df = recent_df.reset_index(drop=True)
-recent_df_windowed = recent_df_windowed.reset_index(drop=True)
-recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
-recent_df.drop(['Label'], axis=1, inplace=True)
+# #
+# recent_states = []
+# recent_df_current = pd.DataFrame(columns=recent_df[hmm_features].columns)
+# recent_count = 0
+# for index, row in recent_df[hmm_features].iterrows():
+#     recent_count += 1
+#     recent_df_current = pd.concat([recent_df_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
+#     recent_states.append(predict_states(hmm_model, recent_df_current, hmm_features, scaler)[-1])
+#     #keeps a window of 500 to improve computational efficiency
+#     if recent_count >= 1000:
+#         recent_df_current = recent_df_current.drop(recent_df_current.index[0])
+#
+# recent_states = list(zip(*recent_states))
+#
+# for i in range(hmm_comps):
+#     xg_features.append(f'State{i}')
+#     recent_df[f'State{i}'] = recent_states[i]
+#
+# #Need this to make recent_df compatible with convert_data_to_windows method
+# recent_df['Label'] = 0
+# print(recent_df['Close'])
+# recent_df['Weights'] = 0
+# recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+#
+# recent_df = recent_df.drop(index=recent_df.index[:window_size])
+# recent_df = recent_df.reset_index(drop=True)
+# recent_df_windowed = recent_df_windowed.reset_index(drop=True)
+# recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
+# xg_labels_test = recent_df['Label'].tolist()
+# print(recent_df[['Label', 'Close_t-1']])
+# recent_df.drop(['Label'], axis=1, inplace=True)
+# recent_df.drop(['Weights'], axis=1, inplace=True)
+#
+# xg_labels_pred = xgboost_model.predict(recent_df)
+# xg_labels_pred = xg_labels_pred.tolist()
+# recent_df['Pred_Label'] = xg_labels_pred
+#
+# count0 = 0
+# count1 = 0
+# for i in range(len(xg_labels_pred)):
+#     if xg_labels_pred[i] == 0 and xg_labels_test[i] == 0:
+#         count0 += 1
+#     if xg_labels_pred[i] == 1 and xg_labels_test[i] == 1:
+#         count1 += 1
+#
+# accuracy0 = count0 / xg_labels_test.count(0)
+# accuracy1 = count1 / xg_labels_test.count(1)
+# ratio0 = xg_labels_test.count(0) / len(xg_labels_test)
+# ratio1 = xg_labels_test.count(1) / len(xg_labels_test)
+# predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
+# predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
+# print(f"Accuracy of sells: {accuracy0}")
+# print(f"Accuracy of buys: {accuracy1}")
+# print(f"Combined accuracy: {accuracy0 + accuracy1}")
+# print(f"Ratio of sells: {ratio0}")
+# print(f"Ratio of buys: {ratio1}")
+# print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
+# print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
+# print(xg_labels_test.count(0))
+# print(xg_labels_pred.count(0))
+# print(xg_labels_test.count(1))
+# print(xg_labels_pred.count(1))
 
-probabilities = xgboost_model.predict_proba(recent_df).tolist()
-probability_0 = []
-probability_1 = []
-probability_2 = []
-for probability in probabilities:
-    probability_0.append(probability[0])
-    probability_1.append(probability[1])
-    probability_2.append(probability[2])
-
-print(f"75th percentile of sells: {np.percentile(probability_0, 1)}")
-print(f"75th percentile of holds: {np.percentile(probability_1, 1)}")
-print(f"75th percentile of buys: {np.percentile(probability_2, 1)}")
-closes = recent_df['Close_t-1'].tolist()
-trading_simulation(probabilities, closes, np.percentile(probability_2, 80), np.percentile(probability_0, 80), 100, starting_money=1500, spend_percentage=0.15)
+#
+# probabilities = xgboost_model.predict_proba(recent_df).tolist()
+# probability_0 = []
+# probability_1 = []
+# for probability in probabilities:
+#     probability_0.append(probability[0])
+#     probability_1.append(probability[1])
+#
+# labels = xgboost_model.predict(recent_df)
+# for i in range(len(labels)):
+#     print(f"label: {labels[i]}, price: {closes[i]}")
+#
+# print(f"percentile of sells: {np.percentile(probability_0, 53)}")
+# print(f"percentile of buys: {np.percentile(probability_1, 53)}")
+# closes = recent_df['Close_t-1'].tolist()
+# print(recent_df[['Pred_Label', 'Close_t-1']])
+# trading_simulation(xg_labels_pred, closes, starting_money=1500, spend_percentage=1)
+# notify()
 #while True:
 #     start_time = time.time()
 #
