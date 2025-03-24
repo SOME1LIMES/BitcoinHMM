@@ -30,7 +30,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
-pd.options.display.float_format = '{:.0f}'.format
+#pd.options.display.float_format = '{:.0f}'.format
 
 api_key = 'IbIgJihiEgl4rEjWnOFazg7F4YVzJXVG8if3iKcGsurgspgblDN2F73XMPdUzOcH'
 
@@ -46,57 +46,6 @@ def load_and_preprocess_data(filepath):
     eth_df.drop(0, inplace=True)
     eth_df = eth_df.astype(float)
     df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-
-    halving_dates = [
-        datetime.datetime(2020, 5, 11),
-        datetime.datetime(2024, 4, 20),
-        datetime.datetime(2028, 2, 19) #next estimated halving
-    ]
-    halving_cycle_duration = datetime.timedelta(days=365)
-
-    quarters = []
-    months = []
-    days = []
-    hours = []
-    sessions = []
-    in_halving_cycle = []
-
-    for timestamp in df['Timestamp']:
-        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
-        month = utc_time.month
-        quarter = (month - 1) // 3 + 1
-        day = utc_time.weekday()
-        hour = utc_time.hour
-
-        if 0 <= hour < 9:
-            session = 0
-        elif 7 <= hour < 16:
-            session = 1
-        elif 12 <= hour < 21:
-            session = 2
-        else:
-            session = 0
-
-        in_cycle = False
-        for halving_date in halving_dates:
-            if halving_date <= utc_time <= halving_date + halving_cycle_duration:
-                in_cycle = True
-                break
-
-        quarters.append(quarter)
-        months.append(month)
-        days.append(day)
-        hours.append(hour)
-        sessions.append(session)
-        in_halving_cycle.append(in_cycle)
-
-    df['Quarter'] = quarters
-    df['Month'] = months
-    df['Day'] = days
-    df['Hour'] = hours
-    df['Session'] = sessions
-    df['In_Halving_Cycle'] = in_halving_cycle
-    df['In_Halving_Cycle'] = df['In_Halving_Cycle'].astype(int)
 
     #Intramarket Difference
     period = 24
@@ -359,7 +308,7 @@ def load_and_preprocess_data(filepath):
     df.replace([np.inf, -np.inf], 0, inplace=True)
     df.dropna(inplace=True)
 
-    agg_excluded = ['Timestamp', 'Day', 'Session', 'Hour', 'Hour_Sin', 'Hour_Cos', 'Label', 'Price_Diff_Future_Abs', 'Price_Diff_Future']
+    agg_excluded = ['Timestamp', 'Label', 'Price_Diff_Future_Abs', 'Price_Diff_Future']
     agg_period = [4, 16, 48, 96, 384, 1152] #1h, 4h, 12h, 1d, 4d, 12d
     agg_df = pd.DataFrame()
     for period in agg_period:
@@ -395,15 +344,11 @@ def load_and_preprocess_data(filepath):
     #defragmenting dataframe
     df = df.copy()
 
-    training_df = df[df['Timestamp'] > 1680307200000] #January 1st 2023 12:15 am to present
-    pca_training_df = df[((df['Timestamp'] > 1672549200000) & (df['Timestamp'] <= 1680307200000))]
-    eval_df = df[((df['Timestamp'] > 1654056000000) & (df['Timestamp'] <= 1672549200000))] #June 1st 12:15am 2022 to Jan 1st 2023 12am
-    test_df = df[((df['Timestamp'] >= 1641013200000) & (df['Timestamp'] <= 1654056000000))] #Jan 1st 12am 2022 to June 1st 12am 2022
+    training_df = df[df['Timestamp'] > 1654056000000] #January 1st 2023 12:15 am to present
+    pca_training_df = df[((df['Timestamp'] >= 1641013200000) & (df['Timestamp'] <= 1654056000000))] #Jan 1st 12am 2022 to June 1st 12am 2022
 
     training_df.reset_index(drop=True, inplace=True)
     pca_training_df.reset_index(drop=True, inplace=True)
-    eval_df.reset_index(drop=True, inplace=True)
-    test_df.reset_index(drop=True, inplace=True)
 
     # RSI PCA analysis
     rsis = pd.DataFrame()
@@ -429,30 +374,6 @@ def load_and_preprocess_data(filepath):
     rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
     training_df = pd.concat([training_df, rsi_pca_df], axis=1)
 
-    eval_rsis = pd.DataFrame()
-    for p in range(2, 33):
-        eval_rsis[p] = talib.RSI(eval_df['Close'], timeperiod=p)
-
-    eval_rsi_means = eval_rsis.mean()
-    eval_rsis -= eval_rsi_means
-    eval_rsis = eval_rsis.dropna()
-
-    pca_data = rsi_pca.transform(eval_rsis)
-    rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
-    eval_df = pd.concat([eval_df, rsi_pca_df], axis=1)
-
-    test_rsis = pd.DataFrame()
-    for p in range(2, 33):
-        test_rsis[p] = talib.RSI(test_df['Close'], timeperiod=p)
-
-    test_rsi_means = test_rsis.mean()
-    test_rsis -= test_rsi_means
-    test_rsis = test_rsis.dropna()
-
-    pca_data = rsi_pca.transform(test_rsis)
-    rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
-    test_df = pd.concat([test_df, rsi_pca_df], axis=1)
-
     # ATR PCA analysis
     atrs = pd.DataFrame()
     for p in range(2, 33):
@@ -476,30 +397,6 @@ def load_and_preprocess_data(filepath):
     pca_data = atr_pca.transform(training_atrs)
     atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
     training_df = pd.concat([training_df, atr_pca_df], axis=1)
-
-    eval_atrs = pd.DataFrame()
-    for p in range(2, 33):
-        eval_atrs[p] = talib.ATR(eval_df['High'], eval_df['Low'], eval_df['Close'], timeperiod=p)
-
-    eval_atr_means = eval_atrs.mean()
-    eval_atrs -= eval_atr_means
-    eval_atrs = eval_atrs.dropna()
-
-    pca_data = atr_pca.transform(eval_atrs)
-    atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
-    eval_df = pd.concat([eval_df, atr_pca_df], axis=1)
-
-    test_atrs = pd.DataFrame()
-    for p in range(2, 33):
-        test_atrs[p] = talib.ATR(test_df['High'], test_df['Low'], test_df['Close'], timeperiod=p)
-
-    test_atr_means = test_atrs.mean()
-    test_atrs -= test_atr_means
-    test_atrs = test_atrs.dropna()
-
-    pca_data = atr_pca.transform(test_atrs)
-    atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
-    test_df = pd.concat([test_df, atr_pca_df], axis=1)
 
     # ADX PCA analysis
     adxs = pd.DataFrame()
@@ -525,75 +422,27 @@ def load_and_preprocess_data(filepath):
     adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
     training_df = pd.concat([training_df, adx_pca_df], axis=1)
 
-    eval_adxs = pd.DataFrame()
-    for p in range(2, 33):
-        eval_adxs[p] = talib.ADX(eval_df['High'], eval_df['Low'], eval_df['Close'], timeperiod=p)
-
-    eval_adx_means = eval_adxs.mean()
-    eval_adxs -= eval_adx_means
-    eval_adxs = eval_adxs.dropna()
-
-    pca_data = adx_pca.transform(eval_adxs)
-    adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
-    eval_df = pd.concat([eval_df, adx_pca_df], axis=1)
-
-    test_adxs = pd.DataFrame()
-    for p in range(2, 33):
-        test_adxs[p] = talib.ADX(test_df['High'], test_df['Low'], test_df['Close'], timeperiod=p)
-
-    test_adx_means = test_adxs.mean()
-    test_adxs -= test_adx_means
-    test_adxs = test_adxs.dropna()
-
-    pca_data = adx_pca.transform(test_adxs)
-    adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
-    test_df = pd.concat([test_df, adx_pca_df], axis=1)
-
     training_df.dropna(inplace=True)
-    eval_df.dropna(inplace=True)
-    test_df.dropna(inplace=True)
-
     #calculate aggregate pca features
     agg_included = ['RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5']
     agg_period = [4, 16, 48, 96, 384, 1152]  # 1h, 4h, 12h, 1d, 4d, 12d
     training_agg_df = pd.DataFrame()
-    eval_agg_df = pd.DataFrame()
-    test_agg_df = pd.DataFrame()
     for period in agg_period:
+        print()
         for feature in training_df.columns:
             if feature in agg_included:
+                print(f"'{feature}_Mean_{period}', ", end=' ')
                 training_agg_df[f'{feature}_Mean_{period}'] = training_df[feature].rolling(window=period).mean()
                 training_agg_df[f'{feature}_Dev_{period}'] = training_df[feature].rolling(window=period).std()
                 training_agg_df[f'{feature}_Drawdown_{period}'] = (training_df[feature] / training_df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
-        for feature in eval_df.columns:
-            if feature in agg_included:
-                eval_agg_df[f'{feature}_Mean_{period}'] = eval_df[feature].rolling(window=period).mean()
-                eval_agg_df[f'{feature}_Dev_{period}'] = eval_df[feature].rolling(window=period).std()
-                eval_agg_df[f'{feature}_Drawdown_{period}'] = (eval_df[feature] / eval_df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
-        for feature in test_df.columns:
-            if feature in agg_included:
-                test_agg_df[f'{feature}_Mean_{period}'] = test_df[feature].rolling(window=period).mean()
-                test_agg_df[f'{feature}_Dev_{period}'] = test_df[feature].rolling(window=period).std()
-                test_agg_df[f'{feature}_Drawdown_{period}'] = (test_df[feature] / test_df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
 
     training_df = pd.concat([training_df, training_agg_df], axis=1)
     training_df = training_df.dropna(axis=1, thresh=len(training_df) - 1452)
     training_df = training_df.fillna(0)
-    eval_df = pd.concat([eval_df, eval_agg_df], axis=1)
-    eval_df = eval_df.dropna(axis=1, thresh=len(eval_df) - 1452)
-    eval_df = eval_df.fillna(0)
-    test_df = pd.concat([test_df, test_agg_df], axis=1)
-    test_df = test_df.dropna(axis=1, thresh=len(test_df) - 1452)
-    test_df = test_df.fillna(0)
 
     ms = MinMaxScaler(feature_range=(0, 1))
     training_df['Weights'] = ms.fit_transform(training_df[['Price_Diff_Future_Abs']]) * 10
-    eval_df['Weights'] = ms.fit_transform(eval_df[['Price_Diff_Future_Abs']]) * 10
-    test_df['Weights'] = ms.fit_transform(test_df[['Price_Diff_Future_Abs']]) * 10
-
     training_df = training_df.copy()
-    eval_df = eval_df.copy()
-    test_df = test_df.copy()
 
     # count = 0
     # for column in df.columns:
@@ -602,7 +451,7 @@ def load_and_preprocess_data(filepath):
     #     if count == 15:
     #         count = 0
     #         print()
-    return training_df, eval_df, test_df
+    return training_df
 
 def cmma(High, Low, Close, period, atr_period = 168):
     atr = talib.ATR(High, Low, Close, atr_period)
@@ -632,56 +481,6 @@ def predict_states(model, data, features, scaler):
      X_scaled = scaler.transform(X)
      states = model.predict_proba(X_scaled)
      return states
-
-def plot_results_hmm(data, states, n_components):
-    print("Plotting results...")
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15,10), sharex=True)
-
-    ax1.plot(data.index, data['Close'])
-    ax1.set_title('Bitcoin Price and HMM States')
-    ax1.set_ylabel('Price')
-
-    for state in range(n_components):
-        mask = (states == state)
-        ax1.fill_between(data.index, data['Close'].min(), data['Close'].max(), where=mask, alpha=0.3, label=f'State {state}')
-    ax1.legend()
-
-    ax2.plot(data.index, data['Returns'])
-    ax2.set_title('Bitcoin Returns')
-    ax2.set_ylabel('Returns')
-    ax2.set_xlabel('Date')
-
-    plt.tight_layout()
-    print("Saving plot...")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    plt.savefig('plots/hmm' + str(timestamp))
-
-def plot_results_rf(data, labels_true, labels_pred):
-    print("Plotting results...")
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15,10), sharex=True)
-
-    ax1.plot(data.index, data['Close'])
-    ax1.set_title('Bitcoin Price and Real Labels')
-    ax1.set_ylabel('Price')
-
-    for label in range(3):
-        mask = (labels_true == label)
-        ax1.fill_between(data.index, data['Close'].min(), data['Close'].max(), where=mask, alpha=0.3, label=f'Signal {label}')
-    ax1.legend()
-
-    ax2.plot(data.index, data['Close'])
-    ax2.set_title('Bitcoin Price and Predicted Labels')
-    ax2.set_ylabel('Price')
-
-    for label in range(3):
-        mask = (labels_pred == label)
-        ax2.fill_between(data.index, data['Close'].min(), data['Close'].max(), where=mask, alpha=0.3, label=f'Signal {label}')
-    ax2.legend()
-
-    plt.tight_layout()
-    print("Saving plot...")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    plt.savefig('plots/rf' + str(timestamp))
 
 def custom_pnl_objective(y_true, y_pred):
     y_true[y_true == 0] = -1
@@ -720,7 +519,7 @@ def custom_pnl_objective(y_true, y_pred):
 #         'xgb__max_bin': Integer(128, 512),
 #         'xgb__grow_policy': Categorical(["depthwise", "lossguide"]),
 #         'xgb__max_delta_step': Integer(0, 10),
-#         'xgb__scale_pos_weight': Real(1.03, 1.07),
+#         'xgb__scale_pos_weight': Real(1.04, 1.08),
 #         'xgb__booster': Categorical(["gbtree", "dart"])
 #     }
 #     opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='roc_auc', random_state=42)
@@ -750,21 +549,21 @@ def custom_pnl_objective(y_true, y_pred):
 
 def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
     params = {
-        'max_depth': 14,
-        'learning_rate': 0.029317166919399066,
-        'subsample': 1.0,
-        'colsample_bytree': 0.7587347450548942,
+        'max_depth': 10,
+        'learning_rate': 0.0072011999078535486,
+        'subsample': 0.7168045624622187,
+        'colsample_bytree': 0.6578997967435244,
         'colsample_bylevel': 0.840082181391577,
-        'colsample_bynode': 0.7635282333655302,
-        'reg_alpha': 0.0,
-        'reg_lambda': 13.0,
-        'gamma': 0.0,
-        'n_estimators': 5000,
-        'min_child_weight': 1,
-        'max_bin': 470,
+        'colsample_bynode': 0.966433999423917,
+        'reg_alpha': 1.424671347168512,
+        'reg_lambda': 8.217243165955011,
+        'gamma': 8.041775379227216,
+        'n_estimators': 3500,
+        'min_child_weight': 9,
+        'max_bin': 412,
         'grow_policy': "depthwise",
-        'max_delta_step': 9,
-        'scale_pos_weight': 1.05,
+        'max_delta_step': 3,
+        'scale_pos_weight': 1.051,
         'booster': 'gbtree'
     }
 
@@ -910,57 +709,6 @@ def calculate_indicators(df, pca_training_df):
     eth_df.drop(0, inplace=True)
     eth_df = eth_df.astype(float)
     df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-
-    halving_dates = [
-        datetime.datetime(2020, 5, 11),
-        datetime.datetime(2024, 4, 20),
-        datetime.datetime(2028, 2, 19)  # next estimated halving
-    ]
-    halving_cycle_duration = datetime.timedelta(days=365)
-
-    quarters = []
-    months = []
-    days = []
-    hours = []
-    sessions = []
-    in_halving_cycle = []
-
-    for timestamp in df['Timestamp']:
-        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
-        month = utc_time.month
-        quarter = (month - 1) // 3 + 1
-        day = utc_time.weekday()
-        hour = utc_time.hour
-
-        if 0 <= hour < 9:
-            session = 0
-        elif 7 <= hour < 16:
-            session = 1
-        elif 12 <= hour < 21:
-            session = 2
-        else:
-            session = 0
-
-        in_cycle = False
-        for halving_date in halving_dates:
-            if halving_date <= utc_time <= halving_date + halving_cycle_duration:
-                in_cycle = True
-                break
-
-        quarters.append(quarter)
-        months.append(month)
-        days.append(day)
-        hours.append(hour)
-        sessions.append(session)
-        in_halving_cycle.append(in_cycle)
-
-    df['Quarter'] = quarters
-    df['Month'] = months
-    df['Day'] = days
-    df['Hour'] = hours
-    df['Session'] = sessions
-    df['In_Halving_Cycle'] = in_halving_cycle
-    df['In_Halving_Cycle'] = df['In_Halving_Cycle'].astype(int)
 
     # Intramarket Difference
     period = 24
@@ -1282,7 +1030,7 @@ def calculate_indicators(df, pca_training_df):
     adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
     df = pd.concat([df, adx_pca_df], axis=1)
 
-    agg_excluded = ['Timestamp', 'Day', 'Session', 'Hour', 'Hour_Sin', 'Hour_Cos', 'Label']
+    agg_excluded = ['Timestamp', 'Label']
     agg_period = [4, 16, 48, 96, 384, 1152]  # 1h, 4h, 12h, 1d, 4d, 12d
     agg_df = pd.DataFrame()
     for period in agg_period:
@@ -1327,24 +1075,20 @@ def calculate_indicators(df, pca_training_df):
     return df
 
 def convert_data_to_windows(data, window_size=2):
-    rows = []
-    for i in range(len(data) - window_size):
-        print(f"window_step: {i}")
-        row = {}
+    final = pd.DataFrame()
+    non_windowed = ['Label', 'Weights', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5']
+    for i in range(window_size):
+        print(f'window step {i}')
         for feature in data.columns:
-            if feature != 'Label' and feature != 'Weights':
-                for t in range(window_size):
-                    row[f"{feature}_t-{window_size - t}"] = data[feature].iloc[i + t]
+            if feature not in non_windowed:
+                final[f'{feature}_t{i}'] = data[feature].shift(i)
 
-        row['Label'] = int(data['Label'].iloc[i + window_size])
-        row['Weights'] = float(data['Weights'].iloc[i + window_size])
-        rows.append(row)
-
-    window_data = pd.DataFrame(rows)
+    for feature in non_windowed:
+        final[feature] = data[feature]
+    final.dropna(inplace=True)
+    return final
     # window_data['Label'] = window_data['Label'].shift(1)
     # window_data['Weights'] = window_data['Weights'].shift(1)
-
-    return window_data
 
 def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.1):
     money = starting_money
@@ -1426,156 +1170,131 @@ def notify():
     messagebox.showinfo("Notification", "Your code has finished running!")
     root.destroy()
 
-window_size = 33
-data_train, data_eval, data_test = load_and_preprocess_data("BTCUSDC15m_2020-2025_labeled.csv")
+def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, val_size=0.15, window_size=2):
+    splits = []
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    for train_idx, test_val_idx in tscv.split(data):
+        n_test_val = len(test_val_idx)
+        n_val = int(n_test_val * (val_size / (test_size + val_size)))
+
+        val_idx = test_val_idx[:n_val]
+        test_idx = test_val_idx[n_val:]
+
+        splits.append((train_idx, val_idx, test_idx))
+
+    split_count = 0
+    for split in splits:
+        split_count += 1
+        print("Split: " + str(split_count))
+
+        data_train = data.iloc[min(split[0]):max(split[0])]
+        data_eval = data.iloc[min(split[1]):max(split[1])]
+        data_test = data.iloc[min(split[2]):max(split[2])]
+
+        # Build xgboost model
+        xg_data_eval = convert_data_to_windows(data_eval[xg_features], window_size)
+        xg_data_train = convert_data_to_windows(data_train[xg_features], window_size)
+        xg_data_test = convert_data_to_windows(data_test[xg_features], window_size)
+
+        # dropping the first few rows to line up data with the xgboost data
+        data_train = data_train.drop(index=data_train.index[:window_size])
+        data_eval = data_eval.drop(index=data_eval.index[:window_size])
+        data_test = data_test.drop(index=data_test.index[:window_size])
+
+        # need to reset index so that the concat works properly
+        xg_data_train = xg_data_train.reset_index(drop=True)
+        data_train = data_train.reset_index(drop=True)
+        xg_data_eval = xg_data_eval.reset_index(drop=True)
+        data_eval = data_eval.reset_index(drop=True)
+        xg_data_test = xg_data_test.reset_index(drop=True)
+        data_test = data_test.reset_index(drop=True)
+        xg_data_train = pd.concat([xg_data_train, data_train[agg_features]], axis=1)
+        xg_data_eval = pd.concat([xg_data_eval, data_eval[agg_features]], axis=1)
+        xg_data_test = pd.concat([xg_data_test, data_test[agg_features]], axis=1)
+
+        xg_data_train.dropna(inplace=True)
+        xg_data_eval.dropna(inplace=True)
+        xg_data_test.dropna(inplace=True)
+
+        print(xg_data_train[['Close_t0', 'Weights', 'Label']])
+        xg_labels_train = xg_data_train.pop('Label').tolist()
+        xg_labels_train = [int(x) for x in xg_labels_train]
+        xg_labels_eval = xg_data_eval.pop('Label').tolist()
+        xg_labels_eval = [int(x) for x in xg_labels_eval]
+        xg_labels_test = xg_data_test.pop('Label').tolist()
+        xg_labels_test = [int(x) for x in xg_labels_test]
+
+        weights = xg_data_train['Weights'].tolist()
+        xg_data_train.drop(columns='Weights', inplace=True)
+        xg_data_eval.drop(columns='Weights', inplace=True)
+        xg_data_test.drop(columns='Weights', inplace=True)
+        xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, weights, 5, 5)
+        xgboost_model = load_xgboost(xgboost_path)
+        xg_labels_pred = xgboost_model.predict(xg_data_test)
+        xg_labels_pred = xg_labels_pred.tolist()
+
+        count0 = 0
+        count1 = 0
+        for i in range(len(xg_labels_pred)):
+            if xg_labels_pred[i] == 0 and xg_labels_test[i] == 0:
+                count0 += 1
+            if xg_labels_pred[i] == 1 and xg_labels_test[i] == 1:
+                count1 += 1
+
+        accuracy0 = count0 / xg_labels_test.count(0)
+        accuracy1 = count1 / xg_labels_test.count(1)
+        ratio0 = xg_labels_test.count(0) / len(xg_labels_test)
+        ratio1 = xg_labels_test.count(1) / len(xg_labels_test)
+        predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
+        predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
+        print(f"Accuracy of sells: {accuracy0}")
+        print(f"Accuracy of buys: {accuracy1}")
+        print(f"Combined accuracy: {accuracy0 + accuracy1}")
+        print(f"Ratio of sells: {ratio0}")
+        print(f"Ratio of buys: {ratio1}")
+        print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
+        print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
+
+window_size = 2
+data = load_and_preprocess_data("BTCUSDC15m_2020-2025_labeled.csv")
 scaler = StandardScaler()
-hmm_features = ['Close', 'Session', 'BTC-ETC_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
+hmm_features = ['Close', 'BTC-ETC_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
                 'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD', 'Stochastic-RSI', 'RSI_Mean_4', 'Chikou_Span_Dev_48', 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4']
-xg_features = ['Timestamp', 'Close', 'Session', 'BTC-ETC_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Closing_Marubozu', 'Doji', 'Dragonfly_Doji', 'Engulfing', 'Hikkake', 'Long_Doji', 'Long_Candle', 'Short_Candle', 'Marubozu', 'Harami', 'Don_Signal',
-               'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K', 'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD',
-               'Stochastic-RSI',  'Belt_Hold', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'Weights', 'Label']
-agg_features = ['RSI_Mean_4', 'RSI_Mean_16', 'TSI_Mean_16', 'Volume_Change_Mean_4', 'Price_Diff_Mean_4', 'TSI_Mean_4', 'Returns_Mean_4', 'Lower_Wick_Ratio_Mean_4',
-                'BB-KC_Mean_96', 'Returns_Mean_16', 'Price_Diff_Mean_16', 'Body_Ratio_Mean_4', 'Label_Mean_16', 'Price_Diff_Mean_96', 'CCI_Mean_4', 'MACDHist_Mean_96', 'CCI_Mean_96', 'Doji-RSI_Mean_4', 'Belt_Hold-ATR_Mean_48', 'Label_Mean_96',
-                'VWAP_Mean_48', 'Long_Doji-RSI_Mean_4', 'Short_Candle-RSI_Mean_4', 'Aroon_Mean_4', 'CCI_Mean_16', 'Long_Candle-RSI_Mean_4', 'ADX_Mean_4', 'Aroon_Mean_16', 'Volume_Change_Mean_16', 'MACDSignal_Mean_4',
-                'Stochastic-RSI_Mean_48', 'MACDSignal_Mean_16', 'Closing_Marubozu-ATR_Mean_4', 'Volume-ATR_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Mean_4', 'Returns_Mean_48', 'Marubozu-OBV_Mean_16',
-                'Dragonfly_Doji-RSI_Mean_48', 'Ichimoku_Overlap_Mean_48', 'Lower_Wick_Ratio_Mean_48', 'RSI_Mean_48', 'Price_Diff_Mean_48', 'Fast_%K_Mean_4', 'Aroon_Mean_96', 'Hammer_Mean_16', 'Body_Ratio_Mean_16',
-                'Engulfing_Mean_4', 'VWAP_Mean_4', 'Belt_Hold-ATR_Mean_96', 'Returns_Mean_96', 'Marubozu-RSI_Mean_48', 'Hikkake_Mean_16', 'LOW-HIGH_EMA_Mean_4', 'Chikou_Span_Dev_48', 'Long_Doji-RSI_Dev_4',
-                'Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_48', 'Stochastic-RSI_Dev_96', 'Closing_Marubozu-RSI_Dev_48', 'ADX_Dev_4', 'Stochastic-RSI_Dev_4', 'Lower_Wick_Ratio_Dev_4', 'Long_Candle_Dev_384',
-                'ADX_Dev_96', 'High_Dev_4', 'TSI_Dev_48', 'Engulfing_Dev_48', 'VWAP_Dev_48', 'Volume-ATR_Dev_4', 'OBV_Dev_4', 'BB_Upper_Dev_4', 'TSI_Dev_4', 'BB_Lower_Dev_4', 'Fast_%D_Dev_4', 'KC_Lower_Dev_4',
-                'Volume_Dev_4', 'Long_Doji-RSI_Dev_16', 'Senkou_Span_A_Dev_4', 'Senkou_Span_B_Dev_16', 'CCI_Dev_4', 'Aroon_Dev_96', 'Stochastic-RSI_Dev_48', 'Lower_Wick_Ratio_Dev_48', 'BB-KC_Dev_16', 'Upper_Wick_Dev_4',
-                'Dragonfly_Doji-OBV_Dev_48', 'Belt_Hold-RSI_Dev_48', 'Kijun_Sen_Dev_16', 'Closing_Marubozu-RSI_Dev_4', 'Upper_Wick_Ratio_Dev_4', 'Short_Candle-RSI_Dev_96', 'Long_Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_16', 'Closing_Marubozu-RSI_Dev_16',
-                'Fast_%K_Dev_48', 'MACDSignal_Dev_4', 'CCI_Dev_48', 'Belt_Hold-RSI_Dev_4', 'RSI_Dev_48', 'Short_Candle-OBV_Dev_16', 'VWAP-ATR_Dev_4', 'Long_Candle-RSI_Dev_384', 'Closing_Marubozu-RSI_Dev_96', 'BTC-ETC_Diff_Dev_4', 'Doji-RSI_Dev_4',
-                'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4', 'Volatility_Drawdown_4', 'CMF_Drawdown_4', 'ADX_Drawdown_4', 'ATR_Drawdown_4', 'S2_Drawdown_4', 'KC_Upper_Drawdown_16', 'Open_Drawdown_4', 'Fast_%D_Drawdown_4', 'ADX_Drawdown_16', 'BB_Lower_Drawdown_4',
-                'RSI-MACD_Drawdown_4', 'Chikou_Span_Drawdown_16', 'BB_Upper_Drawdown_4', 'Volatility_Drawdown_16', 'R2_Drawdown_4', 'RSI_Drawdown_4', 'BB_Upper_Drawdown_16', 'BB-KC_Drawdown_4', 'BB_Lower_Drawdown_16', 'CMF_Drawdown_16', 'S1_Drawdown_4',
-                'Low_Drawdown_4', 'VWAP-ATR_Drawdown_16', 'BB_Middle_Drawdown_4', 'R2_Drawdown_16', 'Senkou_Span_B_Drawdown_4', 'High_Drawdown_4', 'Chikou_Span_Drawdown_48']
+xg_features = ['Close', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5', 'Stochastic-RSI', 'Fast_%K', 'Volatility', 'BTC-ETC_Diff', 'Returns',
+               'Upper_Wick_Ratio', 'Range', 'Upper_Wick', 'MACDSignal', 'LOW-HIGH_EMA', 'Ichimoku_Overlap', 'RSI-MACD', 'Body_Ratio', 'MACD', 'Price_Diff', 'Timestamp', 'VWAP-ATR', 'WILLR',
+               'RSI', 'Doji-OBV', 'BB-KC', 'Lower_Wick', 'Body_Size', 'MACDHist', 'BB_Width', 'ATR', 'VWAP', 'Volume-ATR', 'Lower_Wick_Ratio', 'KC_Width', 'TSI', 'Momentum', 'ADX', 'CCI', 'Fast_%D',
+               'CMF', 'OBV', 'Volume_Change', 'Volume', 'Weights', 'Label']
+agg_features = ['Stochastic-RSI_Mean_4', 'BTC-ETC_Diff_Mean_4', 'Price_Diff_Mean_4', 'Returns_Mean_4', 'Volatility_Mean_4', 'Volume_Change_Mean_4', 'OBV_Mean_4', 'CMF_Mean_4', 'VWAP_Mean_4', 'RSI_Mean_4', 'Fast_%K_Mean_4', 'Fast_%D_Mean_4', 'WILLR_Mean_4', 'CCI_Mean_4', 'ATR_Mean_4', 'ADX_Mean_4', 'Momentum_Mean_4', 'TSI_Mean_4', 'BB_Width_Mean_4', 'MACD_Mean_4', 'MACDSignal_Mean_4', 'MACDHist_Mean_4', 'KC_Width_Mean_4', 'Body_Size_Mean_4', 'Upper_Wick_Mean_4', 'Lower_Wick_Mean_4', 'Range_Mean_4', 'Body_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'Lower_Wick_Ratio_Mean_4', 'Doji-OBV_Mean_4', 'Volume-ATR_Mean_4', 'VWAP-ATR_Mean_4', 'RSI-MACD_Mean_4', 'BB-KC_Mean_4', 'Ichimoku_Overlap_Mean_4', 'LOW-HIGH_EMA_Mean_4',
+                'Stochastic-RSI_Mean_16', 'BTC-ETC_Diff_Mean_16', 'Price_Diff_Mean_16', 'Returns_Mean_16', 'Volatility_Mean_16', 'Volume_Change_Mean_16', 'OBV_Mean_16', 'CMF_Mean_16', 'VWAP_Mean_16', 'RSI_Mean_16', 'Fast_%K_Mean_16', 'Fast_%D_Mean_16', 'WILLR_Mean_16', 'CCI_Mean_16', 'ATR_Mean_16', 'ADX_Mean_16', 'Momentum_Mean_16', 'TSI_Mean_16', 'BB_Width_Mean_16', 'MACD_Mean_16', 'MACDSignal_Mean_16', 'MACDHist_Mean_16', 'KC_Width_Mean_16', 'Body_Size_Mean_16', 'Upper_Wick_Mean_16', 'Lower_Wick_Mean_16', 'Range_Mean_16', 'Body_Ratio_Mean_16', 'Upper_Wick_Ratio_Mean_16', 'Lower_Wick_Ratio_Mean_16', 'Doji-OBV_Mean_16', 'Volume-ATR_Mean_16', 'VWAP-ATR_Mean_16', 'RSI-MACD_Mean_16', 'BB-KC_Mean_16', 'Ichimoku_Overlap_Mean_16', 'LOW-HIGH_EMA_Mean_16',
+                'Stochastic-RSI_Mean_48', 'BTC-ETC_Diff_Mean_48', 'Price_Diff_Mean_48', 'Returns_Mean_48', 'Volatility_Mean_48', 'Volume_Change_Mean_48', 'OBV_Mean_48', 'CMF_Mean_48', 'VWAP_Mean_48', 'RSI_Mean_48', 'Fast_%K_Mean_48', 'Fast_%D_Mean_48', 'WILLR_Mean_48', 'CCI_Mean_48', 'ATR_Mean_48', 'ADX_Mean_48', 'Momentum_Mean_48', 'TSI_Mean_48', 'BB_Width_Mean_48', 'MACD_Mean_48', 'MACDSignal_Mean_48', 'MACDHist_Mean_48', 'KC_Width_Mean_48', 'Body_Size_Mean_48', 'Upper_Wick_Mean_48', 'Lower_Wick_Mean_48', 'Range_Mean_48', 'Body_Ratio_Mean_48', 'Upper_Wick_Ratio_Mean_48', 'Lower_Wick_Ratio_Mean_48', 'Doji-OBV_Mean_48', 'Volume-ATR_Mean_48', 'VWAP-ATR_Mean_48', 'RSI-MACD_Mean_48', 'BB-KC_Mean_48', 'Ichimoku_Overlap_Mean_48', 'LOW-HIGH_EMA_Mean_48',
+                'Stochastic-RSI_Mean_96', 'BTC-ETC_Diff_Mean_96', 'Price_Diff_Mean_96', 'Returns_Mean_96', 'Volatility_Mean_96', 'Volume_Change_Mean_96', 'OBV_Mean_96', 'CMF_Mean_96', 'VWAP_Mean_96', 'RSI_Mean_96', 'Fast_%K_Mean_96', 'Fast_%D_Mean_96', 'WILLR_Mean_96', 'CCI_Mean_96', 'ATR_Mean_96', 'ADX_Mean_96', 'Momentum_Mean_96', 'TSI_Mean_96', 'BB_Width_Mean_96', 'MACD_Mean_96', 'MACDSignal_Mean_96', 'MACDHist_Mean_96', 'KC_Width_Mean_96', 'Body_Size_Mean_96', 'Upper_Wick_Mean_96', 'Lower_Wick_Mean_96', 'Range_Mean_96', 'Body_Ratio_Mean_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Ratio_Mean_96', 'Doji-OBV_Mean_96', 'Volume-ATR_Mean_96', 'VWAP-ATR_Mean_96', 'RSI-MACD_Mean_96', 'BB-KC_Mean_96', 'Ichimoku_Overlap_Mean_96', 'LOW-HIGH_EMA_Mean_96',
+                'Stochastic-RSI_Mean_384', 'BTC-ETC_Diff_Mean_384', 'Price_Diff_Mean_384', 'Returns_Mean_384', 'Volatility_Mean_384', 'Volume_Change_Mean_384', 'OBV_Mean_384', 'CMF_Mean_384', 'VWAP_Mean_384', 'RSI_Mean_384', 'Fast_%K_Mean_384', 'Fast_%D_Mean_384', 'WILLR_Mean_384', 'CCI_Mean_384', 'ATR_Mean_384', 'ADX_Mean_384', 'Momentum_Mean_384', 'TSI_Mean_384', 'BB_Width_Mean_384', 'MACD_Mean_384', 'MACDSignal_Mean_384', 'MACDHist_Mean_384', 'KC_Width_Mean_384', 'Body_Size_Mean_384', 'Upper_Wick_Mean_384', 'Lower_Wick_Mean_384', 'Range_Mean_384', 'Body_Ratio_Mean_384', 'Upper_Wick_Ratio_Mean_384', 'Lower_Wick_Ratio_Mean_384', 'Doji-OBV_Mean_384', 'Volume-ATR_Mean_384', 'VWAP-ATR_Mean_384', 'RSI-MACD_Mean_384', 'BB-KC_Mean_384', 'Ichimoku_Overlap_Mean_384', 'LOW-HIGH_EMA_Mean_384',
+                'Stochastic-RSI_Mean_1152', 'BTC-ETC_Diff_Mean_1152', 'Price_Diff_Mean_1152', 'Returns_Mean_1152', 'Volatility_Mean_1152', 'Volume_Change_Mean_1152', 'OBV_Mean_1152', 'CMF_Mean_1152', 'VWAP_Mean_1152', 'RSI_Mean_1152', 'Fast_%K_Mean_1152', 'Fast_%D_Mean_1152', 'WILLR_Mean_1152', 'CCI_Mean_1152', 'ATR_Mean_1152', 'ADX_Mean_1152', 'Momentum_Mean_1152', 'TSI_Mean_1152', 'BB_Width_Mean_1152', 'MACD_Mean_1152', 'MACDSignal_Mean_1152', 'MACDHist_Mean_1152', 'KC_Width_Mean_1152', 'Body_Size_Mean_1152', 'Upper_Wick_Mean_1152', 'Lower_Wick_Mean_1152', 'Range_Mean_1152', 'Body_Ratio_Mean_1152', 'Upper_Wick_Ratio_Mean_1152', 'Lower_Wick_Ratio_Mean_1152', 'Doji-OBV_Mean_1152', 'Volume-ATR_Mean_1152', 'VWAP-ATR_Mean_1152', 'RSI-MACD_Mean_1152', 'BB-KC_Mean_1152', 'Ichimoku_Overlap_Mean_1152', 'LOW-HIGH_EMA_Mean_1152',
+                'RSI_PC1_Mean_4',  'RSI_PC2_Mean_4',  'RSI_PC3_Mean_4',  'ATR_PC1_Mean_4',  'ATR_PC2_Mean_4',  'ATR_PC3_Mean_4',  'ADX_PC1_Mean_4',  'ADX_PC2_Mean_4',  'ADX_PC3_Mean_4',  'ADX_PC4_Mean_4',  'ADX_PC5_Mean_4',
+                'RSI_PC1_Mean_16',  'RSI_PC2_Mean_16',  'RSI_PC3_Mean_16',  'ATR_PC1_Mean_16',  'ATR_PC2_Mean_16',  'ATR_PC3_Mean_16',  'ADX_PC1_Mean_16',  'ADX_PC2_Mean_16',  'ADX_PC3_Mean_16',  'ADX_PC4_Mean_16',  'ADX_PC5_Mean_16',
+                'RSI_PC1_Mean_48',  'RSI_PC2_Mean_48',  'RSI_PC3_Mean_48',  'ATR_PC1_Mean_48',  'ATR_PC2_Mean_48',  'ATR_PC3_Mean_48',  'ADX_PC1_Mean_48',  'ADX_PC2_Mean_48',  'ADX_PC3_Mean_48',  'ADX_PC4_Mean_48',  'ADX_PC5_Mean_48',
+                'RSI_PC1_Mean_96',  'RSI_PC2_Mean_96',  'RSI_PC3_Mean_96',  'ATR_PC1_Mean_96',  'ATR_PC2_Mean_96',  'ATR_PC3_Mean_96',  'ADX_PC1_Mean_96',  'ADX_PC2_Mean_96',  'ADX_PC3_Mean_96',  'ADX_PC4_Mean_96',  'ADX_PC5_Mean_96',
+                'RSI_PC1_Mean_384',  'RSI_PC2_Mean_384',  'RSI_PC3_Mean_384',  'ATR_PC1_Mean_384',  'ATR_PC2_Mean_384',  'ATR_PC3_Mean_384',  'ADX_PC1_Mean_384',  'ADX_PC2_Mean_384',  'ADX_PC3_Mean_384',  'ADX_PC4_Mean_384',  'ADX_PC5_Mean_384',
+                'RSI_PC1_Mean_1152',  'RSI_PC2_Mean_1152',  'RSI_PC3_Mean_1152',  'ATR_PC1_Mean_1152',  'ATR_PC2_Mean_1152',  'ATR_PC3_Mean_1152',  'ADX_PC1_Mean_1152',  'ADX_PC2_Mean_1152',  'ADX_PC3_Mean_1152',  'ADX_PC4_Mean_1152',  'ADX_PC5_Mean_1152'
+                ]
 
-# 'RSI_PC3_Mean_16', 'RSI_PC1_Mean_48', 'RSI_PC1_Mean_16', 'RSI_PC2_Mean_16', 'ATR_PC2_Mean_4',
-#                 'ADX_PC2_Mean_384', 'ATR_PC3_Mean_16', 'ADX_PC1_Mean_96', 'ADX_PC5_Mean_16', 'RSI_PC1_Mean_384', 'ADX_PC3_Mean_4', 'ADX_PC2_Mean_16', 'RSI_PC3_Mean_4', 'ATR_PC3_Mean_96', 'RSI_PC2_Dev_48', 'RSI_PC1_Dev_48', 'RSI_PC3_Dev_48', 'ADX_PC2_Mean_4', 'RSI_PC1_Dev_96',
-#                 'ATR_PC3_Dev_4', 'ADX_PC4_Dev_48', 'ADX_PC1_Dev_4', 'RSI_PC1_Dev_16', 'RSI_PC2_Dev_96', 'ADX_PC4_Dev_4', 'ADX_PC2_Dev_16', 'ADX_PC3_Dev_96', 'ADX_PC5_Dev_48', 'ADX_PC5_Dev_16', 'ATR_PC2_Drawdown_4', 'ADX_PC4_Drawdown_4', 'RSI_PC3_Drawdown_4', 'RSI_PC3_Drawdown_16',
-#                 'ATR_PC3_Drawdown_16', 'ATR_PC1_Drawdown_4', 'ADX_PC5_Drawdown_4'
+# 'RSI_Mean_4', 'RSI_Mean_16', 'TSI_Mean_16', 'Volume_Change_Mean_4', 'Price_Diff_Mean_4', 'TSI_Mean_4', 'Returns_Mean_4', 'Lower_Wick_Ratio_Mean_4',
+#                 'BB-KC_Mean_96', 'Returns_Mean_16', 'Price_Diff_Mean_16', 'Body_Ratio_Mean_4', 'Label_Mean_16', 'Price_Diff_Mean_96', 'CCI_Mean_4', 'MACDHist_Mean_96', 'CCI_Mean_96', 'Doji-RSI_Mean_4', 'Belt_Hold-ATR_Mean_48', 'Label_Mean_96',
+#                 'VWAP_Mean_48', 'Long_Doji-RSI_Mean_4', 'Short_Candle-RSI_Mean_4', 'Aroon_Mean_4', 'CCI_Mean_16', 'Long_Candle-RSI_Mean_4', 'ADX_Mean_4', 'Aroon_Mean_16', 'Volume_Change_Mean_16', 'MACDSignal_Mean_4',
+#                 'Stochastic-RSI_Mean_48', 'MACDSignal_Mean_16', 'Closing_Marubozu-ATR_Mean_4', 'Volume-ATR_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Mean_4', 'Returns_Mean_48', 'Marubozu-OBV_Mean_16',
+#                 'Dragonfly_Doji-RSI_Mean_48', 'Ichimoku_Overlap_Mean_48', 'Lower_Wick_Ratio_Mean_48', 'RSI_Mean_48', 'Price_Diff_Mean_48', 'Fast_%K_Mean_4', 'Aroon_Mean_96', 'Hammer_Mean_16', 'Body_Ratio_Mean_16',
+#                 'Engulfing_Mean_4', 'VWAP_Mean_4', 'Belt_Hold-ATR_Mean_96', 'Returns_Mean_96', 'Marubozu-RSI_Mean_48', 'Hikkake_Mean_16', 'LOW-HIGH_EMA_Mean_4', 'Chikou_Span_Dev_48', 'Long_Doji-RSI_Dev_4',
+#                 'Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_48', 'Stochastic-RSI_Dev_96', 'Closing_Marubozu-RSI_Dev_48', 'ADX_Dev_4', 'Stochastic-RSI_Dev_4', 'Lower_Wick_Ratio_Dev_4', 'Long_Candle_Dev_384',
+#                 'ADX_Dev_96', 'High_Dev_4', 'TSI_Dev_48', 'Engulfing_Dev_48', 'VWAP_Dev_48', 'Volume-ATR_Dev_4', 'OBV_Dev_4', 'BB_Upper_Dev_4', 'TSI_Dev_4', 'BB_Lower_Dev_4', 'Fast_%D_Dev_4', 'KC_Lower_Dev_4',
+#                 'Volume_Dev_4', 'Long_Doji-RSI_Dev_16', 'Senkou_Span_A_Dev_4', 'Senkou_Span_B_Dev_16', 'CCI_Dev_4', 'Aroon_Dev_96', 'Stochastic-RSI_Dev_48', 'Lower_Wick_Ratio_Dev_48', 'BB-KC_Dev_16', 'Upper_Wick_Dev_4',
+#                 'Dragonfly_Doji-OBV_Dev_48', 'Belt_Hold-RSI_Dev_48', 'Kijun_Sen_Dev_16', 'Closing_Marubozu-RSI_Dev_4', 'Upper_Wick_Ratio_Dev_4', 'Short_Candle-RSI_Dev_96', 'Long_Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_16', 'Closing_Marubozu-RSI_Dev_16',
+#                 'Fast_%K_Dev_48', 'MACDSignal_Dev_4', 'CCI_Dev_48', 'Belt_Hold-RSI_Dev_4', 'RSI_Dev_48', 'Short_Candle-OBV_Dev_16', 'VWAP-ATR_Dev_4', 'Long_Candle-RSI_Dev_384', 'Closing_Marubozu-RSI_Dev_96', 'BTC-ETC_Diff_Dev_4', 'Doji-RSI_Dev_4',
+#                 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4', 'Volatility_Drawdown_4', 'CMF_Drawdown_4', 'ADX_Drawdown_4', 'ATR_Drawdown_4', 'S2_Drawdown_4', 'KC_Upper_Drawdown_16', 'Open_Drawdown_4', 'Fast_%D_Drawdown_4', 'ADX_Drawdown_16', 'BB_Lower_Drawdown_4',
+#                 'RSI-MACD_Drawdown_4', 'Chikou_Span_Drawdown_16', 'BB_Upper_Drawdown_4', 'Volatility_Drawdown_16', 'R2_Drawdown_4', 'RSI_Drawdown_4', 'BB_Upper_Drawdown_16', 'BB-KC_Drawdown_4', 'BB_Lower_Drawdown_16', 'CMF_Drawdown_16', 'S1_Drawdown_4',
+#                 'Low_Drawdown_4', 'VWAP-ATR_Drawdown_16', 'BB_Middle_Drawdown_4', 'R2_Drawdown_16', 'Senkou_Span_B_Drawdown_4', 'High_Drawdown_4', 'Chikou_Span_Drawdown_48'
+walk_forward(data, xg_features, agg_features)
 
-# hmm_comps = 2
-# hmm_path = train_hmm(pd.concat([data_test, data_eval, data_train], ignore_index=True), hmm_features, scaler, hmm_comps)
-# hmm_model = load_hmm(hmm_path)
-
-#walk forward hmm prediction
-# states = []
-# data_train_current = pd.DataFrame(columns=data_train[hmm_features].columns)
-# train_count = 0
-# for index, row in data_train[hmm_features].iterrows():
-#     train_count += 1
-#     print(train_count)
-#     data_train_current = pd.concat([data_train_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
-#     states.append(predict_states(hmm_model, data_train_current, hmm_features, scaler)[-1])
-#     #keeps a window of 500 to improve computational efficiency
-#     if train_count >= 1000:
-#         data_train_current = data_train_current.drop(data_train_current.index[0])
-#
-# states_eval = []
-# data_eval_current = pd.DataFrame(columns=data_eval[hmm_features].columns)
-# eval_count = 0
-# for index, row in data_eval[hmm_features].iterrows():
-#     eval_count += 1
-#     print(eval_count)
-#     data_eval_current = pd.concat([data_eval_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
-#     states_eval.append(predict_states(hmm_model, data_eval_current, hmm_features, scaler)[-1])
-#     if eval_count >= 1000:
-#         data_eval_current = data_eval_current.drop(data_eval_current.index[0])
-#
-# states_test = []
-# data_test_current = pd.DataFrame(columns=data_test[hmm_features].columns)
-# test_count = 0
-# for index, row in data_test[hmm_features].iterrows():
-#     test_count += 1
-#     print(test_count)
-#     data_test_current = pd.concat([data_test_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
-#     states_test.append(predict_states(hmm_model, data_test_current, hmm_features, scaler)[-1])
-#     if test_count >= 1000:
-#          data_test_current = data_test_current.drop(data_test_current.index[0])
-#
-# data_train_states = list(zip(*states))
-# data_eval_states = list(zip(*states_eval))
-# data_test_states = list(zip(*states_test))
-#
-# for i in range(hmm_comps):
-#     data_train[f'State{i}'] = data_train_states[i]
-#     data_eval[f'State{i}'] = data_eval_states[i]
-#     data_test[f'State{i}'] = data_test_states[i]
-#     xg_features.append(f'State{i}')
-
-#defragmenting the dataframes
-data_train = data_train.copy()
-data_eval = data_eval.copy()
-data_test = data_test.copy()
-
-#Build xgboost model
-xg_data_eval = convert_data_to_windows(data_eval[xg_features], window_size)
-xg_data_train = convert_data_to_windows(data_train[xg_features], window_size)
-xg_data_test = convert_data_to_windows(data_test[xg_features], window_size)
-
-print(xg_data_train[['Close_t-1', 'Label']].tail(50))
-
-#dropping the first few rows to line up data with the xgboost data
-data_train = data_train.drop(index=data_train.index[:window_size])
-data_eval = data_eval.drop(index=data_eval.index[:window_size])
-data_test = data_test.drop(index=data_test.index[:window_size])
-
-#need to reset index so that the concat works properly
-xg_data_train = xg_data_train.reset_index(drop=True)
-data_train = data_train.reset_index(drop=True)
-xg_data_eval = xg_data_eval.reset_index(drop=True)
-data_eval = data_eval.reset_index(drop=True)
-xg_data_test = xg_data_test.reset_index(drop=True)
-data_test = data_test.reset_index(drop=True)
-xg_data_train = pd.concat([xg_data_train, data_train[agg_features]], axis=1)
-xg_data_eval = pd.concat([xg_data_eval, data_eval[agg_features]], axis=1)
-xg_data_test = pd.concat([xg_data_test, data_test[agg_features]], axis=1)
-
-xg_data_train.dropna(inplace=True)
-xg_data_eval.dropna(inplace=True)
-xg_data_test.dropna(inplace=True)
-
-xg_labels_train = xg_data_train.pop('Label').tolist()
-xg_labels_train = [int(x) for x in xg_labels_train]
-xg_labels_eval = xg_data_eval.pop('Label').tolist()
-xg_labels_eval = [int(x) for x in xg_labels_eval]
-xg_labels_test = xg_data_test.pop('Label').tolist()
-xg_labels_test = [int(x) for x in xg_labels_test]
-
-weights = xg_data_train['Weights'].tolist()
-xg_data_train.drop(columns='Weights', inplace=True)
-xg_data_eval.drop(columns='Weights', inplace=True)
-xg_data_test.drop(columns='Weights', inplace=True)
-xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, weights, 15, 45)
-xgboost_model = load_xgboost(xgboost_path)
-xg_labels_pred = xgboost_model.predict(xg_data_test)
-xg_labels_pred = xg_labels_pred.tolist()
-
-count0 = 0
-count1 = 0
-for i in range(len(xg_labels_pred)):
-    if xg_labels_pred[i] == 0 and xg_labels_test[i] == 0:
-        count0 += 1
-    if xg_labels_pred[i] == 1 and xg_labels_test[i] == 1:
-        count1 += 1
-
-accuracy0 = count0 / xg_labels_test.count(0)
-accuracy1 = count1 / xg_labels_test.count(1)
-ratio0 = xg_labels_test.count(0) / len(xg_labels_test)
-ratio1 = xg_labels_test.count(1) / len(xg_labels_test)
-predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
-predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
-print(f"Accuracy of sells: {accuracy0}")
-print(f"Accuracy of buys: {accuracy1}")
-print(f"Combined accuracy: {accuracy0 + accuracy1}")
-print(f"Ratio of sells: {ratio0}")
-print(f"Ratio of buys: {ratio1}")
-print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
-print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
-print(xg_labels_test.count(0))
-print(xg_labels_pred.count(0))
-print(xg_labels_test.count(1))
-print(xg_labels_pred.count(1))
 
 # xgboost_path = "xgboost_pipeline.pkl"
 # xgboost_model = load_xgboost(xgboost_path)
