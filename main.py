@@ -26,6 +26,7 @@ import pywt
 import tkinter as tk
 from tkinter import messagebox
 import warnings
+import joblib
 
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 pd.set_option('display.max_columns', None)
@@ -34,20 +35,25 @@ pd.set_option('display.max_rows', 100)
 
 api_key = 'IbIgJihiEgl4rEjWnOFazg7F4YVzJXVG8if3iKcGsurgspgblDN2F73XMPdUzOcH'
 
-def load_and_preprocess_data(filepath, file=True, data=None, pca_training_data=None):
+def load_and_preprocess_data(filepath, file=True, data=None, eth_data=None):
     if file:
         print(f"Loading data from {filepath}...")
         df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df.drop(0, inplace=True)
         #Drop useless row
         df = df.astype(float)
+
+        #eth pre-processing
+        eth_df = pd.read_csv('ETHUSDC_15m.csv', names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        eth_df.drop(['Open', 'Volume'], axis=1, inplace=True)
+        eth_df.drop(0, inplace=True)
+        eth_df = eth_df.astype(float)
     else:
         df = data.astype(float)
+        eth_data.drop(['Open', 'Volume'], axis=1, inplace=True)
+        eth_data.drop(0, inplace=True)
+        eth_df = eth_data.astype(float)
 
-    eth_df = pd.read_csv('ETHUSDC_15m.csv', names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-    eth_df.drop(['Open', 'Volume'], axis=1)
-    eth_df.drop(0, inplace=True)
-    eth_df = eth_df.astype(float)
     df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
 
     #Intramarket Difference
@@ -226,7 +232,9 @@ def load_and_preprocess_data(filepath, file=True, data=None, pca_training_data=N
     df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
     df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
 
-    #
+    print(df.columns.tolist())
+
+
     # #Fractal Dimension
     # df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
     # df['Fractal_Dimension'] = 2 - df['Hurst']
@@ -332,84 +340,128 @@ def load_and_preprocess_data(filepath, file=True, data=None, pca_training_data=N
     if file:
         training_df = df[df['Timestamp'] > 1654056000000] #January 1st 2023 12:15 am to present
         pca_training_df = df[((df['Timestamp'] >= 1641013200000) & (df['Timestamp'] <= 1654056000000))] #Jan 1st 12am 2022 to June 1st 12am 2022
+
+        training_df.reset_index(drop=True, inplace=True)
+        pca_training_df.reset_index(drop=True, inplace=True)
+
+        # RSI PCA analysis
+        rsis = pd.DataFrame()
+        for p in range(2, 33):
+            rsis[p] = talib.RSI(pca_training_df['Close'], timeperiod=p)
+
+        rsi_means = rsis.mean()
+        rsis -= rsi_means
+        rsis = rsis.dropna()
+
+        rsi_pca = PCA(n_components=3, random_state=42)
+        rsi_pca.fit(rsis)
+
+        training_rsis = pd.DataFrame()
+        for p in range(2, 33):
+            training_rsis[p] = talib.RSI(training_df['Close'], timeperiod=p)
+
+        training_rsis -= rsi_means
+        training_rsis = training_rsis.dropna()
+
+        pca_data = rsi_pca.transform(training_rsis)
+        rsi_pca_df = pd.DataFrame(pca_data, index=training_rsis.index, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
+        training_df = pd.concat([training_df, rsi_pca_df], axis=1)
+
+        # ATR PCA analysis
+        atrs = pd.DataFrame()
+        for p in range(2, 33):
+            atrs[p] = talib.ATR(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
+
+        atr_means = atrs.mean()
+        atrs -= atr_means
+        atrs = atrs.dropna()
+
+        atr_pca = PCA(n_components=3, random_state=42)
+        atr_pca.fit(atrs)
+
+        training_atrs = pd.DataFrame()
+        for p in range(2, 33):
+            training_atrs[p] = talib.ATR(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
+
+        training_atrs -= atr_means
+        training_atrs = training_atrs.dropna()
+
+        pca_data = atr_pca.transform(training_atrs)
+        atr_pca_df = pd.DataFrame(pca_data,index=training_atrs.index, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
+        training_df = pd.concat([training_df, atr_pca_df], axis=1)
+
+        # ADX PCA analysis
+        adxs = pd.DataFrame()
+        for p in range(2, 33):
+            adxs[p] = talib.ADX(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
+
+        adx_means = adxs.mean()
+        adxs -= adx_means
+        adxs = adxs.dropna()
+
+        adx_pca = PCA(n_components=5, random_state=42)
+        adx_pca.fit(adxs)
+
+        training_adxs = pd.DataFrame()
+        for p in range(2, 33):
+            training_adxs[p] = talib.ADX(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
+
+        training_adxs -= adx_means
+        training_adxs = training_adxs.dropna()
+
+        pca_data = adx_pca.transform(training_adxs)
+        adx_pca_df = pd.DataFrame(pca_data, index=training_adxs.index, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
+        training_df = pd.concat([training_df, adx_pca_df], axis=1)
+
+        #save pca models and means for future use
+        joblib.dump(rsi_pca, "rsi_pca.pkl")
+        joblib.dump(atr_pca, "atr_pca.pkl")
+        joblib.dump(adx_pca, "adx_pca.pkl")
+        joblib.dump(rsi_means, "rsi_pca_means.pkl")
+        joblib.dump(atr_means, "atr_pca_means.pkl")
+        joblib.dump(adx_means, "adx_pca_means.pkl")
     else:
         training_df = df
-        pca_training_df = pca_training_data.astype(float)
+        training_df.reset_index(drop=True, inplace=True)
+        rsi_pca = joblib.load("rsi_pca.pkl")
+        atr_pca = joblib.load("atr_pca.pkl")
+        adx_pca = joblib.load("adx_pca.pkl")
+        training_rsi_means = joblib.load("rsi_pca_means.pkl")
+        training_atr_means = joblib.load("atr_pca_means.pkl")
+        training_adx_means = joblib.load("adx_pca_means.pkl")
 
-    training_df.reset_index(drop=True, inplace=True)
-    pca_training_df.reset_index(drop=True, inplace=True)
+        training_rsis = pd.DataFrame()
+        for p in range(2, 33):
+            training_rsis[p] = talib.RSI(df['Close'], timeperiod=p)
 
-    # RSI PCA analysis
-    rsis = pd.DataFrame()
-    for p in range(2, 33):
-        rsis[p] = talib.RSI(pca_training_df['Close'], timeperiod=p)
+        training_rsis -= training_rsi_means
+        training_rsis = training_rsis.dropna()
 
-    rsi_means = rsis.mean()
-    rsis -= rsi_means
-    rsis = rsis.dropna()
+        pca_data = rsi_pca.transform(training_rsis)
+        rsi_pca_df = pd.DataFrame(pca_data, index=training_rsis.index, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
+        training_df = pd.concat([training_df, rsi_pca_df], axis=1)
 
-    rsi_pca = PCA(n_components=3, random_state=42)
-    rsi_pca.fit(rsis)
+        training_atrs = pd.DataFrame()
+        for p in range(2, 33):
+            training_atrs[p] = talib.ATR(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
 
-    training_rsis = pd.DataFrame()
-    for p in range(2, 33):
-        training_rsis[p] = talib.RSI(training_df['Close'], timeperiod=p)
+        training_atrs -= training_atr_means
+        training_atrs = training_atrs.dropna()
 
-    training_rsi_means = training_rsis.mean()
-    training_rsis -= training_rsi_means
-    training_rsis = training_rsis.dropna()
+        pca_data = atr_pca.transform(training_atrs)
+        atr_pca_df = pd.DataFrame(pca_data,index=training_atrs.index, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
+        training_df = pd.concat([training_df, atr_pca_df], axis=1)
 
-    pca_data = rsi_pca.transform(training_rsis)
-    rsi_pca_df = pd.DataFrame(pca_data, columns=['RSI_PC1', 'RSI_PC2', 'RSI_PC3'])
-    training_df = pd.concat([training_df, rsi_pca_df], axis=1)
+        training_adxs = pd.DataFrame()
+        for p in range(2, 33):
+            training_adxs[p] = talib.ADX(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
 
-    # ATR PCA analysis
-    atrs = pd.DataFrame()
-    for p in range(2, 33):
-        atrs[p] = talib.ATR(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
+        training_adxs -= training_adx_means
+        training_adxs = training_adxs.dropna()
 
-    atr_means = atrs.mean()
-    atrs -= atr_means
-    atrs = atrs.dropna()
-
-    atr_pca = PCA(n_components=3, random_state=42)
-    atr_pca.fit(atrs)
-
-    training_atrs = pd.DataFrame()
-    for p in range(2, 33):
-        training_atrs[p] = talib.ATR(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
-
-    training_atr_means = training_atrs.mean()
-    training_atrs -= training_atr_means
-    training_atrs = training_atrs.dropna()
-
-    pca_data = atr_pca.transform(training_atrs)
-    atr_pca_df = pd.DataFrame(pca_data, columns=['ATR_PC1', 'ATR_PC2', 'ATR_PC3'])
-    training_df = pd.concat([training_df, atr_pca_df], axis=1)
-
-    # ADX PCA analysis
-    adxs = pd.DataFrame()
-    for p in range(2, 33):
-        adxs[p] = talib.ADX(pca_training_df['High'], pca_training_df['Low'], pca_training_df['Close'], timeperiod=p)
-
-    adx_means = adxs.mean()
-    adxs -= adx_means
-    adxs = adxs.dropna()
-
-    adx_pca = PCA(n_components=5, random_state=42)
-    adx_pca.fit(adxs)
-
-    training_adxs = pd.DataFrame()
-    for p in range(2, 33):
-        training_adxs[p] = talib.ADX(training_df['High'], training_df['Low'], training_df['Close'], timeperiod=p)
-
-    training_adx_means = training_adxs.mean()
-    training_adxs -= training_adx_means
-    training_adxs = training_adxs.dropna()
-
-    pca_data = adx_pca.transform(training_adxs)
-    adx_pca_df = pd.DataFrame(pca_data, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
-    training_df = pd.concat([training_df, adx_pca_df], axis=1)
+        pca_data = adx_pca.transform(training_adxs)
+        adx_pca_df = pd.DataFrame(pca_data, index=training_adxs.index, columns=['ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5'])
+        training_df = pd.concat([training_df, adx_pca_df], axis=1)
 
     training_df.fillna(0, inplace=True)
     #calculate aggregate pca features
@@ -482,27 +534,23 @@ def custom_pnl_objective(y_true, y_pred):
 
 # def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
 #     tscv = TimeSeriesSplit(n_splits=splits)
-#     scale_weight = labels_train.count(1)/labels_train.count(0)
-#     print(scale_weight)
-#
 #     pipeline = Pipeline(steps=[('xgb', XGBClassifier(random_state=42, eval_metric='auc', early_stopping_rounds=70, tree_method='hist', device='cuda', objective='binary:logistic'))])
 #
 #     search_space = {
-#         'xgb__max_depth': Integer(3, 14),
-#         'xgb__learning_rate': Real(0.0005, 1.0, prior='log-uniform'),
-#         'xgb__subsample': Real(0.15, 1.0),
+#         'xgb__max_depth': Integer(3, 12),
+#         'xgb__learning_rate': Real(0.0001, 0.3, prior='log-uniform'),
+#         'xgb__subsample': Real(0.8, 1.0),
 #         'xgb__colsample_bytree': Real(0.5, 1.0),
 #         'xgb__colsample_bylevel': Real(0.5, 1.0),
 #         'xgb__colsample_bynode': Real(0.5, 1.0),
+#         'xgb__gamma': Real(0.1, 12.0),
 #         'xgb__reg_alpha': Real(0.0, 8.0),
-#         'xgb__reg_lambda': Real(0.0, 13.0),
-#         'xgb__gamma': Real(0.0, 12.0),
-#         'xgb__n_estimators': Integer(100, 5000),
-#         'xgb__min_child_weight': Integer(1, 15),
+#         'xgb__reg_lambda': Real(0.1, 13.0),
+#         'xgb__n_estimators': Integer(100, 3000),
+#         'xgb__min_child_weight': Integer(1, 20),
 #         'xgb__max_bin': Integer(128, 512),
 #         'xgb__grow_policy': Categorical(["depthwise", "lossguide"]),
-#         'xgb__max_delta_step': Integer(0, 10),
-#         'xgb__scale_pos_weight': Real(1.04, 1.08),
+#         'xgb__scale_pos_weight': Real(0.5, 2.0),
 #         'xgb__booster': Categorical(["gbtree", "dart"])
 #     }
 #     opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='roc_auc', random_state=42)
@@ -520,8 +568,20 @@ def custom_pnl_objective(y_true, y_pred):
 #
 #     xgboost_step = opt.best_estimator_.steps[0]
 #     xgboost_model = xgboost_step[1]
-#     plot_importance(xgboost_model, max_num_features=100)
-#     plt.show()
+#
+#     booster = xgboost_model.get_booster()
+#     imp_dict = booster.get_score(importance_type='gain')
+#     imp_df = (
+#         pd.DataFrame([
+#             {'feature': feat, 'importance': score}
+#             for feat, score in imp_dict.items()
+#         ])
+#         .sort_values('importance', ascending=False)
+#         .reset_index(drop=True)
+#     )
+#     print(imp_df.head(int(len(imp_df)*0.7)).to_string(index=False))
+#     # plot_importance(xgboost_model, max_num_features=100)
+#     # plt.show()
 #
 #     # save the model
 #     filepath = "xgboost_pipeline.pkl"
@@ -532,22 +592,22 @@ def custom_pnl_objective(y_true, y_pred):
 
 def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
     params = {
-        'max_depth': 10,
-        'learning_rate': 0.0072011999078535486,
-        'subsample': 0.7168045624622187,
-        'colsample_bytree': 0.6578997967435244,
-        'colsample_bylevel': 0.840082181391577,
-        'colsample_bynode': 0.966433999423917,
-        'reg_alpha': 1.424671347168512,
-        'reg_lambda': 8.217243165955011,
-        'gamma': 8.041775379227216,
-        'n_estimators': 3500,
-        'min_child_weight': 9,
-        'max_bin': 412,
-        'grow_policy': "depthwise",
-        'max_delta_step': 3,
-        'scale_pos_weight': 1.051,
-        'booster': 'gbtree'
+        'max_depth': 3,
+        'learning_rate': 0.0001,
+        'subsample': 0.85,
+        'colsample_bytree': 1.0,
+        'colsample_bylevel': 0.6498774939804,
+        'colsample_bynode': 0.49,
+        'reg_alpha': 5.0445785578467275,
+        'reg_lambda': 13.2,
+        'gamma': 3.7754805658479595,
+        'n_estimators': 3000,
+        'min_child_weight': 18,
+        'max_bin': 186,
+        'grow_policy': 'lossguide',
+        'max_delta_step': 6,
+        'scale_pos_weight': 0.9813,
+        'booster': 'dart'
     }
 
     model = XGBClassifier(
@@ -567,8 +627,19 @@ def train_xgboost(data_train, labels_train, data_test, labels_test, weights, spl
         sample_weight=weights
     )
 
-    plot_importance(model, max_num_features=100)
-    plt.show()
+    booster = model.get_booster()
+    imp_dict = booster.get_score(importance_type='gain')
+    imp_df = (
+        pd.DataFrame([
+            {'feature': feat, 'importance': score}
+            for feat, score in imp_dict.items()
+        ])
+        .sort_values('importance', ascending=False)
+        .reset_index(drop=True)
+    )
+    print(imp_df.head(int(len(imp_df)*0.7)).to_string(index=False))
+    #plot_importance(model, max_num_features=100)
+    #plt.show()
 
     filepath = "xgboost_pipeline.pkl"
     with open(filepath, "wb") as f:
@@ -861,9 +932,9 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         xg_data_test = convert_data_to_windows(data_test[xg_features], window_size)
 
         # dropping the first few rows to line up data with the xgboost data
-        data_train = data_train.drop(index=data_train.index[:window_size])
-        data_eval = data_eval.drop(index=data_eval.index[:window_size])
-        data_test = data_test.drop(index=data_test.index[:window_size])
+        data_train = data_train.drop(index=data_train.index[:window_size-1])
+        data_eval = data_eval.drop(index=data_eval.index[:window_size-1])
+        data_test = data_test.drop(index=data_test.index[:window_size-1])
 
         # need to reset index so that the concat works properly
         xg_data_train = xg_data_train.reset_index(drop=True)
@@ -880,7 +951,6 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         xg_data_eval.dropna(inplace=True)
         xg_data_test.dropna(inplace=True)
 
-        print(xg_data_train[['Close_t0', 'Weights', 'Label']])
         xg_labels_train = xg_data_train.pop('Label').tolist()
         xg_labels_train = [int(x) for x in xg_labels_train]
         xg_labels_eval = xg_data_eval.pop('Label').tolist()
@@ -892,7 +962,22 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         xg_data_train.drop(columns='Weights', inplace=True)
         xg_data_eval.drop(columns='Weights', inplace=True)
         xg_data_test.drop(columns='Weights', inplace=True)
-        xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, weights, 5, 5)
+
+        threshold = 0.90
+        corr_matrix = xg_data_train.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        high_corr = (upper.stack()
+                     .reset_index()
+                     .rename(columns={"level_0": "feature1",
+                                      "level_1": "feature2",
+                                      0: "corr_value"}))
+
+        high_corr = high_corr[high_corr["corr_value"] > threshold]
+        for _, row in high_corr.iterrows():
+            f1, f2, val = row["feature1"], row["feature2"], row["corr_value"]
+            print(f"{f1:30s} ↔ {f2:30s} : corr = {val:.2f}")
+
+        xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, weights, 2, 200)
         xgboost_model = load_xgboost(xgboost_path)
         xg_labels_pred = xgboost_model.predict(xg_data_test)
         xg_labels_pred = xg_labels_pred.tolist()
@@ -909,21 +994,21 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         accuracy1 = count1 / xg_labels_test.count(1)
         ratio0 = xg_labels_test.count(0) / len(xg_labels_test)
         ratio1 = xg_labels_test.count(1) / len(xg_labels_test)
-        predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
-        predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
+        total_accuracy = (count0 + count1) / len(xg_labels_test)
+        #predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
+        #predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
         print(f"Accuracy of sells: {accuracy0}")
         print(f"Accuracy of buys: {accuracy1}")
         print(f"Combined accuracy: {accuracy0 + accuracy1}")
+        print(f"Overall accuracy: {total_accuracy}")
         print(f"Ratio of sells: {ratio0}")
         print(f"Ratio of buys: {ratio1}")
-        print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
-        print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
+        #print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
+        #print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
     return xgboost_model
 
 def continuous_sim(xgboost_model, xg_features, agg_features):
     twenty_days_ms = 60 * 24 * 60 * 60 * 1000
-    pca_training_df = get_historical_data(1735707600000,  	1738386000000)
-
     current_time = int(time.time() * 1000)
     # while current_time % (15 * 60 * 1000) != 0:
     #     current_time = int(time.time() * 1000)
@@ -931,17 +1016,18 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
     print(f"Current time: {current_time}")
     start_time = current_time - twenty_days_ms
     raw_data = get_historical_data(start_time, current_time)
+    eth_data = get_historical_data(start_time, current_time, 'ETHUSDC')
     recent_df = raw_data.copy()
     # 1735732800000, 1738411200000 -> Jan 2025
     # 1648728000000, 1738324800000 -> March 2023 to now
-    recent_df = load_and_preprocess_data("", False, data=recent_df, pca_training_data=pca_training_df)
+    recent_df = load_and_preprocess_data("", False, data=recent_df, eth_data=eth_data)
     #recent_df = recent_df.dropna()
 
     recent_df['Label'] = 0
     recent_df['Weights'] = 0
     recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
 
-    recent_df = recent_df.drop(index=recent_df.index[:window_size])
+    recent_df = recent_df.drop(index=recent_df.index[:window_size-1])
     recent_df = recent_df.reset_index(drop=True)
     recent_df_windowed = recent_df_windowed.reset_index(drop=True)
     recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
@@ -955,18 +1041,20 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
 
     while True:
         row = get_recent_data('1')
+        eth_row = get_recent_data('1', 'ETHUSDC')
         raw_data = pd.concat([raw_data, row], ignore_index=True)
+        eth_data = pd.concat([eth_data, eth_row], ignore_index=True)
         recent_df = raw_data.copy()
         # 1735732800000, 1738411200000 -> Jan 2025
         # 1648728000000, 1738324800000 -> March 2023 to now
-        recent_df = load_and_preprocess_data("", False, data=recent_df, pca_training_data=pca_training_df)
+        recent_df = load_and_preprocess_data("", False, data=recent_df, eth_data=eth_data)
         recent_df = recent_df.dropna()
 
         recent_df['Label'] = 0
         recent_df['Weights'] = 0
         recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
 
-        recent_df = recent_df.drop(index=recent_df.index[:window_size])
+        recent_df = recent_df.drop(index=recent_df.index[:window_size-1])
         recent_df = recent_df.reset_index(drop=True)
         recent_df_windowed = recent_df_windowed.reset_index(drop=True)
         recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
@@ -977,10 +1065,10 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
 
         last_price = recent_df['Close_t0'].iloc[-2]
         recent_price = recent_df['Close_t0'].iloc[-1]
-        last_timestamp = recent_df['Timestamp_t0'].iloc[-2]
-        recent_timestamp = recent_df['Timestamp_t0'].iloc[-1]
-        print(f"Last price: {last_price} at time {last_timestamp}")
-        print(f"Recent price: {recent_price} at time {recent_timestamp}")
+        #last_timestamp = recent_df['Timestamp_t0'].iloc[-2]
+        #recent_timestamp = recent_df['Timestamp_t0'].iloc[-1]
+        print(f"Last price: {last_price}")
+        print(f"Recent price: {recent_price}")
         print("Label: " + str(last_label))
         if last_price >= recent_price and last_label == 0:
             print("Sell prediction correct")
@@ -995,44 +1083,94 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
         last_label = pred_labels[-1]
         time.sleep(900)
 
-window_size = 2
+window_size = 1
 data = load_and_preprocess_data("BTCUSDC_15m.csv")
 scaler = StandardScaler()
 hmm_features = ['Close', 'BTC-ETC_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
                 'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD', 'Stochastic-RSI', 'RSI_Mean_4', 'Chikou_Span_Dev_48', 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4']
-xg_features = ['Close', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5', 'Stochastic-RSI', 'Fast_%K', 'Volatility', 'BTC-ETC_Diff', 'Returns',
-               'Upper_Wick_Ratio', 'Range', 'Upper_Wick', 'MACDSignal', 'LOW-HIGH_EMA', 'Ichimoku_Overlap', 'RSI-MACD', 'Body_Ratio', 'MACD', 'Price_Diff', 'Timestamp', 'VWAP-ATR', 'WILLR',
-               'RSI', 'Doji-OBV', 'BB-KC', 'Lower_Wick', 'Body_Size', 'MACDHist', 'BB_Width', 'ATR', 'VWAP', 'Volume-ATR', 'Lower_Wick_Ratio', 'KC_Width', 'TSI', 'Momentum', 'ADX', 'CCI', 'Fast_%D',
-               'CMF', 'OBV', 'Volume_Change', 'Volume', 'Weights', 'Label']
-agg_features = ['Stochastic-RSI_Mean_4', 'BTC-ETC_Diff_Mean_4', 'Price_Diff_Mean_4', 'Returns_Mean_4', 'Volatility_Mean_4', 'Volume_Change_Mean_4', 'OBV_Mean_4', 'CMF_Mean_4', 'VWAP_Mean_4', 'RSI_Mean_4', 'Fast_%K_Mean_4', 'Fast_%D_Mean_4', 'WILLR_Mean_4', 'CCI_Mean_4', 'ATR_Mean_4', 'ADX_Mean_4', 'Momentum_Mean_4', 'TSI_Mean_4', 'BB_Width_Mean_4', 'MACD_Mean_4', 'MACDSignal_Mean_4', 'MACDHist_Mean_4', 'KC_Width_Mean_4', 'Body_Size_Mean_4', 'Upper_Wick_Mean_4', 'Lower_Wick_Mean_4', 'Range_Mean_4', 'Body_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'Lower_Wick_Ratio_Mean_4', 'Doji-OBV_Mean_4', 'Volume-ATR_Mean_4', 'VWAP-ATR_Mean_4', 'RSI-MACD_Mean_4', 'BB-KC_Mean_4', 'Ichimoku_Overlap_Mean_4', 'LOW-HIGH_EMA_Mean_4',
-                'Stochastic-RSI_Mean_16', 'BTC-ETC_Diff_Mean_16', 'Price_Diff_Mean_16', 'Returns_Mean_16', 'Volatility_Mean_16', 'Volume_Change_Mean_16', 'OBV_Mean_16', 'CMF_Mean_16', 'VWAP_Mean_16', 'RSI_Mean_16', 'Fast_%K_Mean_16', 'Fast_%D_Mean_16', 'WILLR_Mean_16', 'CCI_Mean_16', 'ATR_Mean_16', 'ADX_Mean_16', 'Momentum_Mean_16', 'TSI_Mean_16', 'BB_Width_Mean_16', 'MACD_Mean_16', 'MACDSignal_Mean_16', 'MACDHist_Mean_16', 'KC_Width_Mean_16', 'Body_Size_Mean_16', 'Upper_Wick_Mean_16', 'Lower_Wick_Mean_16', 'Range_Mean_16', 'Body_Ratio_Mean_16', 'Upper_Wick_Ratio_Mean_16', 'Lower_Wick_Ratio_Mean_16', 'Doji-OBV_Mean_16', 'Volume-ATR_Mean_16', 'VWAP-ATR_Mean_16', 'RSI-MACD_Mean_16', 'BB-KC_Mean_16', 'Ichimoku_Overlap_Mean_16', 'LOW-HIGH_EMA_Mean_16',
-                'Stochastic-RSI_Mean_48', 'BTC-ETC_Diff_Mean_48', 'Price_Diff_Mean_48', 'Returns_Mean_48', 'Volatility_Mean_48', 'Volume_Change_Mean_48', 'OBV_Mean_48', 'CMF_Mean_48', 'VWAP_Mean_48', 'RSI_Mean_48', 'Fast_%K_Mean_48', 'Fast_%D_Mean_48', 'WILLR_Mean_48', 'CCI_Mean_48', 'ATR_Mean_48', 'ADX_Mean_48', 'Momentum_Mean_48', 'TSI_Mean_48', 'BB_Width_Mean_48', 'MACD_Mean_48', 'MACDSignal_Mean_48', 'MACDHist_Mean_48', 'KC_Width_Mean_48', 'Body_Size_Mean_48', 'Upper_Wick_Mean_48', 'Lower_Wick_Mean_48', 'Range_Mean_48', 'Body_Ratio_Mean_48', 'Upper_Wick_Ratio_Mean_48', 'Lower_Wick_Ratio_Mean_48', 'Doji-OBV_Mean_48', 'Volume-ATR_Mean_48', 'VWAP-ATR_Mean_48', 'RSI-MACD_Mean_48', 'BB-KC_Mean_48', 'Ichimoku_Overlap_Mean_48', 'LOW-HIGH_EMA_Mean_48',
-                'Stochastic-RSI_Mean_96', 'BTC-ETC_Diff_Mean_96', 'Price_Diff_Mean_96', 'Returns_Mean_96', 'Volatility_Mean_96', 'Volume_Change_Mean_96', 'OBV_Mean_96', 'CMF_Mean_96', 'VWAP_Mean_96', 'RSI_Mean_96', 'Fast_%K_Mean_96', 'Fast_%D_Mean_96', 'WILLR_Mean_96', 'CCI_Mean_96', 'ATR_Mean_96', 'ADX_Mean_96', 'Momentum_Mean_96', 'TSI_Mean_96', 'BB_Width_Mean_96', 'MACD_Mean_96', 'MACDSignal_Mean_96', 'MACDHist_Mean_96', 'KC_Width_Mean_96', 'Body_Size_Mean_96', 'Upper_Wick_Mean_96', 'Lower_Wick_Mean_96', 'Range_Mean_96', 'Body_Ratio_Mean_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Ratio_Mean_96', 'Doji-OBV_Mean_96', 'Volume-ATR_Mean_96', 'VWAP-ATR_Mean_96', 'RSI-MACD_Mean_96', 'BB-KC_Mean_96', 'Ichimoku_Overlap_Mean_96', 'LOW-HIGH_EMA_Mean_96',
-                'Stochastic-RSI_Mean_384', 'BTC-ETC_Diff_Mean_384', 'Price_Diff_Mean_384', 'Returns_Mean_384', 'Volatility_Mean_384', 'Volume_Change_Mean_384', 'OBV_Mean_384', 'CMF_Mean_384', 'VWAP_Mean_384', 'RSI_Mean_384', 'Fast_%K_Mean_384', 'Fast_%D_Mean_384', 'WILLR_Mean_384', 'CCI_Mean_384', 'ATR_Mean_384', 'ADX_Mean_384', 'Momentum_Mean_384', 'TSI_Mean_384', 'BB_Width_Mean_384', 'MACD_Mean_384', 'MACDSignal_Mean_384', 'MACDHist_Mean_384', 'KC_Width_Mean_384', 'Body_Size_Mean_384', 'Upper_Wick_Mean_384', 'Lower_Wick_Mean_384', 'Range_Mean_384', 'Body_Ratio_Mean_384', 'Upper_Wick_Ratio_Mean_384', 'Lower_Wick_Ratio_Mean_384', 'Doji-OBV_Mean_384', 'Volume-ATR_Mean_384', 'VWAP-ATR_Mean_384', 'RSI-MACD_Mean_384', 'BB-KC_Mean_384', 'Ichimoku_Overlap_Mean_384', 'LOW-HIGH_EMA_Mean_384',
-                'Stochastic-RSI_Mean_1152', 'BTC-ETC_Diff_Mean_1152', 'Price_Diff_Mean_1152', 'Returns_Mean_1152', 'Volatility_Mean_1152', 'Volume_Change_Mean_1152', 'OBV_Mean_1152', 'CMF_Mean_1152', 'VWAP_Mean_1152', 'RSI_Mean_1152', 'Fast_%K_Mean_1152', 'Fast_%D_Mean_1152', 'WILLR_Mean_1152', 'CCI_Mean_1152', 'ATR_Mean_1152', 'ADX_Mean_1152', 'Momentum_Mean_1152', 'TSI_Mean_1152', 'BB_Width_Mean_1152', 'MACD_Mean_1152', 'MACDSignal_Mean_1152', 'MACDHist_Mean_1152', 'KC_Width_Mean_1152', 'Body_Size_Mean_1152', 'Upper_Wick_Mean_1152', 'Lower_Wick_Mean_1152', 'Range_Mean_1152', 'Body_Ratio_Mean_1152', 'Upper_Wick_Ratio_Mean_1152', 'Lower_Wick_Ratio_Mean_1152', 'Doji-OBV_Mean_1152', 'Volume-ATR_Mean_1152', 'VWAP-ATR_Mean_1152', 'RSI-MACD_Mean_1152', 'BB-KC_Mean_1152', 'Ichimoku_Overlap_Mean_1152', 'LOW-HIGH_EMA_Mean_1152',
-                'RSI_PC1_Mean_4',  'RSI_PC2_Mean_4',  'RSI_PC3_Mean_4',  'ATR_PC1_Mean_4',  'ATR_PC2_Mean_4',  'ATR_PC3_Mean_4',  'ADX_PC1_Mean_4',  'ADX_PC2_Mean_4',  'ADX_PC3_Mean_4',  'ADX_PC4_Mean_4',  'ADX_PC5_Mean_4',
-                'RSI_PC1_Mean_16',  'RSI_PC2_Mean_16',  'RSI_PC3_Mean_16',  'ATR_PC1_Mean_16',  'ATR_PC2_Mean_16',  'ATR_PC3_Mean_16',  'ADX_PC1_Mean_16',  'ADX_PC2_Mean_16',  'ADX_PC3_Mean_16',  'ADX_PC4_Mean_16',  'ADX_PC5_Mean_16',
-                'RSI_PC1_Mean_48',  'RSI_PC2_Mean_48',  'RSI_PC3_Mean_48',  'ATR_PC1_Mean_48',  'ATR_PC2_Mean_48',  'ATR_PC3_Mean_48',  'ADX_PC1_Mean_48',  'ADX_PC2_Mean_48',  'ADX_PC3_Mean_48',  'ADX_PC4_Mean_48',  'ADX_PC5_Mean_48',
-                'RSI_PC1_Mean_96',  'RSI_PC2_Mean_96',  'RSI_PC3_Mean_96',  'ATR_PC1_Mean_96',  'ATR_PC2_Mean_96',  'ATR_PC3_Mean_96',  'ADX_PC1_Mean_96',  'ADX_PC2_Mean_96',  'ADX_PC3_Mean_96',  'ADX_PC4_Mean_96',  'ADX_PC5_Mean_96',
-                'RSI_PC1_Mean_384',  'RSI_PC2_Mean_384',  'RSI_PC3_Mean_384',  'ATR_PC1_Mean_384',  'ATR_PC2_Mean_384',  'ATR_PC3_Mean_384',  'ADX_PC1_Mean_384',  'ADX_PC2_Mean_384',  'ADX_PC3_Mean_384',  'ADX_PC4_Mean_384',  'ADX_PC5_Mean_384',
-                'RSI_PC1_Mean_1152',  'RSI_PC2_Mean_1152',  'RSI_PC3_Mean_1152',  'ATR_PC1_Mean_1152',  'ATR_PC2_Mean_1152',  'ATR_PC3_Mean_1152',  'ADX_PC1_Mean_1152',  'ADX_PC2_Mean_1152',  'ADX_PC3_Mean_1152',  'ADX_PC4_Mean_1152',  'ADX_PC5_Mean_1152'
-                ]
+xg_features = ['WILLR', 'Stochastic-RSI', 'Upper_Wick_Ratio', 'Fast_%K', 'KC_Width', 'OBV', 'Body_Ratio', 'RSI', 'MACDSignal', 'Volume', 'Volume-ATR', 'BB_Width', 'Lower_Wick_Ratio', 'MACD', 'Volatility', 'Range', 'Upper_Wick', 'LOW-HIGH_EMA',
+               'Fast_%D', 'Lower_Wick', 'BB-KC', 'Price_Diff', 'ATR', 'CMF', 'MACDHist', 'Close', 'VWAP', 'Doji-OBV', 'Returns', 'Body_Size', 'Momentum', 'Volume_Change', 'RSI-MACD', 'BTC-ETC_Diff', 'Ichimoku_Overlap',
+               'TSI', 'CCI', 'VWAP-ATR', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5', 'Closing_Marubozu', 'Long_Candle', 'Marubozu', 'R1', 'Short_Candle',
+               'Kijun_Sen', 'KC_Lower', 'KC_Upper', 'Tenkan_Sen', 'Senkou_Span_B', 'PP', 'S1', 'S2', 'Senkou_Span_A', 'Chikou_Span', 'Harami', 'Label', 'Weights']
+agg_features = ['Range_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'MACD_Dev_16', 'OBV_Dev_4', 'Upper_Wick_Mean_48', 'VWAP_Dev_96', 'Range_Dev_4', 'ADX_PC5_Dev_4', 'Volume-ATR_Mean_96', 'Volatility_Dev_4', 'ADX_Mean_48', 'MACDSignal_Dev_4',
+                'Stochastic-RSI_Drawdown_4', 'Body_Ratio_Mean_16', 'Body_Size_Drawdown_16', 'Fast_%D_Drawdown_4', 'Upper_Wick_Ratio_Mean_16', 'ADX_PC4_Mean_384', 'VWAP_Dev_1152', 'BB-KC_Mean_384', 'Volume-ATR_Dev_96', 'Range_Drawdown_16',
+                'Upper_Wick_Mean_16', 'MACDHist_Dev_4', 'RSI_PC1_Dev_4', 'ATR_PC3_Mean_16', 'MACDHist_Mean_1152', 'Lower_Wick_Ratio_Dev_384', 'Doji-OBV_Mean_16', 'Stochastic-RSI_Dev_4', 'ATR_PC3_Mean_4', 'Upper_Wick_Dev_16', 'MACDSignal_Mean_48',
+                'LOW-HIGH_EMA_Drawdown_384', 'VWAP_Mean_48', 'Price_Diff_Dev_4', 'Volume-ATR_Drawdown_48', 'Body_Size_Mean_4', 'Upper_Wick_Ratio_Dev_96', 'Body_Ratio_Drawdown_48', 'ATR_PC1_Dev_4', 'Fast_%D_Dev_1152', 'ATR_Dev_4', 'Price_Diff_Mean_4',
+                'Fast_%D_Dev_48', 'CMF_Mean_48', 'Volume-ATR_Mean_48', 'ADX_PC1_Mean_48', 'MACDHist_Mean_48', 'ATR_Drawdown_4', 'BB-KC_Drawdown_4', 'Upper_Wick_Mean_4', 'Lower_Wick_Dev_384', 'VWAP-ATR_Mean_48', 'BB_Width_Dev_4', 'Lower_Wick_Mean_4',
+                'RSI_Dev_48', 'Volume-ATR_Mean_4', 'TSI_Dev_48', 'CMF_Dev_16', 'ADX_PC3_Dev_48', 'Volume_Change_Mean_4', 'CMF_Drawdown_48', 'ADX_PC3_Dev_4']
 
-# 'RSI_Mean_4', 'RSI_Mean_16', 'TSI_Mean_16', 'Volume_Change_Mean_4', 'Price_Diff_Mean_4', 'TSI_Mean_4', 'Returns_Mean_4', 'Lower_Wick_Ratio_Mean_4',
-#                 'BB-KC_Mean_96', 'Returns_Mean_16', 'Price_Diff_Mean_16', 'Body_Ratio_Mean_4', 'Label_Mean_16', 'Price_Diff_Mean_96', 'CCI_Mean_4', 'MACDHist_Mean_96', 'CCI_Mean_96', 'Doji-RSI_Mean_4', 'Belt_Hold-ATR_Mean_48', 'Label_Mean_96',
-#                 'VWAP_Mean_48', 'Long_Doji-RSI_Mean_4', 'Short_Candle-RSI_Mean_4', 'Aroon_Mean_4', 'CCI_Mean_16', 'Long_Candle-RSI_Mean_4', 'ADX_Mean_4', 'Aroon_Mean_16', 'Volume_Change_Mean_16', 'MACDSignal_Mean_4',
-#                 'Stochastic-RSI_Mean_48', 'MACDSignal_Mean_16', 'Closing_Marubozu-ATR_Mean_4', 'Volume-ATR_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Mean_4', 'Returns_Mean_48', 'Marubozu-OBV_Mean_16',
-#                 'Dragonfly_Doji-RSI_Mean_48', 'Ichimoku_Overlap_Mean_48', 'Lower_Wick_Ratio_Mean_48', 'RSI_Mean_48', 'Price_Diff_Mean_48', 'Fast_%K_Mean_4', 'Aroon_Mean_96', 'Hammer_Mean_16', 'Body_Ratio_Mean_16',
-#                 'Engulfing_Mean_4', 'VWAP_Mean_4', 'Belt_Hold-ATR_Mean_96', 'Returns_Mean_96', 'Marubozu-RSI_Mean_48', 'Hikkake_Mean_16', 'LOW-HIGH_EMA_Mean_4', 'Chikou_Span_Dev_48', 'Long_Doji-RSI_Dev_4',
-#                 'Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_48', 'Stochastic-RSI_Dev_96', 'Closing_Marubozu-RSI_Dev_48', 'ADX_Dev_4', 'Stochastic-RSI_Dev_4', 'Lower_Wick_Ratio_Dev_4', 'Long_Candle_Dev_384',
-#                 'ADX_Dev_96', 'High_Dev_4', 'TSI_Dev_48', 'Engulfing_Dev_48', 'VWAP_Dev_48', 'Volume-ATR_Dev_4', 'OBV_Dev_4', 'BB_Upper_Dev_4', 'TSI_Dev_4', 'BB_Lower_Dev_4', 'Fast_%D_Dev_4', 'KC_Lower_Dev_4',
-#                 'Volume_Dev_4', 'Long_Doji-RSI_Dev_16', 'Senkou_Span_A_Dev_4', 'Senkou_Span_B_Dev_16', 'CCI_Dev_4', 'Aroon_Dev_96', 'Stochastic-RSI_Dev_48', 'Lower_Wick_Ratio_Dev_48', 'BB-KC_Dev_16', 'Upper_Wick_Dev_4',
-#                 'Dragonfly_Doji-OBV_Dev_48', 'Belt_Hold-RSI_Dev_48', 'Kijun_Sen_Dev_16', 'Closing_Marubozu-RSI_Dev_4', 'Upper_Wick_Ratio_Dev_4', 'Short_Candle-RSI_Dev_96', 'Long_Doji-RSI_Dev_48', 'Long_Candle-RSI_Dev_16', 'Closing_Marubozu-RSI_Dev_16',
-#                 'Fast_%K_Dev_48', 'MACDSignal_Dev_4', 'CCI_Dev_48', 'Belt_Hold-RSI_Dev_4', 'RSI_Dev_48', 'Short_Candle-OBV_Dev_16', 'VWAP-ATR_Dev_4', 'Long_Candle-RSI_Dev_384', 'Closing_Marubozu-RSI_Dev_96', 'BTC-ETC_Diff_Dev_4', 'Doji-RSI_Dev_4',
-#                 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4', 'Volatility_Drawdown_4', 'CMF_Drawdown_4', 'ADX_Drawdown_4', 'ATR_Drawdown_4', 'S2_Drawdown_4', 'KC_Upper_Drawdown_16', 'Open_Drawdown_4', 'Fast_%D_Drawdown_4', 'ADX_Drawdown_16', 'BB_Lower_Drawdown_4',
-#                 'RSI-MACD_Drawdown_4', 'Chikou_Span_Drawdown_16', 'BB_Upper_Drawdown_4', 'Volatility_Drawdown_16', 'R2_Drawdown_4', 'RSI_Drawdown_4', 'BB_Upper_Drawdown_16', 'BB-KC_Drawdown_4', 'BB_Lower_Drawdown_16', 'CMF_Drawdown_16', 'S1_Drawdown_4',
-#                 'Low_Drawdown_4', 'VWAP-ATR_Drawdown_16', 'BB_Middle_Drawdown_4', 'R2_Drawdown_16', 'Senkou_Span_B_Drawdown_4', 'High_Drawdown_4', 'Chikou_Span_Drawdown_48'
-model = load_xgboost("xgboost_pipeline.pkl")
+# feature  importance
+#         Stochastic-RSI_t0   43.444180
+#                  WILLR_t0   41.580982
+#                Fast_%K_t0   39.913826
+#                   RSI_PC1   27.960758
+#               Doji-OBV_t0   26.195438
+#       Closing_Marubozu_t0   26.105345
+#                  Range_t0   23.293200
+#       Upper_Wick_Ratio_t0   22.428465
+#             Upper_Wick_t0   22.274658
+#       Lower_Wick_Ratio_t0   21.646400
+#                   RSI_PC2   20.889765
+#             Volume-ATR_t0   20.257256
+#         Price_Diff_Mean_4   19.970669
+#              Body_Size_t0   18.188129
+#                    RSI_t0   17.469692
+#             Lower_Wick_t0   17.436827
+#                   VWAP_t0   17.239100
+#                 Volume_t0   17.116684
+#         Lower_Wick_Mean_4   16.658495
+#                Fast_%D_t0   16.539736
+#               Momentum_t0   16.519463
+#          Doji-OBV_Mean_16   16.048666
+#            Long_Candle_t0   15.751548
+#             Price_Diff_t0   15.390106
+#               Marubozu_t0   15.264894
+#                Returns_t0   13.664656
+#                 OBV_Dev_4   13.570038
+#         Upper_Wick_Mean_4   13.547947
+#   Upper_Wick_Ratio_Mean_4   12.882600
+#  Upper_Wick_Ratio_Mean_16   12.359438
+#             Body_Ratio_t0   12.355774
+#           Short_Candle_t0   12.162180
+# Stochastic-RSI_Drawdown_4   11.603987
+#                   ATR_PC1   11.170573
+#         Volume-ATR_Mean_4   11.137233
+#           BTC-ETC_Diff_t0   10.851021
+#        Upper_Wick_Mean_16   10.584715
+#                   RSI_PC3   10.449183
+#          Fast_%D_Dev_1152    9.468043
+#                    CCI_t0    9.296351
+#  Lower_Wick_Ratio_Dev_384    9.281325
+#        Body_Ratio_Mean_16    8.885139
+#                    OBV_t0    8.587098
+#          Price_Diff_Dev_4    8.497617
+#                CMF_Dev_16    8.333025
+#               KC_Upper_t0    8.065414
+#     Body_Size_Drawdown_16    7.694060
+#                     R1_t0    7.610858
+#          Senkou_Span_B_t0    7.555476
+# LOW-HIGH_EMA_Drawdown_384    7.524621
+#    Volume-ATR_Drawdown_48    7.451731
+#            BB-KC_Mean_384    7.257810
+#    Body_Ratio_Drawdown_48    7.244038
+#        Upper_Wick_Mean_48    6.745100
+#         Range_Drawdown_16    6.695742
+#            ATR_Drawdown_4    6.690574
+#                    ATR_t0    6.547372
+#               Range_Dev_4    6.490618
+#           CMF_Drawdown_48    6.465449
+#               KC_Width_t0    6.402169
+#                 ATR_Dev_4    6.397157
+#        Volume-ATR_Mean_96    6.352917
+#            ATR_PC3_Mean_4    6.334408
+#               MACD_Dev_16    6.327398
+#               KC_Lower_t0    6.242350
+#      Volume_Change_Mean_4    6.237663
+#               VWAP_Dev_96    6.177499
+#         Volume-ATR_Dev_96    6.113950
+#                   ATR_PC3    6.100461
+
+model = walk_forward(data, xg_features, agg_features, n_splits=2, window_size=window_size)
 # data_test = get_historical_data( 1739645100000, 1744825500000)
 # pca_training_df = get_historical_data(1735707600000,  	1738386000000)
 # data_test = load_and_preprocess_data("", False, data=data_test, pca_training_data=pca_training_df)
