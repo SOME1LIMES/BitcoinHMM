@@ -27,7 +27,15 @@ import tkinter as tk
 from tkinter import messagebox
 import warnings
 import joblib
+import shap
+from hurst import compute_Hc
+import keras_tuner as kt
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 
+tf.random.set_seed(42)
+np.random.seed(42)
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', 100)
@@ -56,11 +64,35 @@ def load_and_preprocess_data(filepath, file=True, data=None, eth_data=None):
 
     df['Label'] = (df['Close'].shift(-1) > df['Close']).astype(int)
 
+    days = []
+    hours = []
+    sessions = []
+    for timestamp in df['Timestamp']:
+        utc_time = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000)
+        days.append(utc_time.weekday())
+        hour = utc_time.hour
+        hours.append(hour)
+        if 0 <= hour < 9:
+            session = 0
+        elif 7 <= hour < 16:
+            session = 1
+        elif 12 <= hour < 21:
+            session = 2
+        else:
+            session = 0
+        sessions.append(session)
+
+    df['Day'] = days
+    df['Session'] = sessions
+    df['Hour'] = hours
+    df['Hour_Sin'] = np.sin(2 * np.pi * df['Hour'] / 24.0)
+    df['Hour_Cos'] = np.cos(2 * np.pi * df['Hour'] / 24.0)
+
     #Intramarket Difference
     period = 24
     btc_cmma = cmma(df['High'], df['Low'], df['Close'], period)
     eth_cmma = cmma(eth_df['High'], eth_df['Low'], eth_df['Close'], period)
-    df['BTC-ETC_Diff'] = btc_cmma - eth_cmma
+    df['BTC-ETH_Diff'] = btc_cmma - eth_cmma
 
     df['Price_Diff'] = df['Close'].diff()
     df["Returns"] = df["Close"].pct_change()
@@ -232,12 +264,9 @@ def load_and_preprocess_data(filepath, file=True, data=None, eth_data=None):
     df['Three_Crows'] = talib.CDL3BLACKCROWS(df['Open'], df['High'], df['Low'], df['Close'])
     df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
 
-    print(df.columns.tolist())
-
-
-    # #Fractal Dimension
-    # df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
-    # df['Fractal_Dimension'] = 2 - df['Hurst']
+    #Fractal Dimension
+    df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
+    df['Fractal_Dimension'] = 2 - df['Hurst']
 
     #calculate interaction features
     df['Volume-ATR'] = df['Volume'] / df['ATR']
@@ -483,7 +512,7 @@ def load_and_preprocess_data(filepath, file=True, data=None, eth_data=None):
 
     ms = MinMaxScaler(feature_range=(0, 1))
     training_df['Weights'] = ms.fit_transform(training_df[['Price_Diff_Future_Abs']]) * 10
-    df.drop(['Price_Diff_Future_Abs', 'Price_Diff_Future'], axis=1, inplace=True)
+    training_df.drop(['Price_Diff_Future_Abs', 'Price_Diff_Future', 'Timestamp'], axis=1, inplace=True)
     training_df = training_df.copy()
 
     return training_df
@@ -637,7 +666,7 @@ def train_xgboost(data_train, labels_train, data_test, labels_test, weights, spl
         .sort_values('importance', ascending=False)
         .reset_index(drop=True)
     )
-    print(imp_df.head(int(len(imp_df)*0.7)).to_string(index=False))
+    print(imp_df.head(int(len(imp_df))).to_string(index=False))
     #plot_importance(model, max_num_features=100)
     #plt.show()
 
@@ -758,6 +787,7 @@ def get_recent_data(count='1000', symbol='BTCUSDC'):
 def convert_data_to_windows(data, window_size=2):
     final = pd.DataFrame()
     non_windowed = ['Label', 'Weights', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5']
+    non_windowed = [column for column in non_windowed if column in data.columns]
     for i in range(window_size):
         for feature in data.columns:
             if feature not in non_windowed:
@@ -904,7 +934,7 @@ def notify():
     messagebox.showinfo("Notification", "Your code has finished running!")
     root.destroy()
 
-def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, val_size=0.15, window_size=2):
+def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, val_size=0.15, window_size=2, n_drop=40):
     splits = []
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
@@ -921,6 +951,11 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
     for split in splits:
         split_count += 1
         print("Split: " + str(split_count))
+
+        if split_count == n_splits:
+            if best_dims_to_drop:
+                xg_features = [f for f in xg_features if f not in best_dims_to_drop]
+                print("Final features after pruning:", xg_features)
 
         data_train = data.iloc[min(split[0]):max(split[0])]
         data_eval = data.iloc[min(split[1]):max(split[1])]
@@ -963,7 +998,7 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         xg_data_eval.drop(columns='Weights', inplace=True)
         xg_data_test.drop(columns='Weights', inplace=True)
 
-        threshold = 0.90
+        threshold = 0.9
         corr_matrix = xg_data_train.corr().abs()
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
         high_corr = (upper.stack()
@@ -981,6 +1016,22 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         xgboost_model = load_xgboost(xgboost_path)
         xg_labels_pred = xgboost_model.predict(xg_data_test)
         xg_labels_pred = xg_labels_pred.tolist()
+
+        if split_count == n_splits - 1:
+            booster = xgboost_model.get_booster()
+            imp = booster.get_score(importance_type='gain')
+            latent_imp = {f: imp.get(f, 0) for f in xg_features if f.startswith('dim')}
+            to_drop = sorted(latent_imp, key=lambda f: latent_imp[f])[:n_drop]
+            print("Dropping these latent dims:", to_drop)
+            best_dims_to_drop = set(to_drop)
+
+        explainer = shap.Explainer(xgboost_model, xg_data_train)
+        shap_values = explainer(xg_data_test)
+        shap.summary_plot(shap_values, xg_data_test, max_display=40)
+        shap.plots.bar(shap_values, max_display=30)
+        shap.plots.scatter(shap_values[:, "WILLR_t0"], color=shap_values)
+        # shap.dependence_plot("Stochastic-RSI_t0", shap_values, xg_data_test, interaction_index="Upper_Wick_Ratio_t0")
+        # shap.plots.force(shap_values[0])
 
         count0 = 0
         count1 = 0
@@ -1083,94 +1134,117 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
         last_label = pred_labels[-1]
         time.sleep(900)
 
+# class MyHyperband(kt.Hyperband):
+#     def run_trial(self, trial, *fit_args, **fit_kwargs):
+#         batch_size = trial.hyperparameters.get("batch_size")
+#         fit_kwargs["batch_size"] = batch_size
+#         return super().run_trial(trial, *fit_args, **fit_kwargs)
+
+# def build_autoencoder(hp):
+#     hp.Choice("batch_size", [32, 64, 128, 256, 512])
+#     latent_dim = hp.Int("latent_dim", min_value=10, max_value=50, step=5)
+#     n_enc_layers = hp.Int("n_enc_layers", 1, 3)
+#     enc_units = []
+#     for i in range(n_enc_layers):
+#         enc_units.append(
+#             hp.Int(f"enc_units_{i}", min_value=32, max_value=256, step=32)
+#         )
+#
+#     inputs = keras.Input(shape=(input_dim,))
+#     x = inputs
+#     for i, units in enumerate(enc_units):
+#         x = layers.Dense(units, activation=hp.Choice(f"enc_activation_{i}", ["relu","tanh"]))(
+#             x
+#         )
+#         if hp.Boolean(f"use_dropout_enc_{i}"):
+#             x = layers.Dropout(hp.Float(f"dropout_rate_enc_{i}", 0.0, 0.5, step=0.1))(x)
+#
+#
+#     bottleneck = layers.Dense(latent_dim, activation="relu", name="bottleneck")(x)
+#     x = bottleneck
+#     for i, units in enumerate(reversed(enc_units)):
+#         x = layers.Dense(units, activation=hp.Choice(f"dec_activation_{i}", ["relu","tanh"]))(
+#             x
+#         )
+#         if hp.Boolean(f"use_dropout_dec_{i}"):
+#             x = layers.Dropout(hp.Float(f"dropout_rate_dec_{i}", 0.0, 0.5, step=0.1))(x)
+#
+#     outputs = layers.Dense(input_dim, activation="linear")(x)
+#     auto = keras.Model(inputs, outputs)
+#     auto.compile(
+#         optimizer=keras.optimizers.Adam(
+#             hp.Float("learning_rate", 1e-4, 1e-2, sampling="log")
+#         ),
+#         loss="mse"
+#     )
+#     return auto
+
+def build_autoencoder(input_dim):
+    latent_dim  = 45
+    enc_units   = [256]
+    enc_acts    = ["relu"]
+    enc_do_flag = [True]
+    enc_do_rate = [0.0]
+    dec_units   = list(reversed(enc_units))
+    dec_acts    = ["tanh"]
+    dec_do_flag = [False]
+    dec_do_rate = [0.4]
+    learning_rate = 0.0002399
+
+    inputs = keras.Input(shape=(input_dim,), name="ae_input")
+    x = inputs
+    for i, units in enumerate(enc_units):
+        x = layers.Dense(units, activation=enc_acts[i], name=f"enc_dense_{i}")(x)
+        if enc_do_flag[i]:
+            x = layers.Dropout(enc_do_rate[i], name=f"enc_dropout_{i}")(x)
+    bottleneck = layers.Dense(latent_dim, activation="relu", name="bottleneck")(x)
+
+    x = bottleneck
+    for i, units in enumerate(dec_units):
+        x = layers.Dense(units, activation=dec_acts[i], name=f"dec_dense_{i}")(x)
+        if dec_do_flag[i]:
+            x = layers.Dropout(dec_do_rate[i], name=f"dec_dropout_{i}")(x)
+    outputs = layers.Dense(input_dim, activation="linear", name="reconstruction")(x)
+
+    autoencoder = keras.Model(inputs, outputs, name="autoencoder")
+    encoder     = keras.Model(inputs, bottleneck, name="encoder")
+    autoencoder.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="mse"
+    )
+
+    return autoencoder, encoder
+
 window_size = 1
 data = load_and_preprocess_data("BTCUSDC_15m.csv")
 scaler = StandardScaler()
-hmm_features = ['Close', 'BTC-ETC_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
+hmm_features = ['Close', 'BTC-ETH_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
                 'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD', 'Stochastic-RSI', 'RSI_Mean_4', 'Chikou_Span_Dev_48', 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4']
-xg_features = ['WILLR', 'Stochastic-RSI', 'Upper_Wick_Ratio', 'Fast_%K', 'KC_Width', 'OBV', 'Body_Ratio', 'RSI', 'MACDSignal', 'Volume', 'Volume-ATR', 'BB_Width', 'Lower_Wick_Ratio', 'MACD', 'Volatility', 'Range', 'Upper_Wick', 'LOW-HIGH_EMA',
-               'Fast_%D', 'Lower_Wick', 'BB-KC', 'Price_Diff', 'ATR', 'CMF', 'MACDHist', 'Close', 'VWAP', 'Doji-OBV', 'Returns', 'Body_Size', 'Momentum', 'Volume_Change', 'RSI-MACD', 'BTC-ETC_Diff', 'Ichimoku_Overlap',
-               'TSI', 'CCI', 'VWAP-ATR', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5', 'Closing_Marubozu', 'Long_Candle', 'Marubozu', 'R1', 'Short_Candle',
-               'Kijun_Sen', 'KC_Lower', 'KC_Upper', 'Tenkan_Sen', 'Senkou_Span_B', 'PP', 'S1', 'S2', 'Senkou_Span_A', 'Chikou_Span', 'Harami', 'Label', 'Weights']
-agg_features = ['Range_Mean_4', 'Upper_Wick_Ratio_Mean_4', 'MACD_Dev_16', 'OBV_Dev_4', 'Upper_Wick_Mean_48', 'VWAP_Dev_96', 'Range_Dev_4', 'ADX_PC5_Dev_4', 'Volume-ATR_Mean_96', 'Volatility_Dev_4', 'ADX_Mean_48', 'MACDSignal_Dev_4',
-                'Stochastic-RSI_Drawdown_4', 'Body_Ratio_Mean_16', 'Body_Size_Drawdown_16', 'Fast_%D_Drawdown_4', 'Upper_Wick_Ratio_Mean_16', 'ADX_PC4_Mean_384', 'VWAP_Dev_1152', 'BB-KC_Mean_384', 'Volume-ATR_Dev_96', 'Range_Drawdown_16',
-                'Upper_Wick_Mean_16', 'MACDHist_Dev_4', 'RSI_PC1_Dev_4', 'ATR_PC3_Mean_16', 'MACDHist_Mean_1152', 'Lower_Wick_Ratio_Dev_384', 'Doji-OBV_Mean_16', 'Stochastic-RSI_Dev_4', 'ATR_PC3_Mean_4', 'Upper_Wick_Dev_16', 'MACDSignal_Mean_48',
-                'LOW-HIGH_EMA_Drawdown_384', 'VWAP_Mean_48', 'Price_Diff_Dev_4', 'Volume-ATR_Drawdown_48', 'Body_Size_Mean_4', 'Upper_Wick_Ratio_Dev_96', 'Body_Ratio_Drawdown_48', 'ATR_PC1_Dev_4', 'Fast_%D_Dev_1152', 'ATR_Dev_4', 'Price_Diff_Mean_4',
-                'Fast_%D_Dev_48', 'CMF_Mean_48', 'Volume-ATR_Mean_48', 'ADX_PC1_Mean_48', 'MACDHist_Mean_48', 'ATR_Drawdown_4', 'BB-KC_Drawdown_4', 'Upper_Wick_Mean_4', 'Lower_Wick_Dev_384', 'VWAP-ATR_Mean_48', 'BB_Width_Dev_4', 'Lower_Wick_Mean_4',
-                'RSI_Dev_48', 'Volume-ATR_Mean_4', 'TSI_Dev_48', 'CMF_Dev_16', 'ADX_PC3_Dev_48', 'Volume_Change_Mean_4', 'CMF_Drawdown_48', 'ADX_PC3_Dev_4']
+xg_features = ['MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'RSI_PC1', 'Closing_Marubozu-OBV', 'Doji-RSI', 'RSI_PC2', 'Closing_Marubozu', 'Short_Candle-RSI', 'Lower_Wick', 'Volume',
+               'Volume-ATR', 'OBV', 'KC_Upper', 'Range', 'VWAP', 'Long_Candle-OBV', 'Body_Size', 'CCI', 'Doji-OBV', 'Fast_%D', 'Label', 'Weights']
+agg_features = ['Closing_Marubozu-OBV_Dev_16', 'Volume_Dev_16', 'Volume_Mean_48', 'Closing_Marubozu-OBV_Dev_4', 'MFV_Mean_16', 'OBV_Dev_16', 'OBV_Dev_96', 'OBV_Dev_48', 'Doji-OBV_Mean_16', 'Price_Diff_Mean_4',
+                'Volume_Dev_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Mean_4', 'OBV_Dev_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'Doji-OBV_Dev_16']
 
-# feature  importance
-#         Stochastic-RSI_t0   43.444180
-#                  WILLR_t0   41.580982
-#                Fast_%K_t0   39.913826
-#                   RSI_PC1   27.960758
-#               Doji-OBV_t0   26.195438
-#       Closing_Marubozu_t0   26.105345
-#                  Range_t0   23.293200
-#       Upper_Wick_Ratio_t0   22.428465
-#             Upper_Wick_t0   22.274658
-#       Lower_Wick_Ratio_t0   21.646400
-#                   RSI_PC2   20.889765
-#             Volume-ATR_t0   20.257256
-#         Price_Diff_Mean_4   19.970669
-#              Body_Size_t0   18.188129
-#                    RSI_t0   17.469692
-#             Lower_Wick_t0   17.436827
-#                   VWAP_t0   17.239100
-#                 Volume_t0   17.116684
-#         Lower_Wick_Mean_4   16.658495
-#                Fast_%D_t0   16.539736
-#               Momentum_t0   16.519463
-#          Doji-OBV_Mean_16   16.048666
-#            Long_Candle_t0   15.751548
-#             Price_Diff_t0   15.390106
-#               Marubozu_t0   15.264894
-#                Returns_t0   13.664656
-#                 OBV_Dev_4   13.570038
-#         Upper_Wick_Mean_4   13.547947
-#   Upper_Wick_Ratio_Mean_4   12.882600
-#  Upper_Wick_Ratio_Mean_16   12.359438
-#             Body_Ratio_t0   12.355774
-#           Short_Candle_t0   12.162180
-# Stochastic-RSI_Drawdown_4   11.603987
-#                   ATR_PC1   11.170573
-#         Volume-ATR_Mean_4   11.137233
-#           BTC-ETC_Diff_t0   10.851021
-#        Upper_Wick_Mean_16   10.584715
-#                   RSI_PC3   10.449183
-#          Fast_%D_Dev_1152    9.468043
-#                    CCI_t0    9.296351
-#  Lower_Wick_Ratio_Dev_384    9.281325
-#        Body_Ratio_Mean_16    8.885139
-#                    OBV_t0    8.587098
-#          Price_Diff_Dev_4    8.497617
-#                CMF_Dev_16    8.333025
-#               KC_Upper_t0    8.065414
-#     Body_Size_Drawdown_16    7.694060
-#                     R1_t0    7.610858
-#          Senkou_Span_B_t0    7.555476
-# LOW-HIGH_EMA_Drawdown_384    7.524621
-#    Volume-ATR_Drawdown_48    7.451731
-#            BB-KC_Mean_384    7.257810
-#    Body_Ratio_Drawdown_48    7.244038
-#        Upper_Wick_Mean_48    6.745100
-#         Range_Drawdown_16    6.695742
-#            ATR_Drawdown_4    6.690574
-#                    ATR_t0    6.547372
-#               Range_Dev_4    6.490618
-#           CMF_Drawdown_48    6.465449
-#               KC_Width_t0    6.402169
-#                 ATR_Dev_4    6.397157
-#        Volume-ATR_Mean_96    6.352917
-#            ATR_PC3_Mean_4    6.334408
-#               MACD_Dev_16    6.327398
-#               KC_Lower_t0    6.242350
-#      Volume_Change_Mean_4    6.237663
-#               VWAP_Dev_96    6.177499
-#         Volume-ATR_Dev_96    6.113950
-#                   ATR_PC3    6.100461
+mask = ~data.columns.str.contains("Mean|Dev|Drawdown", case=False, regex=True)
+no_agg = data.loc[:, mask]
+excluded_features = no_agg.drop(columns=xg_features)
+excluded_features_scaled = scaler.fit_transform(excluded_features)
+input_dim = excluded_features_scaled.shape[1]
 
-model = walk_forward(data, xg_features, agg_features, n_splits=2, window_size=window_size)
+auto, enc = build_autoencoder(input_dim)
+auto.fit(excluded_features_scaled, excluded_features_scaled,
+    epochs=100,
+    batch_size=256,
+    validation_split=0.1
+)
+encoded_data = enc.predict(excluded_features_scaled)
+
+dim_cols = [f"dim{i}" for i in range(1, 45 + 1)]
+encoded_df = pd.DataFrame(encoded_data, columns=dim_cols)
+data = pd.concat([data, encoded_df], axis=1)
+xg_features.extend(dim_cols)
+
+model = walk_forward(data, xg_features, agg_features, n_splits=7, window_size=window_size)
 # data_test = get_historical_data( 1739645100000, 1744825500000)
 # pca_training_df = get_historical_data(1735707600000,  	1738386000000)
 # data_test = load_and_preprocess_data("", False, data=data_test, pca_training_data=pca_training_df)
