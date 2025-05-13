@@ -29,12 +29,7 @@ import warnings
 import joblib
 import shap
 from hurst import compute_Hc
-import keras_tuner as kt
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
 
-tf.random.set_seed(42)
 np.random.seed(42)
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 pd.set_option('display.max_columns', None)
@@ -43,7 +38,7 @@ pd.set_option('display.max_rows', 100)
 
 api_key = 'IbIgJihiEgl4rEjWnOFazg7F4YVzJXVG8if3iKcGsurgspgblDN2F73XMPdUzOcH'
 
-def load_and_preprocess_data(filepath, file=True, data=None, eth_data=None):
+def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, eth_data=None):
     if file:
         print(f"Loading data from {filepath}...")
         df = pd.read_csv(filepath, names=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
@@ -515,6 +510,33 @@ def load_and_preprocess_data(filepath, file=True, data=None, eth_data=None):
     training_df.drop(['Price_Diff_Future_Abs', 'Price_Diff_Future', 'Timestamp'], axis=1, inplace=True)
     training_df = training_df.copy()
 
+    if file:
+        ex_scaler = StandardScaler()
+        mask = ~training_df.columns.str.contains("Mean|Dev|Drawdown", case=False, regex=True)
+        no_agg = training_df.loc[:, mask]
+        excluded_features = no_agg.drop(columns=xg_features)
+        excluded_features_scaled = ex_scaler.fit_transform(excluded_features)
+
+        ex_pca = PCA(n_components=3, random_state=42)
+        pca_data = ex_pca.fit_transform(excluded_features_scaled)
+        excluded_pca_df = pd.DataFrame(pca_data, columns=['EX_PC1', 'EX_PC2', 'EX_PC3'])
+        print(len(training_df))
+        training_df = pd.concat([training_df, excluded_pca_df], axis=1)
+        print(len(training_df))
+        joblib.dump(ex_pca, "ex_pca.pkl")
+        joblib.dump(ex_scaler, "ex_scaler.pkl")
+    else:
+        ex_pca = joblib.load("ex_pca.pkl")
+        ex_scaler = joblib.load("ex_scaler.pkl")
+        mask = ~training_df.columns.str.contains("Mean|Dev|Drawdown", case=False, regex=True)
+        no_agg = training_df.loc[:, mask]
+        excluded_features = no_agg.drop(columns=xg_features)
+        excluded_features_scaled = ex_scaler.transform(excluded_features)
+
+        pca_data = ex_pca.transform(excluded_features_scaled)
+        excluded_pca_df = pd.DataFrame(pca_data, columns=['EX_PC1', 'EX_PC2', 'EX_PC3'])
+        training_df = pd.concat([training_df, excluded_pca_df], axis=1)
+
     return training_df
 
 def cmma(High, Low, Close, period, atr_period = 168):
@@ -934,7 +956,7 @@ def notify():
     messagebox.showinfo("Notification", "Your code has finished running!")
     root.destroy()
 
-def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, val_size=0.15, window_size=2, n_drop=40):
+def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, val_size=0.15, window_size=2):
     splits = []
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
@@ -951,11 +973,6 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
     for split in splits:
         split_count += 1
         print("Split: " + str(split_count))
-
-        if split_count == n_splits:
-            if best_dims_to_drop:
-                xg_features = [f for f in xg_features if f not in best_dims_to_drop]
-                print("Final features after pruning:", xg_features)
 
         data_train = data.iloc[min(split[0]):max(split[0])]
         data_eval = data.iloc[min(split[1]):max(split[1])]
@@ -1017,14 +1034,6 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         xg_labels_pred = xgboost_model.predict(xg_data_test)
         xg_labels_pred = xg_labels_pred.tolist()
 
-        if split_count == n_splits - 1:
-            booster = xgboost_model.get_booster()
-            imp = booster.get_score(importance_type='gain')
-            latent_imp = {f: imp.get(f, 0) for f in xg_features if f.startswith('dim')}
-            to_drop = sorted(latent_imp, key=lambda f: latent_imp[f])[:n_drop]
-            print("Dropping these latent dims:", to_drop)
-            best_dims_to_drop = set(to_drop)
-
         explainer = shap.Explainer(xgboost_model, xg_data_train)
         shap_values = explainer(xg_data_test)
         shap.summary_plot(shap_values, xg_data_test, max_display=40)
@@ -1071,7 +1080,9 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
     recent_df = raw_data.copy()
     # 1735732800000, 1738411200000 -> Jan 2025
     # 1648728000000, 1738324800000 -> March 2023 to now
-    recent_df = load_and_preprocess_data("", False, data=recent_df, eth_data=eth_data)
+    recent_df = load_and_preprocess_data("", xg_features, False, data=recent_df, eth_data=eth_data)
+    xg_features.extend(['EX_PC2'])
+    print(recent_df['EX_PC2'].tail(10))
     #recent_df = recent_df.dropna()
 
     recent_df['Label'] = 0
@@ -1084,7 +1095,6 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
     recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
     recent_df.drop(['Label'], axis=1, inplace=True)
     recent_df.drop(['Weights'], axis=1, inplace=True)
-    recent_df = recent_df.loc[recent_df['Close_t0'] != 0]
     pred_labels = xgboost_model.predict(recent_df).tolist()
     last_label = pred_labels[-1]
 
@@ -1134,89 +1144,7 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
         last_label = pred_labels[-1]
         time.sleep(900)
 
-# class MyHyperband(kt.Hyperband):
-#     def run_trial(self, trial, *fit_args, **fit_kwargs):
-#         batch_size = trial.hyperparameters.get("batch_size")
-#         fit_kwargs["batch_size"] = batch_size
-#         return super().run_trial(trial, *fit_args, **fit_kwargs)
-
-# def build_autoencoder(hp):
-#     hp.Choice("batch_size", [32, 64, 128, 256, 512])
-#     latent_dim = hp.Int("latent_dim", min_value=10, max_value=50, step=5)
-#     n_enc_layers = hp.Int("n_enc_layers", 1, 3)
-#     enc_units = []
-#     for i in range(n_enc_layers):
-#         enc_units.append(
-#             hp.Int(f"enc_units_{i}", min_value=32, max_value=256, step=32)
-#         )
-#
-#     inputs = keras.Input(shape=(input_dim,))
-#     x = inputs
-#     for i, units in enumerate(enc_units):
-#         x = layers.Dense(units, activation=hp.Choice(f"enc_activation_{i}", ["relu","tanh"]))(
-#             x
-#         )
-#         if hp.Boolean(f"use_dropout_enc_{i}"):
-#             x = layers.Dropout(hp.Float(f"dropout_rate_enc_{i}", 0.0, 0.5, step=0.1))(x)
-#
-#
-#     bottleneck = layers.Dense(latent_dim, activation="relu", name="bottleneck")(x)
-#     x = bottleneck
-#     for i, units in enumerate(reversed(enc_units)):
-#         x = layers.Dense(units, activation=hp.Choice(f"dec_activation_{i}", ["relu","tanh"]))(
-#             x
-#         )
-#         if hp.Boolean(f"use_dropout_dec_{i}"):
-#             x = layers.Dropout(hp.Float(f"dropout_rate_dec_{i}", 0.0, 0.5, step=0.1))(x)
-#
-#     outputs = layers.Dense(input_dim, activation="linear")(x)
-#     auto = keras.Model(inputs, outputs)
-#     auto.compile(
-#         optimizer=keras.optimizers.Adam(
-#             hp.Float("learning_rate", 1e-4, 1e-2, sampling="log")
-#         ),
-#         loss="mse"
-#     )
-#     return auto
-
-def build_autoencoder(input_dim):
-    latent_dim  = 45
-    enc_units   = [256]
-    enc_acts    = ["relu"]
-    enc_do_flag = [True]
-    enc_do_rate = [0.0]
-    dec_units   = list(reversed(enc_units))
-    dec_acts    = ["tanh"]
-    dec_do_flag = [False]
-    dec_do_rate = [0.4]
-    learning_rate = 0.0002399
-
-    inputs = keras.Input(shape=(input_dim,), name="ae_input")
-    x = inputs
-    for i, units in enumerate(enc_units):
-        x = layers.Dense(units, activation=enc_acts[i], name=f"enc_dense_{i}")(x)
-        if enc_do_flag[i]:
-            x = layers.Dropout(enc_do_rate[i], name=f"enc_dropout_{i}")(x)
-    bottleneck = layers.Dense(latent_dim, activation="relu", name="bottleneck")(x)
-
-    x = bottleneck
-    for i, units in enumerate(dec_units):
-        x = layers.Dense(units, activation=dec_acts[i], name=f"dec_dense_{i}")(x)
-        if dec_do_flag[i]:
-            x = layers.Dropout(dec_do_rate[i], name=f"dec_dropout_{i}")(x)
-    outputs = layers.Dense(input_dim, activation="linear", name="reconstruction")(x)
-
-    autoencoder = keras.Model(inputs, outputs, name="autoencoder")
-    encoder     = keras.Model(inputs, bottleneck, name="encoder")
-    autoencoder.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="mse"
-    )
-
-    return autoencoder, encoder
-
 window_size = 1
-data = load_and_preprocess_data("BTCUSDC_15m.csv")
 scaler = StandardScaler()
 hmm_features = ['Close', 'BTC-ETH_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
                 'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD', 'Stochastic-RSI', 'RSI_Mean_4', 'Chikou_Span_Dev_48', 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4']
@@ -1224,27 +1152,10 @@ xg_features = ['MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wi
                'Volume-ATR', 'OBV', 'KC_Upper', 'Range', 'VWAP', 'Long_Candle-OBV', 'Body_Size', 'CCI', 'Doji-OBV', 'Fast_%D', 'Label', 'Weights']
 agg_features = ['Closing_Marubozu-OBV_Dev_16', 'Volume_Dev_16', 'Volume_Mean_48', 'Closing_Marubozu-OBV_Dev_4', 'MFV_Mean_16', 'OBV_Dev_16', 'OBV_Dev_96', 'OBV_Dev_48', 'Doji-OBV_Mean_16', 'Price_Diff_Mean_4',
                 'Volume_Dev_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Mean_4', 'OBV_Dev_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'Doji-OBV_Dev_16']
+data = load_and_preprocess_data("BTCUSDC_15m.csv", xg_features)
+xg_features.extend(['EX_PC2'])
 
-mask = ~data.columns.str.contains("Mean|Dev|Drawdown", case=False, regex=True)
-no_agg = data.loc[:, mask]
-excluded_features = no_agg.drop(columns=xg_features)
-excluded_features_scaled = scaler.fit_transform(excluded_features)
-input_dim = excluded_features_scaled.shape[1]
-
-auto, enc = build_autoencoder(input_dim)
-auto.fit(excluded_features_scaled, excluded_features_scaled,
-    epochs=100,
-    batch_size=256,
-    validation_split=0.1
-)
-encoded_data = enc.predict(excluded_features_scaled)
-
-dim_cols = [f"dim{i}" for i in range(1, 45 + 1)]
-encoded_df = pd.DataFrame(encoded_data, columns=dim_cols)
-data = pd.concat([data, encoded_df], axis=1)
-xg_features.extend(dim_cols)
-
-model = walk_forward(data, xg_features, agg_features, n_splits=7, window_size=window_size)
+model = load_xgboost("xgboost_pipeline.pkl")
 # data_test = get_historical_data( 1739645100000, 1744825500000)
 # pca_training_df = get_historical_data(1735707600000,  	1738386000000)
 # data_test = load_and_preprocess_data("", False, data=data_test, pca_training_data=pca_training_df)
@@ -1259,6 +1170,7 @@ model = walk_forward(data, xg_features, agg_features, n_splits=7, window_size=wi
 # xg_data_test.drop(['Weights'], axis=1, inplace=True)
 #
 # walk_forward_trading(model, xg_data_test)
+xg_features.remove('EX_PC2')
 continuous_sim(model, xg_features, agg_features)
 
 #walk_forward_trading(model, xg_data_test)
