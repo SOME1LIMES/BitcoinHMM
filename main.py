@@ -3,6 +3,8 @@ import numpy as np
 from hmmlearn import hmm
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, HistGradientBoostingClassifier, StackingClassifier
+from sklearn.tree import DecisionTreeClassifier
 import talib
 from datetime import datetime
 from xgboost import XGBClassifier
@@ -11,6 +13,7 @@ from skopt.space import Real, Integer, Categorical
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import f1_score, accuracy_score
 from xgboost import plot_importance
 from sklearn.model_selection import TimeSeriesSplit
 import pickle
@@ -29,6 +32,11 @@ import warnings
 import joblib
 import shap
 from hurst import compute_Hc
+from lightgbm import LGBMClassifier
+from collections import Counter
+from sklearn.calibration import CalibratedClassifierCV
+from catboost import CatBoostClassifier
+from sklearn.linear_model import LogisticRegression
 
 np.random.seed(42)
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
@@ -505,8 +513,15 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
     training_df = training_df.dropna(axis=1, thresh=len(training_df) - 1452)
     training_df = training_df.fillna(0)
 
-    ms = MinMaxScaler(feature_range=(0, 1))
-    training_df['Weights'] = ms.fit_transform(training_df[['Price_Diff_Future_Abs']]) * 10
+    magnitude_weight = np.log1p(training_df['Price_Diff_Future_Abs'].values)
+
+    # labels = training_df['Label'].tolist()
+    # counts = Counter(labels)
+    # total = len(labels)
+    # class_mult = {cls: total / (2 * cnt) for cls, cnt in counts.items()}
+    # class_weight = np.array([class_mult[label] for label in labels])
+
+    training_df['Weights'] = magnitude_weight
     training_df.drop(['Price_Diff_Future_Abs', 'Price_Diff_Future', 'Timestamp'], axis=1, inplace=True)
     training_df = training_df.copy()
 
@@ -520,9 +535,7 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
         ex_pca = PCA(n_components=3, random_state=42)
         pca_data = ex_pca.fit_transform(excluded_features_scaled)
         excluded_pca_df = pd.DataFrame(pca_data, columns=['EX_PC1', 'EX_PC2', 'EX_PC3'])
-        print(len(training_df))
         training_df = pd.concat([training_df, excluded_pca_df], axis=1)
-        print(len(training_df))
         joblib.dump(ex_pca, "ex_pca.pkl")
         joblib.dump(ex_scaler, "ex_scaler.pkl")
     else:
@@ -537,6 +550,8 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
         excluded_pca_df = pd.DataFrame(pca_data, columns=['EX_PC1', 'EX_PC2', 'EX_PC3'])
         training_df = pd.concat([training_df, excluded_pca_df], axis=1)
 
+    if file:
+        training_df.to_csv("BTCUSDC_15m_processed.csv", index=False)
     return training_df
 
 def cmma(High, Low, Close, period, atr_period = 168):
@@ -583,44 +598,126 @@ def custom_pnl_objective(y_true, y_pred):
 
     return grad.astype(np.float32), hess.astype(np.float32)
 
-# def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
-#     tscv = TimeSeriesSplit(n_splits=splits)
-#     pipeline = Pipeline(steps=[('xgb', XGBClassifier(random_state=42, eval_metric='auc', early_stopping_rounds=70, tree_method='hist', device='cuda', objective='binary:logistic'))])
-#
-#     search_space = {
-#         'xgb__max_depth': Integer(3, 12),
-#         'xgb__learning_rate': Real(0.0001, 0.3, prior='log-uniform'),
-#         'xgb__subsample': Real(0.8, 1.0),
-#         'xgb__colsample_bytree': Real(0.5, 1.0),
-#         'xgb__colsample_bylevel': Real(0.5, 1.0),
-#         'xgb__colsample_bynode': Real(0.5, 1.0),
-#         'xgb__gamma': Real(0.1, 12.0),
-#         'xgb__reg_alpha': Real(0.0, 8.0),
-#         'xgb__reg_lambda': Real(0.1, 13.0),
-#         'xgb__n_estimators': Integer(100, 3000),
-#         'xgb__min_child_weight': Integer(1, 20),
-#         'xgb__max_bin': Integer(128, 512),
-#         'xgb__grow_policy': Categorical(["depthwise", "lossguide"]),
-#         'xgb__scale_pos_weight': Real(0.5, 2.0),
-#         'xgb__booster': Categorical(["gbtree", "dart"])
+def train_xgboost(data_train, labels_train, data_eval, labels_eval, weights_train, weights_eval, splits, iters):
+    n = len(data_eval)
+    n_cal = int(n * 0.30)
+    data_cal = data_eval.iloc[:n_cal]
+    labels_cal = labels_eval[:n_cal]
+    weights_cal = weights_eval[:n_cal]
+    data_eval = data_eval.iloc[n_cal:]
+    labels_eval = labels_eval[n_cal:]
+    weights_eval = weights_eval[n_cal:]
+
+    tscv = TimeSeriesSplit(n_splits=splits)
+    pipeline = Pipeline(steps=[('xgb', XGBClassifier(random_state=42, eval_metric='auc', early_stopping_rounds=70, tree_method='hist', device='cuda', objective='binary:logistic'))])
+
+    search_space = {
+        'xgb__max_depth': Integer(3, 12),
+        'xgb__learning_rate': Real(0.0001, 0.3, prior='log-uniform'),
+        'xgb__n_estimators': Integer(100, 3000),
+        'xgb__subsample': Real(0.6, 1.0),
+        'xgb__colsample_bytree': Real(0.1, 1.0),
+        'xgb__reg_alpha': Real(0.0, 8.0),
+        'xgb__reg_lambda': Real(0.0, 13.0),
+    }
+    opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='roc_auc', random_state=42)
+
+    opt.fit(data_train, labels_train, xgb__eval_set=[(data_eval, labels_eval)], xgb__sample_weight=weights_train, xgb__sample_weight_eval_set=[weights_eval])
+    print("Best estimator: ", opt.best_estimator_)
+    print("Best score: ", opt.best_score_)
+    print("Best params: ", opt.best_params_)
+    print(opt.score(data_eval, labels_eval))
+
+    pipe = opt.best_estimator_
+    xgb = pipe.named_steps['xgb']
+    xgb.fit(
+        data_train,
+        labels_train,
+        eval_set=[(data_eval, labels_eval)],
+        sample_weight=weights_train,
+        sample_weight_eval_set=[weights_eval]
+    )
+
+    cal = CalibratedClassifierCV(pipe, cv='prefit', method='isotonic')
+    cal.fit(data_cal, labels_cal, sample_weight=weights_cal)
+
+    probs_cal = cal.predict_proba(data_cal)[:, 1]
+    ths = np.linspace(probs_cal.min(), probs_cal.max(), 101)
+    f1s = [f1_score(labels_cal, probs_cal >= t) for t in ths]
+    best_t = ths[np.argmax(f1s)]
+    print("cal best F1 threshold:", best_t)
+
+    pipe.threshold_ = best_t
+    pipe.calibrator_ = cal
+
+    probs = pipe.calibrator_.predict_proba(data_eval)[:, 1]
+    labels_pred = (probs >= pipe.threshold_).astype(int).tolist()
+    print(labels_pred.count(0))
+    print(labels_pred.count(1))
+    print(labels_eval.count(0))
+    print(labels_eval.count(1))
+    print(opt.best_estimator_.steps)
+
+    # booster = xgboost_model.get_booster()
+    # imp_dict = booster.get_score(importance_type='gain')
+    # imp_df = (
+    #     pd.DataFrame([
+    #         {'feature': feat, 'importance': score}
+    #         for feat, score in imp_dict.items()
+    #     ])
+    #     .sort_values('importance', ascending=False)
+    #     .reset_index(drop=True)
+    # )
+    # print(imp_df.head(int(len(imp_df)*0.7)).to_string(index=False))
+    # plot_importance(xgboost_model, max_num_features=100)
+    # plt.show()
+
+    # save the model
+    filepath = "xgboost_pipeline.pkl"
+    with open(filepath, "wb") as f:
+        pickle.dump(pipe, f)
+
+    return filepath
+
+# def train_xgboost(data_train, labels_train, data_eval, labels_eval, weights_train, weights_eval, splits, iters):
+#     params = {
+#         'max_depth': 7,
+#         'learning_rate': 0.001942416148666637,
+#         'subsample': 0.9441643979130557,
+#         'colsample_bytree': 0.8894847797259593,
+#         'colsample_bylevel': 0.44354252366395286,
+#         'colsample_bynode': 0.25,
+#         'reg_alpha': 7.7292861444956635,
+#         'reg_lambda': 8.303325700673254,
+#         'gamma': 11.17446684580332,
+#         'n_estimators': 250,
+#         'min_child_weight': 19,
+#         'max_bin': 128,
+#         'grow_policy': 'lossguide',
+#         'max_delta_step': 6,
+#         'scale_pos_weight': 1.16148,
+#         'booster': 'dart'
 #     }
-#     opt = BayesSearchCV(pipeline, search_space, cv=tscv, n_iter=iters, scoring='roc_auc', random_state=42)
 #
-#     opt.fit(data_train, labels_train, xgb__eval_set=[(data_test, labels_test)], xgb__sample_weight=weights)
-#     print("Best estimator: ", opt.best_estimator_)
-#     print("Best score: ", opt.best_score_)
-#     print("Best params: ", opt.best_params_)
-#     print(opt.score(data_test, labels_test))
-#     labels_pred = opt.predict(data_test)
-#     labels_pred = labels_pred.tolist()
-#     print(labels_pred.count(0))
-#     print(labels_pred.count(1))
-#     print(opt.best_estimator_.steps)
+#     model = XGBClassifier(
+#         random_state=42,
+#         eval_metric='auc',
+#         early_stopping_rounds=100,
+#         tree_method='hist',
+#         device='cuda',
+#         objective='binary:logistic',
+#         **params
+#     )
 #
-#     xgboost_step = opt.best_estimator_.steps[0]
-#     xgboost_model = xgboost_step[1]
+#     model.fit(
+#         data_train,
+#         labels_train,
+#         eval_set=[(data_eval, labels_eval)],
+#         sample_weight=weights_train,
+#         sample_weight_eval_set=[weights_eval]
+#     )
 #
-#     booster = xgboost_model.get_booster()
+#     booster = model.get_booster()
 #     imp_dict = booster.get_score(importance_type='gain')
 #     imp_df = (
 #         pd.DataFrame([
@@ -630,73 +727,15 @@ def custom_pnl_objective(y_true, y_pred):
 #         .sort_values('importance', ascending=False)
 #         .reset_index(drop=True)
 #     )
-#     print(imp_df.head(int(len(imp_df)*0.7)).to_string(index=False))
-#     # plot_importance(xgboost_model, max_num_features=100)
-#     # plt.show()
+#     print(imp_df.head(int(len(imp_df))).to_string(index=False))
+#     #plot_importance(model, max_num_features=100)
+#     #plt.show()
 #
-#     # save the model
 #     filepath = "xgboost_pipeline.pkl"
 #     with open(filepath, "wb") as f:
-#         pickle.dump(opt.best_estimator_, f)
+#         pickle.dump(model, f)
 #
 #     return filepath
-
-def train_xgboost(data_train, labels_train, data_test, labels_test, weights, splits, iters):
-    params = {
-        'max_depth': 3,
-        'learning_rate': 0.0001,
-        'subsample': 0.85,
-        'colsample_bytree': 1.0,
-        'colsample_bylevel': 0.6498774939804,
-        'colsample_bynode': 0.49,
-        'reg_alpha': 5.0445785578467275,
-        'reg_lambda': 13.2,
-        'gamma': 3.7754805658479595,
-        'n_estimators': 3000,
-        'min_child_weight': 18,
-        'max_bin': 186,
-        'grow_policy': 'lossguide',
-        'max_delta_step': 6,
-        'scale_pos_weight': 0.9813,
-        'booster': 'dart'
-    }
-
-    model = XGBClassifier(
-        random_state=42,
-        eval_metric='auc',
-        early_stopping_rounds=100,
-        tree_method='hist',
-        device='cuda',
-        objective='binary:logistic',
-        **params
-    )
-
-    model.fit(
-        data_train,
-        labels_train,
-        eval_set=[(data_test, labels_test)],
-        sample_weight=weights
-    )
-
-    booster = model.get_booster()
-    imp_dict = booster.get_score(importance_type='gain')
-    imp_df = (
-        pd.DataFrame([
-            {'feature': feat, 'importance': score}
-            for feat, score in imp_dict.items()
-        ])
-        .sort_values('importance', ascending=False)
-        .reset_index(drop=True)
-    )
-    print(imp_df.head(int(len(imp_df))).to_string(index=False))
-    #plot_importance(model, max_num_features=100)
-    #plt.show()
-
-    filepath = "xgboost_pipeline.pkl"
-    with open(filepath, "wb") as f:
-        pickle.dump(model, f)
-
-    return filepath
 
 def load_xgboost(filepath):
     with open(filepath, "rb") as f:
@@ -956,7 +995,7 @@ def notify():
     messagebox.showinfo("Notification", "Your code has finished running!")
     root.destroy()
 
-def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, val_size=0.15, window_size=2):
+def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, val_size=0.2, window_size=1):
     splits = []
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
@@ -1010,35 +1049,47 @@ def walk_forward(data, xg_features, agg_features, n_splits=5, test_size=0.15, va
         xg_labels_test = xg_data_test.pop('Label').tolist()
         xg_labels_test = [int(x) for x in xg_labels_test]
 
-        weights = xg_data_train['Weights'].tolist()
-        xg_data_train.drop(columns='Weights', inplace=True)
-        xg_data_eval.drop(columns='Weights', inplace=True)
+        # so I don't have to manually adjust scale_pos_weight, its all done through the sample weights
+        # Need to do it here because of different label ratios between train, eval, and test sets
+        # train_counts = Counter(xg_labels_train)
+        # train_total = len(xg_labels_train)
+        # train_class_mult = {cls: train_total / (2 * cnt) for cls, cnt in train_counts.items()}
+        # train_class_weight = np.array([train_class_mult[label] for label in xg_labels_train])
+        xg_weights_train = xg_data_train.pop('Weights').tolist()
+
+        # eval_counts = Counter(xg_labels_eval)
+        # eval_total = len(xg_labels_eval)
+        # eval_class_mult = {cls: eval_total / (2 * cnt) for cls, cnt in eval_counts.items()}
+        # eval_class_weight = np.array([eval_class_mult[label] for label in xg_labels_eval])
+        xg_weights_eval = xg_data_eval.pop('Weights').tolist()
+
         xg_data_test.drop(columns='Weights', inplace=True)
 
-        threshold = 0.9
-        corr_matrix = xg_data_train.corr().abs()
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-        high_corr = (upper.stack()
-                     .reset_index()
-                     .rename(columns={"level_0": "feature1",
-                                      "level_1": "feature2",
-                                      0: "corr_value"}))
+        # correlation pruning
+        # threshold = 0.9
+        # corr_matrix = xg_data_train.corr().abs()
+        # upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        # high_corr = (upper.stack()
+        #              .reset_index()
+        #              .rename(columns={"level_0": "feature1",
+        #                               "level_1": "feature2",
+        #                               0: "corr_value"}))
+        #
+        # high_corr = high_corr[high_corr["corr_value"] > threshold]
+        # for _, row in high_corr.iterrows():
+        #     f1, f2, val = row["feature1"], row["feature2"], row["corr_value"]
+        #     print(f"{f1:30s} ↔ {f2:30s} : corr = {val:.2f}")
 
-        high_corr = high_corr[high_corr["corr_value"] > threshold]
-        for _, row in high_corr.iterrows():
-            f1, f2, val = row["feature1"], row["feature2"], row["corr_value"]
-            print(f"{f1:30s} ↔ {f2:30s} : corr = {val:.2f}")
-
-        xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, weights, 2, 200)
+        xgboost_path = train_xgboost(xg_data_train, xg_labels_train, xg_data_eval, xg_labels_eval, xg_weights_train, xg_weights_eval, 2, 25)
         xgboost_model = load_xgboost(xgboost_path)
         xg_labels_pred = xgboost_model.predict(xg_data_test)
         xg_labels_pred = xg_labels_pred.tolist()
 
-        explainer = shap.Explainer(xgboost_model, xg_data_train)
-        shap_values = explainer(xg_data_test)
-        shap.summary_plot(shap_values, xg_data_test, max_display=40)
-        shap.plots.bar(shap_values, max_display=30)
-        shap.plots.scatter(shap_values[:, "WILLR_t0"], color=shap_values)
+        # explainer = shap.Explainer(xgboost_model, xg_data_train)
+        # shap_values = explainer(xg_data_test)
+        # shap.summary_plot(shap_values, xg_data_test, max_display=40)
+        # shap.plots.bar(shap_values, max_display=30)
+        # shap.plots.scatter(shap_values[:, "WILLR_t0"], color=shap_values)
         # shap.dependence_plot("Stochastic-RSI_t0", shap_values, xg_data_test, interaction_index="Upper_Wick_Ratio_t0")
         # shap.plots.force(shap_values[0])
 
@@ -1144,6 +1195,119 @@ def continuous_sim(xgboost_model, xg_features, agg_features):
         last_label = pred_labels[-1]
         time.sleep(900)
 
+def calculate_meta_features(data, labels, weights, base_learners, tscv):
+    labels = np.array(labels)
+    weights = np.array(weights)
+    n, m = data.shape[0], len(base_learners)
+    meta = np.full((n, m), np.nan)
+    for col, (name, clf) in enumerate(base_learners):
+        for train_idx, test_idx in tscv.split(data):
+            clf.fit(data.iloc[train_idx], labels[train_idx], sample_weight=weights[train_idx])
+            meta[test_idx, col] = clf.predict_proba(data.iloc[test_idx])[:, 1]
+
+    return pd.DataFrame(meta, index=data.index, columns=[name for name, _ in base_learners])
+def build_meta_model(data_train, labels_train, weights_train, data_test, labels_test):
+    xgb_params = {
+        'colsample_bytree': 0.28738097347081937,
+        'learning_rate': 0.03075865442939569,
+        'max_depth': 3,
+        'n_estimators': 1886,
+        'reg_alpha': 5.74014458426249,
+        'reg_lambda': 9.842761295350742,
+        'subsample': 0.8883894927127294
+    }
+    lgbm_params = {
+        'colsample_bytree': 0.3664782471629243,
+        'learning_rate': 0.0007522341039204546,
+        'max_depth': 14,
+        'n_estimators': 2511,
+        'num_leaves': 20,
+        'reg_alpha': 1e-09,
+        'reg_lambda': 1e-09,
+        'subsample': 0.5112135615785514
+    }
+    cat_params = {
+        'bagging_temperature': 0.41010395885331385,
+        'border_count': 122,
+        'depth': 11,
+        'iterations': 700,
+        'l2_leaf_reg': 6.701809334741078,
+        'learning_rate': 0.002753852651148243
+    }
+    rf_params = {
+        'bootstrap': False,
+        'max_depth': 6,
+        'max_features': 'log2',
+        'min_samples_leaf': 16,
+        'min_samples_split': 11,
+        'n_estimators': 186
+    }
+    ada_params = {
+        'algorithm': 'SAMME',
+        'estimator': DecisionTreeClassifier(max_depth=9),
+        'learning_rate': 0.008132617181090027,
+        'n_estimators': 478
+    }
+    hgb_params = {
+        'l2_regularization': 10.0,
+        'learning_rate': 0.04647501150181916,
+        'max_bins': 50,
+        'max_depth': 4,
+        'max_features': 1e-06,
+        'max_iter': 350,
+        'max_leaf_nodes': 10,
+        'min_samples_leaf': 18
+    }
+
+    estimators = [
+        ('xgb', XGBClassifier(**xgb_params, use_label_encoder=False, eval_metric='auc', random_state=42)),
+        ('lgbm', LGBMClassifier(**lgbm_params, n_jobs=-1, metric='auc', random_state=42)),
+        ('cat', CatBoostClassifier(**cat_params, verbose=False, eval_metric='AUC', random_state=42)),
+        ('rf', RandomForestClassifier(**rf_params, n_jobs=-1, random_state=42)),
+        ('ada', AdaBoostClassifier(**ada_params, random_state=42)),
+        ('hgb', HistGradientBoostingClassifier(**hgb_params, random_state=42))
+    ]
+
+    tscv = TimeSeriesSplit(n_splits=3)
+    meta_data = calculate_meta_features(data_train, labels_train, weights_train, estimators, tscv)
+    mask = ~np.isnan(meta_data).all(axis=1) #drops beginning nan rows
+    meta_data = meta_data.loc[mask]
+    meta_labels_train = np.array(labels_train)[mask]
+    meta_weights_train = np.array(weights_train)[mask]
+
+    lr = LogisticRegression(max_iter=20000)
+    search_space = {
+        'C': Real(1e-4, 1e2, prior='log-uniform'),
+        'penalty': Categorical(['l1', 'l2']),
+        'solver': Categorical(['liblinear',  'saga'])
+    }
+
+    bayes = BayesSearchCV(
+        estimator = lr,
+        search_spaces = search_space,
+        cv = 5,
+        n_iter = 20,
+        scoring = 'roc_auc',
+        n_jobs = -1,
+        verbose = 1,
+        refit = True
+    )
+    bayes.fit(meta_data, meta_labels_train, sample_weight=meta_weights_train)
+
+    print("best params:", bayes.best_params_)
+    print("best CV AUC:", bayes.best_score_)
+    best_stack = bayes.best_estimator_
+
+    for name, clf in estimators:
+        clf.fit(data_train, labels_train, sample_weight=weights_train)
+    meta_test = pd.DataFrame({name: clf.predict_proba(data_test)[:, 1] for name, clf in estimators}, index=data_test.index)
+    y_pred_labels = best_stack.predict(meta_test)
+
+    print("Test Accuracy: ", accuracy_score(labels_test, y_pred_labels))
+    print("Test f1: ", f1_score(labels_test, y_pred_labels))
+
+    return best_stack, y_pred_labels
+
 window_size = 1
 scaler = StandardScaler()
 hmm_features = ['Close', 'BTC-ETH_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
@@ -1152,13 +1316,37 @@ xg_features = ['MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wi
                'Volume-ATR', 'OBV', 'KC_Upper', 'Range', 'VWAP', 'Long_Candle-OBV', 'Body_Size', 'CCI', 'Doji-OBV', 'Fast_%D', 'Label', 'Weights']
 agg_features = ['Closing_Marubozu-OBV_Dev_16', 'Volume_Dev_16', 'Volume_Mean_48', 'Closing_Marubozu-OBV_Dev_4', 'MFV_Mean_16', 'OBV_Dev_16', 'OBV_Dev_96', 'OBV_Dev_48', 'Doji-OBV_Mean_16', 'Price_Diff_Mean_4',
                 'Volume_Dev_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Mean_4', 'OBV_Dev_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'Doji-OBV_Dev_16']
-data = load_and_preprocess_data("BTCUSDC_15m.csv", xg_features)
+#data = load_and_preprocess_data("BTCUSDC_15m.csv", xg_features)
+data = pd.read_csv("BTCUSDC_15m_processed.csv")
 xg_features.extend(['EX_PC2'])
+closes = data['Close'].tolist()
 
-model = load_xgboost("xgboost_pipeline.pkl")
-# data_test = get_historical_data( 1739645100000, 1744825500000)
-# pca_training_df = get_historical_data(1735707600000,  	1738386000000)
-# data_test = load_and_preprocess_data("", False, data=data_test, pca_training_data=pca_training_df)
+xg_features.extend(agg_features)
+data = data[xg_features]
+labels = data.pop('Label').tolist()
+labels = [int(x) for x in labels]
+weights = data.pop('Weights').tolist()
+
+n = len(data)
+cut = int(n * 0.9)
+data_train = data.iloc[:cut]
+labels_train = labels[:cut]
+weights_train = weights[:cut]
+data_test = data.iloc[cut:]
+labels_test = labels[cut:]
+weights_test = weights[cut:]
+closes = closes[cut:]
+
+stack, pred_labels = build_meta_model(data_train, labels_train, weights_train, data_test, labels_test)
+trading_simulation(pred_labels, closes)
+#
+# data_test = get_historical_data(1739645100000, 1744825500000)
+# eth_data_test = get_historical_data(1739645100000, 1744825500000, 'ETHUSDC')
+# data_test = pd.read_csv("BTCUSDC_15m_test.csv")
+# eth_data_test = pd.read_csv("ETHUSDC_15m_test.csv")
+# xg_features.remove('EX_PC2')
+# data_test = load_and_preprocess_data("", xg_features, False, data=data_test, eth_data=eth_data_test)
+# xg_features.extend(['EX_PC2'])
 #
 # xg_data_test = convert_data_to_windows(data_test[xg_features], window_size)
 # data_test = data_test.drop(index=data_test.index[:window_size])
@@ -1168,120 +1356,189 @@ model = load_xgboost("xgboost_pipeline.pkl")
 # xg_data_test.dropna(inplace=True)
 # xg_data_test.drop(['Label'], axis=1, inplace=True)
 # xg_data_test.drop(['Weights'], axis=1, inplace=True)
+# closes = xg_data_test['Close_t0'].tolist()
+# xg_data_test.drop(['Close_t0'], axis=1, inplace=True)
+# labels = model.predict(xg_data_test)
 #
-# walk_forward_trading(model, xg_data_test)
-xg_features.remove('EX_PC2')
-continuous_sim(model, xg_features, agg_features)
+# trading_simulation(labels, closes)
 
-#walk_forward_trading(model, xg_data_test)
+#xg_features.remove('EX_PC2')
+#continuous_sim(model, xg_features, agg_features)
 
+#LGBM hyperparameter tuning
+# lgbm = LGBMClassifier(random_state=42, n_jobs=-1)
+#
+# lgbm_search_space = {
+#     "n_estimators": Integer(100, 3000),
+#     "max_depth": Integer(1, 15),
+#     "learning_rate": Real(1e-4, 0.3, prior="log-uniform"),
+#     "num_leaves": Integer(20, 200),
+#     "subsample": Real(0.5, 1.0),
+#     "colsample_bytree": Real(0.1, 1.0),
+#     "reg_alpha": Real(1e-9, 10.0, prior="log-uniform"),
+#     "reg_lambda": Real(1e-9, 13.0, prior="log-uniform")
+# }
+#
+# lgbm_opt = BayesSearchCV(
+#     estimator = lgbm,
+#     search_spaces = lgbm_search_space,
+#     cv = tscv,
+#     n_iter = 30,
+#     scoring = "roc_auc",
+#     n_jobs = -1,
+#     random_state = 42,
+#     verbose = 1
+# )
+#
+# lgbm_opt.fit(data, labels, sample_weight=weights)
+# print("LGBM best: ", lgbm_opt.best_params_, "auc:", lgbm_opt.best_score_)
+# best_lgbm = lgbm_opt.best_estimator_
 
-# #
-# recent_states = []
-# recent_df_current = pd.DataFrame(columns=recent_df[hmm_features].columns)
-# recent_count = 0
-# for index, row in recent_df[hmm_features].iterrows():
-#     recent_count += 1
-#     recent_df_current = pd.concat([recent_df_current, pd.DataFrame([row.to_dict()])], ignore_index=True)
-#     recent_states.append(predict_states(hmm_model, recent_df_current, hmm_features, scaler)[-1])
-#     #keeps a window of 500 to improve computational efficiency
-#     if recent_count >= 1000:
-#         recent_df_current = recent_df_current.drop(recent_df_current.index[0])
+#Catboost hyperparameter tuning
+#cat = CatBoostClassifier(
+#     random_state=42,
+#     allow_writing_files=False,
+#     task_type='GPU',
+#     devices='0',
+#     verbose=50,
+#     gpu_ram_part=0.9
+# )
 #
-# recent_states = list(zip(*recent_states))
+# cat_search_space = {
+#     "iterations": Integer(100, 2000),
+#     "depth": Integer(3, 12),
+#     "learning_rate": Real(1e-4, 0.3, prior="log-uniform"),
+#     "l2_leaf_reg": Real(0.001, 10.0),
+#     "bagging_temperature": Real(0.0, 1.0),
+#     "border_count": Integer(32, 155)
+# }
 #
-# for i in range(hmm_comps):
-#     xg_features.append(f'State{i}')
-#     recent_df[f'State{i}'] = recent_states[i]
+# cat_opt = BayesSearchCV(
+#     estimator = cat,
+#     search_spaces = cat_search_space,
+#     cv = tscv,
+#     n_iter = 10,
+#     scoring = "roc_auc",
+#     n_jobs = 1,
+#     random_state = 42,
+#     verbose = 1,
+#     refit=False
+# )
 #
-# #Need this to make recent_df compatible with convert_data_to_windows method
-# recent_df['Label'] = 0
-# print(recent_df['Close'])
-# recent_df['Weights'] = 0
-# recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+# cat_opt.fit(
+#     data,
+#     labels,
+#     sample_weight=weights
+# )
 #
-# recent_df = recent_df.drop(index=recent_df.index[:window_size])
-# recent_df = recent_df.reset_index(drop=True)
-# recent_df_windowed = recent_df_windowed.reset_index(drop=True)
-# recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
-# xg_labels_test = recent_df['Label'].tolist()
-# print(recent_df[['Label', 'Close_t-1']])
-# recent_df.drop(['Label'], axis=1, inplace=True)
-# recent_df.drop(['Weights'], axis=1, inplace=True)
-#
-# xg_labels_pred = xgboost_model.predict(recent_df)
-# xg_labels_pred = xg_labels_pred.tolist()
-# recent_df['Pred_Label'] = xg_labels_pred
-#
-# count0 = 0
-# count1 = 0
-# for i in range(len(xg_labels_pred)):
-#     if xg_labels_pred[i] == 0 and xg_labels_test[i] == 0:
-#         count0 += 1
-#     if xg_labels_pred[i] == 1 and xg_labels_test[i] == 1:
-#         count1 += 1
-#
-# accuracy0 = count0 / xg_labels_test.count(0)
-# accuracy1 = count1 / xg_labels_test.count(1)
-# ratio0 = xg_labels_test.count(0) / len(xg_labels_test)
-# ratio1 = xg_labels_test.count(1) / len(xg_labels_test)
-# predratio0 = xg_labels_test.count(0) / xg_labels_pred.count(0)
-# predratio1 = xg_labels_test.count(1) / xg_labels_pred.count(1)
-# print(f"Accuracy of sells: {accuracy0}")
-# print(f"Accuracy of buys: {accuracy1}")
-# print(f"Combined accuracy: {accuracy0 + accuracy1}")
-# print(f"Ratio of sells: {ratio0}")
-# print(f"Ratio of buys: {ratio1}")
-# print(f"Ratio of real 0 labels to predicted 0 labels: {predratio0}")
-# print(f"Ratio of real 1 labels to predicted 1 labels: {predratio1}")
-# print(xg_labels_test.count(0))
-# print(xg_labels_pred.count(0))
-# print(xg_labels_test.count(1))
-# print(xg_labels_pred.count(1))
+# print("CatBoost best: ", cat_opt.best_params_, "auc:", cat_opt.best_score_)
 
+#Random forest hyperparameter tuning
+# rf = RandomForestClassifier(
+#     random_state=42,
+#     n_jobs=-1,
+#     class_weight=None,
+#     verbose=1
+# )
 #
-# probabilities = xgboost_model.predict_proba(recent_df).tolist()
-# probability_0 = []
-# probability_1 = []
-# for probability in probabilities:
-#     probability_0.append(probability[0])
-#     probability_1.append(probability[1])
+# rf_search_space = {
+#     "n_estimators":       Integer(100, 1000),
+#     "max_depth":          Integer(3, 20),
+#     "max_features":       Categorical(["sqrt", "log2", None]),
+#     "min_samples_split":  Integer(2, 20),
+#     "min_samples_leaf":   Integer(1, 20),
+#     "bootstrap":          Categorical([True, False])
+# }
 #
-# labels = xgboost_model.predict(recent_df)
-# for i in range(len(labels)):
-#     print(f"label: {labels[i]}, price: {closes[i]}")
+# rf_opt = BayesSearchCV(
+#     estimator = rf,
+#     search_spaces = rf_search_space,
+#     cv = tscv,
+#     n_iter = 5,
+#     scoring = "roc_auc",
+#     n_jobs = -1,
+#     random_state = 42,
+#     verbose = 1,
+#     refit = False
+# )
 #
-# print(f"percentile of sells: {np.percentile(probability_0, 53)}")
-# print(f"percentile of buys: {np.percentile(probability_1, 53)}")
-# closes = recent_df['Close_t-1'].tolist()
-# print(recent_df[['Pred_Label', 'Close_t-1']])
-# trading_simulation(xg_labels_pred, closes, starting_money=1500, spend_percentage=1)
-# notify()
-#while True:
-#     start_time = time.time()
+# rf_opt.fit(
+#     data,
+#     labels,
+#     sample_weight = weights
+# )
 #
-#     recent_df = calculate_indicators(recent_df)
-#     recent_df = recent_df.dropna()
-#     recent_df['State'] = predict_states(hmm_model, recent_df, hmm_features, scaler)
+# print("RandomForest best: ", rf_opt.best_params_, "auc:", rf_opt.best_score_)
+
+#Adaboost hyperparameter tuning
+# ada = AdaBoostClassifier(
+#     random_state=42
+# )
 #
-#     #Need this to make recent_df compatible with convert_data_to_windows method
-#     recent_df['Label'] = 0
-#     recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+# ada_search_space = {
+#     "n_estimators":    Integer(50, 500),
+#     "learning_rate":   Real(1e-3, 1.0, prior="log-uniform"),
+#     "algorithm":       Categorical(["SAMME.R", "SAMME"]),
+#     "estimator": Categorical([
+#         DecisionTreeClassifier(max_depth=1),
+#         DecisionTreeClassifier(max_depth=3),
+#         DecisionTreeClassifier(max_depth=5),
+#         DecisionTreeClassifier(max_depth=7),
+#         DecisionTreeClassifier(max_depth=9)
+#     ]),
+# }
 #
-#     recent_df = recent_df.drop(index=recent_df.index[:window_size])
-#     recent_df = recent_df.reset_index(drop=True)
-#     recent_df_windowed = recent_df_windowed.reset_index(drop=True)
-#     recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
-#     print(recent_df)
-#     recent_df.drop(['Label'], axis=1, inplace=True)
+# ada_opt = BayesSearchCV(
+#     estimator     = ada,
+#     search_spaces = ada_search_space,
+#     cv            = tscv,
+#     n_iter        = 3,
+#     scoring       = "roc_auc",
+#     n_jobs        = -1,
+#     random_state  = 42,
+#     verbose       = 1,
+#     refit         = False
+# )
 #
-#     labels_recent_pred = xgboost_model.predict(recent_df)
-#     labels_recent_pred = labels_recent_pred.tolist()
-#     recent_df['Label'] = labels_recent_pred
-#     recent_df['PriceDiff'] = recent_df['Close_t-1'].diff()
+# ada_opt.fit(
+#     data,
+#     labels,
+#     sample_weight = weights
+# )
 #
-#     trading_df = recent_df[['Close_t-1', 'Label']]
-#     print(trading_df)
+# print("AdaBoost best: ", ada_opt.best_params_, "auc:", ada_opt.best_score_)
+
+#HistGradientBoosting hyperparameter tuning
+# tscv = TimeSeriesSplit(n_splits=3)
+# hgb = HistGradientBoostingClassifier(random_state=42, verbose=1)
 #
-#     time.sleep(180)
-#     recent_df = get_historical_data(54)
+# hgb_search_space = {
+#     "learning_rate":     Real(1e-3, 1.0,    prior="log-uniform"),
+#     "max_iter":          Integer(50,  3000),
+#     "max_depth":         Integer(3,   15),
+#     "max_leaf_nodes":    Integer(10, 200),
+#     "max_features":      Real(1e-6, 1, prior="log-uniform"),
+#     "min_samples_leaf":  Integer(1,   20),
+#     "l2_regularization": Real(1e-3, 10.0, prior="log-uniform"),
+#     "max_bins":          Integer(50, 255),
+# }
+#
+# hgb_opt = BayesSearchCV(
+#     estimator     = hgb,
+#     search_spaces = hgb_search_space,
+#     cv            = tscv,
+#     n_iter        = 80,
+#     scoring       = "roc_auc",
+#     n_jobs        = -1,
+#     random_state  = 42,
+#     verbose       = 1,
+#     refit         = False,
+# )
+#
+# hgb_opt.fit(
+#     data,
+#     labels,
+#     sample_weight = weights
+# )
+#
+# print("HistGradientBoosting best →", hgb_opt.best_params_, "auc:", hgb_opt.best_score_)
