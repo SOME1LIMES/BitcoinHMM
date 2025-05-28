@@ -1,9 +1,8 @@
 import pandas as pd
 import numpy as np
-from hmmlearn import hmm
+from hmmlearn.hmm import GaussianHMM
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, HistGradientBoostingClassifier, StackingClassifier
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.tree import DecisionTreeClassifier
 import talib
 from datetime import datetime
@@ -16,7 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import f1_score, accuracy_score
 from xgboost import plot_importance
 from sklearn.model_selection import TimeSeriesSplit
-import pickle
+from sklearn.base import BaseEstimator
 import requests
 from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
 import json
@@ -25,20 +24,30 @@ import urllib.parse
 import hashlib
 import hmac
 import datetime
-import pywt
 import tkinter as tk
 from tkinter import messagebox
 import warnings
 import joblib
 import shap
-from hurst import compute_Hc
 from lightgbm import LGBMClassifier
+import lightgbm as lgb
 from collections import Counter
 from sklearn.calibration import CalibratedClassifierCV
-from catboost import CatBoostClassifier
 from sklearn.linear_model import LogisticRegression
+import sys
+from scipy.special import logsumexp
+import seaborn as sns
+from sklearn.neural_network import MLPClassifier
+from keras.models import Sequential
+from keras.layers import LSTM, Dense, Input
+from keras.optimizers import Adam
+from keras.metrics import AUC
+from keras.initializers import GlorotUniform, Orthogonal
+from tensorflow.keras.regularizers import l2
+import tensorflow as tf
 
 np.random.seed(42)
+tf.random.set_seed(42)
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', 100)
@@ -268,8 +277,8 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
     df['Up_Down_3Gap'] = talib.CDLXSIDEGAP3METHODS(df['Open'], df['High'], df['Low'], df['Close'])
 
     #Fractal Dimension
-    df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
-    df['Fractal_Dimension'] = 2 - df['Hurst']
+    # df['Hurst'] = df['Close'].rolling(window=100).apply(lambda x: compute_Hc(x, kind='price')[0], raw=False)
+    # df['Fractal_Dimension'] = 2 - df['Hurst']
 
     #calculate interaction features
     df['Volume-ATR'] = df['Volume'] / df['ATR']
@@ -513,7 +522,10 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
     training_df = training_df.dropna(axis=1, thresh=len(training_df) - 1452)
     training_df = training_df.fillna(0)
 
-    magnitude_weight = np.log1p(training_df['Price_Diff_Future_Abs'].values)
+    # magnitude_weight = np.log1p(training_df['Price_Diff_Future_Abs'].values)
+    # training_df['Weights'] = magnitude_weight
+    ms = MinMaxScaler(feature_range=(0, 1))
+    training_df['Weights'] = ms.fit_transform(training_df[['Price_Diff_Future_Abs']]) * 1
 
     # labels = training_df['Label'].tolist()
     # counts = Counter(labels)
@@ -521,7 +533,6 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
     # class_mult = {cls: total / (2 * cnt) for cls, cnt in counts.items()}
     # class_weight = np.array([class_mult[label] for label in labels])
 
-    training_df['Weights'] = magnitude_weight
     training_df.drop(['Price_Diff_Future_Abs', 'Price_Diff_Future', 'Timestamp'], axis=1, inplace=True)
     training_df = training_df.copy()
 
@@ -568,13 +579,13 @@ def train_hmm(data, features, scaler, n_components=3):
 
     filepath = "hmm_model.pkl"
     with open("hmm_model.pkl", "wb") as f:
-        pickle.dump(model, f)
+        joblib.dump(model, f)
 
     return filepath
 
 def load_hmm(filepath):
     with open(filepath, "rb") as f:
-        model = pickle.load(f)
+        model = joblib.load(f)
     return model
 
 def predict_states(model, data, features, scaler):
@@ -675,7 +686,7 @@ def train_xgboost(data_train, labels_train, data_eval, labels_eval, weights_trai
     # save the model
     filepath = "xgboost_pipeline.pkl"
     with open(filepath, "wb") as f:
-        pickle.dump(pipe, f)
+        joblib.dump(pipe, f)
 
     return filepath
 
@@ -733,13 +744,13 @@ def train_xgboost(data_train, labels_train, data_eval, labels_eval, weights_trai
 #
 #     filepath = "xgboost_pipeline.pkl"
 #     with open(filepath, "wb") as f:
-#         pickle.dump(model, f)
+#         joblib.dump(model, f)
 #
 #     return filepath
 
 def load_xgboost(filepath):
     with open(filepath, "rb") as f:
-        model = pickle.load(f)
+        model = joblib.load(f)
     return model
 
 def get_binanceus_signature(data, secret):
@@ -861,7 +872,7 @@ def convert_data_to_windows(data, window_size=2):
     # window_data['Label'] = window_data['Label'].shift(1)
     # window_data['Weights'] = window_data['Weights'].shift(1)
 
-def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.1):
+def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5):
     money = starting_money
     bitcoin = 0
     close_prices = closes
@@ -1202,82 +1213,115 @@ def calculate_meta_features(data, labels, weights, base_learners, tscv):
     meta = np.full((n, m), np.nan)
     for col, (name, clf) in enumerate(base_learners):
         for train_idx, test_idx in tscv.split(data):
-            clf.fit(data.iloc[train_idx], labels[train_idx], sample_weight=weights[train_idx])
-            meta[test_idx, col] = clf.predict_proba(data.iloc[test_idx])[:, 1]
+            if name == 'mlp':
+                clf.fit(data.iloc[train_idx], labels[train_idx])
+                meta[test_idx, col] = clf.predict_proba(data.iloc[test_idx])[:, 1]
+            else:
+                clf.fit(data.iloc[train_idx], labels[train_idx], sample_weight=weights[train_idx])
+                meta[test_idx, col] = clf.predict_proba(data.iloc[test_idx])[:, 1]
+
+    lgbm = dict(base_learners)['lgbm']
+    importances = lgbm.feature_importances_
+    feat_names = data.columns
+    feat_imp = pd.Series(importances, index=feat_names)
+    print("Top 50 LGBM features:")
+    print(feat_imp.nlargest(50))
 
     return pd.DataFrame(meta, index=data.index, columns=[name for name, _ in base_learners])
+
+def calculate_lstm_features(data, weights, window, hidden_units, tscv):
+    preds = np.full(len(data), np.nan)
+    features = data.columns.tolist()
+    cols = [c for c in data.columns if c != "Direction"]
+    for train_idx, test_idx in tscv.split(data):
+        train_idx = train_idx[train_idx >= window]
+        test_idx = test_idx[test_idx >= window]
+        train_df = data.iloc[train_idx].reset_index(drop=True)
+        test_df = data.iloc[test_idx].reset_index(drop=True)
+
+        scaler = StandardScaler()
+        scaler.fit(train_df[cols])
+        train_df[cols] = scaler.transform(train_df[cols])
+        test_df[cols] = scaler.transform(test_df[cols])
+
+        X_train, y_train = prep_lstm_data(train_df, features, window, "Direction")
+        X_test, _ = prep_lstm_data(test_df, features, window, "Direction")
+        w_train = np.array(weights)[train_idx]
+        w_train = w_train[window:]
+
+        model = build_lstm(window, len(features), hidden_units)
+        model.fit(X_train, y_train, sample_weight=w_train, epochs=20, batch_size=64, verbose=1, shuffle=False)
+        pred = model.predict(X_test, verbose=1).ravel()
+
+        for i, p in enumerate(pred):
+            orig_i = test_idx[i + window]
+            preds[orig_i] = p
+    return preds
+
+    # lstm_scaler = StandardScaler()
+    # cols = [c for c in data.columns if c != "Direction"] #exclude direction because we don't want to scale labels
+    # data[cols] = lstm_scaler.fit_transform(data[cols])
+
 def build_meta_model(data_train, labels_train, weights_train, data_test, labels_test):
-    xgb_params = {
-        'colsample_bytree': 0.28738097347081937,
-        'learning_rate': 0.03075865442939569,
-        'max_depth': 3,
-        'n_estimators': 1886,
-        'reg_alpha': 5.74014458426249,
-        'reg_lambda': 9.842761295350742,
-        'subsample': 0.8883894927127294
-    }
     lgbm_params = {
-        'colsample_bytree': 0.3664782471629243,
-        'learning_rate': 0.0007522341039204546,
-        'max_depth': 14,
-        'n_estimators': 2511,
+        'boosting_type': 'gbdt',
+        'colsample_bytree': 0.1,
+        'learning_rate': 0.003093443570013053,
+        'max_depth': 15,
+        'n_estimators': 1239,
         'num_leaves': 20,
-        'reg_alpha': 1e-09,
-        'reg_lambda': 1e-09,
-        'subsample': 0.5112135615785514
+        'reg_alpha': 2.8867915528468985e-08,
+        'reg_lambda': 11.404719722698687,
+        'subsample': 0.5443075312616172,
+        'min_child_samples': 5,
+        'min_split_gain': 0.0,
+        'scale_pos_weight': 1.1992235739783454,
+        'subsample_freq': 10
     }
-    cat_params = {
-        'bagging_temperature': 0.41010395885331385,
-        'border_count': 122,
-        'depth': 11,
-        'iterations': 700,
-        'l2_leaf_reg': 6.701809334741078,
-        'learning_rate': 0.002753852651148243
-    }
-    rf_params = {
-        'bootstrap': False,
-        'max_depth': 6,
-        'max_features': 'log2',
-        'min_samples_leaf': 16,
-        'min_samples_split': 11,
-        'n_estimators': 186
-    }
-    ada_params = {
-        'algorithm': 'SAMME',
-        'estimator': DecisionTreeClassifier(max_depth=9),
-        'learning_rate': 0.008132617181090027,
-        'n_estimators': 478
-    }
-    hgb_params = {
-        'l2_regularization': 10.0,
-        'learning_rate': 0.04647501150181916,
-        'max_bins': 50,
-        'max_depth': 4,
-        'max_features': 1e-06,
-        'max_iter': 350,
-        'max_leaf_nodes': 10,
-        'min_samples_leaf': 18
+    mlp_params = {
+        'activation': 'logistic',
+        'alpha': 1e-05,
+        'batch_size': 32,
+        'early_stopping': False,
+        'hidden_layer_sizes': 1024,
+        'learning_rate': 'adaptive',
+        'learning_rate_init': 0.00010155102758866622,
+        'max_iter': 2000,
+        'solver': 'adam'
     }
 
+    lstm_data_train = data_train.copy()
+    lstm_data_test = data_test.copy()
+    data_train.pop("Direction")
+    data_test.pop("Direction")
+    lstm_window = 25
+    lstm_hidden_units = 64
+    lstm_features = lstm_data_train.columns.tolist()
     estimators = [
-        ('xgb', XGBClassifier(**xgb_params, use_label_encoder=False, eval_metric='auc', random_state=42)),
         ('lgbm', LGBMClassifier(**lgbm_params, n_jobs=-1, metric='auc', random_state=42)),
-        ('cat', CatBoostClassifier(**cat_params, verbose=False, eval_metric='AUC', random_state=42)),
-        ('rf', RandomForestClassifier(**rf_params, n_jobs=-1, random_state=42)),
-        ('ada', AdaBoostClassifier(**ada_params, random_state=42)),
-        ('hgb', HistGradientBoostingClassifier(**hgb_params, random_state=42))
+        #('mlp', MLPClassifier(**mlp_params, random_state=42))
     ]
 
     tscv = TimeSeriesSplit(n_splits=3)
     meta_data = calculate_meta_features(data_train, labels_train, weights_train, estimators, tscv)
     mask = ~np.isnan(meta_data).all(axis=1) #drops beginning nan rows
-    meta_data = meta_data.loc[mask]
+    meta_data = meta_data.loc[mask].reset_index(drop=True)
     meta_labels_train = np.array(labels_train)[mask]
     meta_weights_train = np.array(weights_train)[mask]
 
+    lstm_data = calculate_lstm_features(lstm_data_train, weights_train, lstm_window, lstm_hidden_units, tscv)
+    lstm_data = lstm_data[mask]
+    lstm_data = np.nan_to_num(lstm_data, nan=0.5)
+    meta_data['LSTM'] = lstm_data
+
+    corr = meta_data.corr()
+    sns.heatmap(corr, annot=True, fmt=".2f")
+    plt.title("Meta-feature Correlation")
+    plt.show()
+
     lr = LogisticRegression(max_iter=20000)
     search_space = {
-        'C': Real(1e-4, 1e2, prior='log-uniform'),
+        'C': Real(1e-4, 1000, prior='log-uniform'),
         'penalty': Categorical(['l1', 'l2']),
         'solver': Categorical(['liblinear',  'saga'])
     }
@@ -1286,11 +1330,12 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
         estimator = lr,
         search_spaces = search_space,
         cv = 5,
-        n_iter = 20,
-        scoring = 'roc_auc',
+        n_iter = 30,
+        scoring = 'balanced_accuracy',
         n_jobs = -1,
         verbose = 1,
-        refit = True
+        refit = True,
+        random_state=42
     )
     bayes.fit(meta_data, meta_labels_train, sample_weight=meta_weights_train)
 
@@ -1298,92 +1343,309 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     print("best CV AUC:", bayes.best_score_)
     best_stack = bayes.best_estimator_
 
+    cols = [c for c in lstm_features if c != "Direction"] #again, don't want to scale 0s and 1s
+    lstm_scaler = StandardScaler()
+    lstm_scaler.fit(lstm_data_train[cols])
+    scaled_lstm_train = pd.DataFrame()
+    scaled_lstm_train[cols] = lstm_scaler.transform(lstm_data_train[cols])
+    scaled_lstm_train['Direction'] = lstm_data_train['Direction']
+    X_train, y_train = prep_lstm_data(scaled_lstm_train, lstm_features, lstm_window, 'Direction')
+    w = np.array(weights_train[lstm_window:], dtype=np.float32)
+    lstm = build_lstm(lstm_window, len(lstm_features), hidden_units=64)
+    lstm.fit(X_train, y_train, epochs=20, batch_size=64, verbose=1, sample_weight=w, shuffle=False)
+
+    lstm_data_test = lstm_data_test.reset_index(drop=True)
+    scaled_lstm_test = pd.DataFrame()
+    scaled_lstm_test[cols] = lstm_scaler.transform(lstm_data_test[cols])
+    scaled_lstm_test['Direction'] = lstm_data_test['Direction']
+    X_test, y_test = prep_lstm_data(scaled_lstm_test, lstm_features, lstm_window, 'Direction')
+    lstm_preds = lstm.predict(X_test, verbose=1).ravel()
+    y_pred_labels = (lstm_preds > 0.5).astype(int)
+    acc = accuracy_score(y_test, y_pred_labels)
+    print("Accuracy:", acc)
+
     for name, clf in estimators:
-        clf.fit(data_train, labels_train, sample_weight=weights_train)
+        if name == 'mlp':
+            clf.fit(data_train, labels_train)
+        else:
+            clf.fit(data_train, labels_train, sample_weight=weights_train)
     meta_test = pd.DataFrame({name: clf.predict_proba(data_test)[:, 1] for name, clf in estimators}, index=data_test.index)
+    lstm_preds = pd.Series(lstm_preds, index=data_test.index[lstm_window:])
+    meta_test['LSTM'] = lstm_preds
+    meta_test['LSTM'].fillna(0.5, inplace=True)
     y_pred_labels = best_stack.predict(meta_test)
+    print(best_stack.predict_proba(meta_test))
 
     print("Test Accuracy: ", accuracy_score(labels_test, y_pred_labels))
     print("Test f1: ", f1_score(labels_test, y_pred_labels))
 
     return best_stack, y_pred_labels
 
-window_size = 1
-scaler = StandardScaler()
-hmm_features = ['Close', 'BTC-ETH_Diff', 'Price_Diff', 'Returns', 'Volatility', 'Don_Signal', 'RSI', 'Upper_Wick_Ratio', 'Volume_Change', 'Body_Ratio', 'Lower_Wick_Ratio', 'Upper_Wick', 'Body_Size', 'VWAP', 'Lower_Wick', 'Fast_%K',
-                'Volume-ATR', 'CCI', 'Volume', 'BB-KC', 'Range', 'MACDHist', 'MACDSignal', 'MACD', 'Stochastic-RSI', 'RSI_Mean_4', 'Chikou_Span_Dev_48', 'Chikou_Span_Drawdown_4', 'KC_Upper_Drawdown_4']
-xg_features = ['MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'RSI_PC1', 'Closing_Marubozu-OBV', 'Doji-RSI', 'RSI_PC2', 'Closing_Marubozu', 'Short_Candle-RSI', 'Lower_Wick', 'Volume',
+class HMMEstimator(BaseEstimator): #sklearn wrapper for hmm so I can run bayes search
+    def __init__(self, n_components=3, covariance_type="full", n_iter=100, random_state=42, min_covar=1e-3):
+        self.n_components = n_components
+        self.covariance_type = covariance_type
+        self.n_iter = n_iter
+        self.random_state = random_state
+        self.min_covar = min_covar
+
+    def fit(self, X, y=None):
+        self._failed = False
+        self.model_ = GaussianHMM(n_components=self.n_components, covariance_type=self.covariance_type, n_iter=self.n_iter, random_state=self.random_state, min_covar=self.min_covar)
+        try:
+            self.model_.fit(X)
+        except (ValueError, np.linalg.LinAlgError): #In case covariance fails
+            self._failed = True
+        return self
+
+    def score(self, X, y=None):
+        if self._failed == True:
+            return -1e10 #return a terrible log-likelihood in case of value error
+        try:
+            return self.model_.score(X) / X.shape[0]
+        except (ValueError, np.linalg.LinAlgError):
+            return -1e10
+
+    def predict(self, X):
+        if self._failed == True:
+            raise RuntimeError("HMM didn’t fit properly; cannot predict")
+        return self.model_.predict(X)
+
+def hmm_log_likelihood(estimator, X, y=None): #wrapper for scoring estimator
+    return estimator.score(X)
+
+def hmm_walk_forward(model, X):
+    log_emlik = model._compute_log_likelihood(X)
+    log_pi = np.log(model.startprob_)
+    log_A = np.log(model.transmat_)
+    n, K = log_emlik.shape
+    log_alpha = np.zeros((n, K))
+    log_alpha[0] = log_pi + log_emlik[0]
+
+    for t in range(1, n):
+        log_alpha[t] = log_emlik[t] + logsumexp(log_alpha[t - 1][:, None] + log_A, axis=0)
+
+    log_norm = logsumexp(log_alpha, axis=1, keepdims=True)
+    log_post = log_alpha - log_norm
+    posteriors = np.exp(log_post)
+    states = posteriors.argmax(axis=1)
+
+    cols = [f"state_{k}_proba" for k in range(K)]
+    df = pd.DataFrame(posteriors, columns=cols, index=range(n))
+    df["state"] = states
+    return df
+
+def prep_lstm_data(data, features, window, target):
+    sub = data[features + [target]].to_numpy(dtype=np.float32)
+    n_samples, n_cols = sub.shape
+    n_feats = len(features)
+    n_seq = n_samples - window
+    X = np.zeros((n_seq, window, n_feats), dtype=np.float32)
+    y = np.zeros((n_seq,), dtype=np.float32)
+    for i in range(n_seq):
+        X[i] = sub[i: i + window, :n_feats]
+        y[i] = sub[i + window, n_feats]
+    return X, y
+
+def build_lstm(timesteps, n_feats, hidden_units=32):
+    m = Sequential([
+        Input(shape=(timesteps, n_feats)),
+        LSTM(hidden_units, kernel_initializer=GlorotUniform(seed=42), recurrent_initializer=Orthogonal(seed=42), kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4), dropout=0.2, recurrent_dropout=0.2, return_sequences=False),
+        Dense(1, activation="sigmoid", kernel_regularizer=l2(1e-4)),
+    ])
+    m.compile(optimizer=Adam(1e-3), loss="binary_crossentropy", metrics=["accuracy", AUC(name="auc")])
+    return m
+
+hmm_scaler = StandardScaler()
+hmm_features = ['RSI_PC2', 'MFV', 'OBV', 'VWAP', 'Range', 'Volume-ATR']
+meta_features = ['Direction', 'MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'RSI_PC1', 'Closing_Marubozu-OBV', 'Doji-RSI', 'RSI_PC2', 'Closing_Marubozu', 'Short_Candle-RSI', 'Lower_Wick', 'Volume',
                'Volume-ATR', 'OBV', 'KC_Upper', 'Range', 'VWAP', 'Long_Candle-OBV', 'Body_Size', 'CCI', 'Doji-OBV', 'Fast_%D', 'Label', 'Weights']
 agg_features = ['Closing_Marubozu-OBV_Dev_16', 'Volume_Dev_16', 'Volume_Mean_48', 'Closing_Marubozu-OBV_Dev_4', 'MFV_Mean_16', 'OBV_Dev_16', 'OBV_Dev_96', 'OBV_Dev_48', 'Doji-OBV_Mean_16', 'Price_Diff_Mean_4',
                 'Volume_Dev_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Mean_4', 'OBV_Dev_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'Doji-OBV_Dev_16']
-#data = load_and_preprocess_data("BTCUSDC_15m.csv", xg_features)
+#data = load_and_preprocess_data("BTCUSDC_15m.csv", meta_features)
 data = pd.read_csv("BTCUSDC_15m_processed.csv")
-xg_features.extend(['EX_PC2'])
+data['Direction'] = (data['Returns'] > 0).astype(int)
 closes = data['Close'].tolist()
 
-xg_features.extend(agg_features)
-data = data[xg_features]
 labels = data.pop('Label').tolist()
 labels = [int(x) for x in labels]
 weights = data.pop('Weights').tolist()
+meta_features.remove('Label')
+meta_features.remove('Weights')
 
 n = len(data)
+cut = int(n * 0.2)
+hmm_train = data.iloc[:cut]
+meta_train = data.iloc[cut:]
+meta_labels = labels[cut:]
+meta_weights = weights[cut:]
+closes = closes[cut:]
+
+hmm_scaled = hmm_scaler.fit_transform(hmm_train[hmm_features].values)
+# hmm = GaussianHMM(n_components=15, covariance_type="full", n_iter=131, min_covar=0.034885114865499216, random_state=42)
+# hmm.fit(hmm_scaled)
+# joblib.dump(hmm, 'trained_hmm.pkl')
+hmm = joblib.load('trained_hmm.pkl')
+
+meta_hmm = hmm_scaler.transform(meta_train[hmm_features].values)
+hmm_df = hmm_walk_forward(hmm, meta_hmm)
+
+meta_features.extend(['EX_PC2'])
+meta_features.extend(agg_features)
+meta_train = meta_train[meta_features]
+
+hmm_df = hmm_df.reset_index(drop=True)
+meta_train = meta_train.reset_index(drop=True)
+meta_train = pd.concat([meta_train, hmm_df], axis=1)
+meta_train.drop(['state_2_proba', 'state_5_proba', 'state_6_proba', 'state_10_proba', 'state_11_proba', 'state_14_proba', 'state_0_proba'], axis=1, inplace=True)
+#drop useless (mostly useless) hmm features
+
+n = len(meta_train)
 cut = int(n * 0.9)
-data_train = data.iloc[:cut]
-labels_train = labels[:cut]
-weights_train = weights[:cut]
-data_test = data.iloc[cut:]
-labels_test = labels[cut:]
-weights_test = weights[cut:]
+data_train = meta_train.iloc[:cut]
+labels_train = meta_labels[:cut]
+weights_train = meta_weights[:cut]
+data_test = meta_train.iloc[cut:]
+labels_test = meta_labels[cut:]
+weights_test = meta_weights[cut:]
 closes = closes[cut:]
 
 stack, pred_labels = build_meta_model(data_train, labels_train, weights_train, data_test, labels_test)
 trading_simulation(pred_labels, closes)
-#
-# data_test = get_historical_data(1739645100000, 1744825500000)
-# eth_data_test = get_historical_data(1739645100000, 1744825500000, 'ETHUSDC')
-# data_test = pd.read_csv("BTCUSDC_15m_test.csv")
-# eth_data_test = pd.read_csv("ETHUSDC_15m_test.csv")
-# xg_features.remove('EX_PC2')
-# data_test = load_and_preprocess_data("", xg_features, False, data=data_test, eth_data=eth_data_test)
-# xg_features.extend(['EX_PC2'])
-#
-# xg_data_test = convert_data_to_windows(data_test[xg_features], window_size)
-# data_test = data_test.drop(index=data_test.index[:window_size])
-# xg_data_test = xg_data_test.reset_index(drop=True)
-# data_test = data_test.reset_index(drop=True)
-# xg_data_test = pd.concat([xg_data_test, data_test[agg_features]], axis=1)
-# xg_data_test.dropna(inplace=True)
-# xg_data_test.drop(['Label'], axis=1, inplace=True)
-# xg_data_test.drop(['Weights'], axis=1, inplace=True)
-# closes = xg_data_test['Close_t0'].tolist()
-# xg_data_test.drop(['Close_t0'], axis=1, inplace=True)
-# labels = model.predict(xg_data_test)
-#
-# trading_simulation(labels, closes)
 
-#xg_features.remove('EX_PC2')
-#continuous_sim(model, xg_features, agg_features)
+#mlp hyperparameter tuning
+# tscv = TimeSeriesSplit(n_splits=5)
+# mlp = MLPClassifier(random_state=42)
+# mlp_search_space = {
+#     "hidden_layer_sizes": Categorical([64, 128, 256, 512, 1024]),
+#     "activation": Categorical(["relu", "tanh", "logistic"]),
+#     "solver": Categorical(["adam", "sgd"]),
+#     "alpha": Real(1e-5, 1e-1, prior="log-uniform"),
+#     "learning_rate_init": Real(1e-4, 1e-1, prior="log-uniform"),
+#     "learning_rate": Categorical(["constant", "invscaling", "adaptive"]),
+#     "batch_size": Integer(32, 256),
+#     "max_iter": Integer(200, 2000),
+#     "early_stopping": Categorical([True, False])
+# }
+#
+# mlp_opt = BayesSearchCV(
+#     estimator = mlp,
+#     search_spaces = mlp_search_space,
+#     cv = tscv,
+#     n_iter = 30,
+#     scoring = "roc_auc",
+#     n_jobs = -1,
+#     random_state = 42,
+#     verbose = 1,
+#     refit = False
+# )
+#
+# mlp_opt.fit(meta_train, meta_labels)
+# print("MLP best: ", mlp_opt.best_params_, "auc:", mlp_opt.best_score_)
+#ADAboost hyperparameter tuning
+# tscv = TimeSeriesSplit(n_splits=5)
+# ada = AdaBoostClassifier(random_state=42, estimator=DecisionTreeClassifier())
+#
+# ada_search_space = {
+#     "n_estimators": Integer(50, 750),
+#     "learning_rate": Real(1e-3, 1.0, prior="log-uniform"),
+#     "algorithm": Categorical(["SAMME.R", "SAMME"]),
+#     "estimator__criterion": Categorical(["gini", "entropy"]),
+#     "estimator__max_depth": Integer(1, 3),
+#     "estimator__min_samples_split": Integer(2, 50),
+#     "estimator__min_samples_leaf": Integer(1, 20),
+#     "estimator__max_features": Categorical(["sqrt", "log2", None]),
+#     "estimator__max_leaf_nodes": Integer(10, 100, prior="log-uniform"),
+#     "estimator__class_weight": Categorical([None, "balanced"])
+# }
+#
+# ada_opt = BayesSearchCV(
+#     estimator = ada,
+#     search_spaces = ada_search_space,
+#     cv = tscv,
+#     n_iter = 30,
+#     scoring = "roc_auc",
+#     n_jobs = -1,
+#     random_state = 42,
+#     verbose = 1,
+#     refit = False,
+#     error_score = 0
+# )
+#
+# ada_opt.fit(
+#     data,
+#     labels,
+#     sample_weight = weights
+# )
+#
+# print("AdaBoost best: ", ada_opt.best_params_, "auc:", ada_opt.best_score_)
+#HMM hyperparameter tuning
+# X = data[hmm_features].values
+# X_scaled = scaler.fit_transform(X)
+# tscv = TimeSeriesSplit(n_splits=5)
+# hmm = HMMEstimator()
+#
+# hmm_search_space = {
+#     "n_components": Integer(2, 20),
+#     "covariance_type": Categorical(["full", "diag", "tied", "spherical"]),
+#     "n_iter": Integer(5, 500),
+#     "min_covar": Real(1e-8, 1, prior="log-uniform")
+# }
+#
+# hmm_opt = BayesSearchCV(
+#     estimator = hmm,
+#     search_spaces = hmm_search_space,
+#     cv = tscv,
+#     n_iter = 30,
+#     scoring = hmm_log_likelihood,
+#     n_jobs = -1,
+#     random_state = 42,
+#     verbose = 1
+# )
+#
+# hmm_opt.fit(X_scaled)
+# print("HMM best →", hmm_opt.best_params_, "avg-loglike:", hmm_opt.best_score_)
 
 #LGBM hyperparameter tuning
-# lgbm = LGBMClassifier(random_state=42, n_jobs=-1)
+# tscv = TimeSeriesSplit(n_splits=5)
+# lgbm = LGBMClassifier(random_state=42, num_threads=4, device='gpu', gpu_device_id=0, metric='auc')
 #
-# lgbm_search_space = {
-#     "n_estimators": Integer(100, 3000),
-#     "max_depth": Integer(1, 15),
-#     "learning_rate": Real(1e-4, 0.3, prior="log-uniform"),
-#     "num_leaves": Integer(20, 200),
-#     "subsample": Real(0.5, 1.0),
-#     "colsample_bytree": Real(0.1, 1.0),
-#     "reg_alpha": Real(1e-9, 10.0, prior="log-uniform"),
-#     "reg_lambda": Real(1e-9, 13.0, prior="log-uniform")
-# }
+# lgbm_search_space = [
+#     {
+#         "n_estimators": Integer(100, 3000),
+#         "max_depth": Integer(1, 15),
+#         "learning_rate": Real(1e-4, 0.3, prior="log-uniform"),
+#         "num_leaves": Integer(20, 200),
+#         "subsample": Real(0.5, 1.0),
+#         "colsample_bytree": Real(0.1, 1.0),
+#         "reg_alpha": Real(1e-9, 10.0, prior="log-uniform"),
+#         "reg_lambda": Real(1e-9, 13.0, prior="log-uniform"),
+#         "min_child_samples": Integer(5, 200),
+#         "min_split_gain": Real(0.0, 1.0),
+#         "subsample_freq": Integer(0, 10),
+#         "scale_pos_weight": Real(0.1, 10.0, prior="log-uniform"),
+#         "boosting_type": Categorical(["gbdt", "dart"])
+#     },
+#     {
+#         "n_estimators": Integer(100, 3000),
+#         "max_depth": Integer(1, 15),
+#         "learning_rate": Real(1e-4, 0.3, prior="log-uniform"),
+#         "num_leaves": Integer(20, 200),
+#         "colsample_bytree": Real(0.1, 1.0),
+#         "reg_alpha": Real(1e-9, 10.0, prior="log-uniform"),
+#         "reg_lambda": Real(1e-9, 13.0, prior="log-uniform"),
+#         "min_child_samples": Integer(5, 200),
+#         "min_split_gain": Real(0.0, 1.0),
+#         "scale_pos_weight": Real(0.1, 10.0, prior="log-uniform"),
+#         "boosting_type": Categorical(["goss"])
+#     }
+# ]
 #
 # lgbm_opt = BayesSearchCV(
 #     estimator = lgbm,
 #     search_spaces = lgbm_search_space,
 #     cv = tscv,
-#     n_iter = 30,
+#     n_iter = 100,
 #     scoring = "roc_auc",
 #     n_jobs = -1,
 #     random_state = 42,
