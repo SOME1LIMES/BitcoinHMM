@@ -15,7 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import f1_score, accuracy_score, make_scorer, roc_auc_score
 from xgboost import plot_importance
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn_genetic import GAFeatureSelectionCV
 import requests
 from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
@@ -31,6 +31,7 @@ import warnings
 import joblib
 import shap
 from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 import lightgbm as lgb
 from collections import Counter
 from sklearn.calibration import CalibratedClassifierCV
@@ -48,7 +49,7 @@ from keras.regularizers import l2
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
 from keras import backend
 import keras_tuner as kt
-from tcn import TCN
+from arch import arch_model
 import tensorflow as tf
 import random
 import os
@@ -931,38 +932,7 @@ def calculate_lstm_features(data, weights, window, hidden_units, dropout, tscv):
             preds[orig_i] = p
     return preds
 
-def calculate_tcn_features(data, weights, window, tscv):
-    preds = np.full(len(data), np.nan)
-    features = data.columns.tolist()
-    cols = [c for c in data.columns if c != "Direction"]
-    for train_idx, test_idx in tscv.split(data):
-        train_idx = train_idx[train_idx >= window]
-        test_idx = test_idx[test_idx >= window]
-        train_df = data.iloc[train_idx].reset_index(drop=True)
-        test_df = data.iloc[test_idx].reset_index(drop=True)
-
-        scaler = RobustScaler()
-        scaler.fit(train_df[cols])
-        train_df[cols] = scaler.transform(train_df[cols])
-        test_df[cols] = scaler.transform(test_df[cols])
-
-        X_train, y_train = prep_lstm_data(train_df, features, window, "Direction")
-        X_test, _ = prep_lstm_data(test_df, features, window, "Direction")
-        w_train = np.array(weights)[train_idx]
-        w_train = w_train[window:]
-
-        es = EarlyStopping(monitor="val_auc", patience=10, restore_best_weights=True, mode="max")
-        rlrop = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, mode="min", min_lr=1e-6)
-        model = build_tcn(window, len(features))
-        model.fit(X_train, y_train, sample_weight=w_train, epochs=30, batch_size=64, verbose=1, shuffle=False, validation_split=0.1, callbacks=[es, rlrop])
-        pred = model.predict(X_test, verbose=1).ravel()
-
-        for i, p in enumerate(pred):
-            orig_i = test_idx[i + window]
-            preds[orig_i] = p
-    return preds
-
-def build_meta_model(data_train, labels_train, weights_train, data_test, labels_test, lstm_data_train, lstm_data_test):
+def build_meta_model(data_train, labels_train, weights_train, data_test, labels_test, lstm_data_train, lstm_data_test, closes_test):
     lgbm_params = {
         'boosting_type': 'gbdt',
         'colsample_bytree': 0.1,
@@ -999,15 +969,10 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     lstm_data = np.nan_to_num(lstm_data, nan=0.5)
     meta_data['LSTM'] = lstm_data
 
-    tcn_data = calculate_tcn_features(lstm_data_train, weights_train, lstm_window, tscv)
-    tcn_data = tcn_data[mask]
-    tcn_data = np.nan_to_num(tcn_data, nan=0.5)
-    meta_data['TCN'] = tcn_data
-
-    corr = meta_data.corr()
-    sns.heatmap(corr, annot=True, fmt=".2f")
-    plt.title("Meta-feature Correlation")
-    plt.show()
+    # corr = meta_data.corr()
+    # sns.heatmap(corr, annot=True, fmt=".2f")
+    # plt.title("Meta-feature Correlation")
+    # plt.show()
 
     lr = LogisticRegression(max_iter=20000, random_state=42)
     search_space = {
@@ -1032,6 +997,14 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     print("best CV AUC:", bayes.best_score_)
     best_stack = bayes.best_estimator_
 
+    data_train_masked = data_train.loc[mask].reset_index(drop=True)
+    probas = best_stack.predict_proba(meta_data)[:, 1]
+    X_reliability = data_train_masked.copy()
+    X_reliability['probas'] = probas
+    y_reliab = (best_stack.predict(meta_data) == meta_labels_train).astype(int)
+    reliability_model = LGBMClassifier(**lgbm_params, n_jobs=-1, metric='auc', random_state=42)
+    reliability_model.fit(X_reliability, y_reliab, sample_weight=meta_weights_train)
+
     cols = [c for c in lstm_features if c != "Direction"] #again, don't want to scale 0s and 1s
     lstm_scaler = RobustScaler()
     lstm_scaler.fit(lstm_data_train[cols])
@@ -1045,8 +1018,6 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     rlrop = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, mode="min", min_lr=1e-6)
     lstm = build_stacked_lstm(lstm_window, len(lstm_features), lstm_hidden_units, lstm_dropout)
     lstm.fit(X_train, y_train, epochs=30, batch_size=64, verbose=1, sample_weight=w, shuffle=False, validation_split=0.1, callbacks=[es, rlrop])
-    tcn = build_tcn(lstm_window, len(lstm_features))
-    tcn.fit(X_train, y_train, epochs=30, batch_size=64, verbose=1, sample_weight=w, shuffle=False, validation_split=0.1, callbacks=[es, rlrop])
 
     lstm_data_test = lstm_data_test.reset_index(drop=True)
     scaled_lstm_test = pd.DataFrame()
@@ -1054,7 +1025,6 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     scaled_lstm_test['Direction'] = lstm_data_test['Direction']
     X_test, y_test = prep_lstm_data(scaled_lstm_test, lstm_features, lstm_window, 'Direction')
     lstm_preds = lstm.predict(X_test, verbose=1).ravel()
-    tcn_preds = tcn.predict(X_test, verbose=1).ravel()
 
     bg = X_train[np.random.choice(len(X_train), 100, replace=False)]
     explainer = shap.GradientExplainer(lstm, bg)
@@ -1075,16 +1045,31 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     lstm_preds = pd.Series(lstm_preds, index=data_test.index[lstm_window:])
     meta_test['LSTM'] = lstm_preds
     meta_test['LSTM'].fillna(0.5, inplace=True)
-    tcn_preds = pd.Series(tcn_preds, index=data_test.index[lstm_window:])
-    meta_test['TCN'] = tcn_preds
-    meta_test['TCN'].fillna(0.5, inplace=True)
+
     y_pred_labels = best_stack.predict(meta_test)
-    print(best_stack.predict_proba(meta_test))
+    test_probas = best_stack.predict_proba(meta_test)[:, 1]
+    reliability_test_data = data_test.copy()
+    reliability_test_data['probas'] = test_probas
+    reliability_probs = reliability_model.predict_proba(reliability_test_data)[:, 1]
+    mask = (reliability_probs >= 0.54870).astype(int)
+    filtered_preds = np.where(mask, y_pred_labels, -1)
+    #cutoffs = np.linspace(0.548, 0.55, 101)
+    #masks = [(reliability_probs >= thresh).astype(int) for thresh in cutoffs]
+    #231.25 at 0.55
+    #Best profit 246.09 at threshold 0.54870
+    # profits = []
+    # for thresh, preds in zip(cutoffs, filtered_preds):
+    #     print(f"threshold: {thresh:.2f}")
+    #     profit = trading_simulation(preds, closes_test)
+    #     profits.append((profit, thresh))
+    #
+    # best_profit, best_thresh = max(profits, key=lambda t: t[0])
+    # print(f"Best profit {best_profit:.2f} at threshold {best_thresh:.5f}")
 
-    print("Test Accuracy: ", accuracy_score(labels_test, y_pred_labels))
-    print("Test f1: ", f1_score(labels_test, y_pred_labels))
+    print("Test Accuracy: ", accuracy_score(labels_test, filtered_preds))
+    print("Test f1: ", f1_score(labels_test, filtered_preds))
 
-    return best_stack, y_pred_labels
+    return best_stack, filtered_preds
 
 class HMMEstimator(BaseEstimator): #sklearn wrapper for hmm so I can run bayes search
     def __init__(self, n_components=3, covariance_type="full", n_iter=100, random_state=42, min_covar=1e-3):
@@ -1139,6 +1124,25 @@ def hmm_walk_forward(model, X):
     df = pd.DataFrame(posteriors, columns=cols, index=range(n))
     df["state"] = states
     return df
+
+class ARCHWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, vol='EGARCH', p=1, q=1, dist='ged'):
+        self.vol = vol
+        self.p = p
+        self.q = q
+        self.dist = dist
+
+    def fit(self, X, y=None):
+        self.model_ = arch_model(X[:, 0], vol=self.vol, p=self.p, q=self.q, dist=self.dist)
+        self.res_ = self.model_.fit(disp='off')
+        return self
+
+    def predict(self, X):
+        fore = self.res_.forecast(horizon=1, reindex=False)
+        return fore.variance.values.flatten()
+
+    def score(self, X, y=None):
+        return self.res_.loglikelihood
 
 def prep_lstm_data(data, features, window, target):
     sub = data[features + [target]].to_numpy(dtype=np.float32)
@@ -1197,44 +1201,11 @@ def build_stacked_lstm(timesteps, n_feats,
     m.compile(optimizer='adam', loss='binary_crossentropy', metrics=["accuracy", AUC(name="auc")])
     return m
 
-def build_tcn(timesteps, n_feats):
-    x_in = Input(shape=(timesteps, n_feats))
-    x = GaussianNoise(1e-2)(x_in)
-    x = TCN(nb_filters=224, kernel_size=8, dilations=(1,2,4), dropout_rate=0, return_sequences=False, use_skip_connections=True)(x)
-    y = Dense(1, activation="sigmoid")(x)
-
-    model = Model(x_in, y)
-    model.compile(
-        optimizer=Adam(0.01),
-        loss="binary_crossentropy",
-        metrics=["accuracy", AUC(name="auc")]
-    )
-    return model
-
-def build_tcn_hypermodel(hp):
-    timesteps, n_feats = X_train.shape[1], X_train.shape[2]
-    nb_filters = hp.Int("nb_filters", min_value=16, max_value=256, step=16)
-    kernel_size = hp.Int("kernel_size", min_value=2, max_value=8, step=1)
-    num_levels = hp.Int("num_levels", 2, 6)
-    dilations = [2**i for i in range(num_levels)]
-    dropout_rate = hp.Float("dropout_rate", min_value=0.0, max_value=0.5, step=0.05)
-    lr = hp.Float("learning_rate", 1e-4, 1e-2, sampling="log")
-
-    x_in = Input(shape=(timesteps, n_feats))
-    x = TCN(nb_filters=nb_filters, kernel_size=kernel_size, dilations=dilations, dropout_rate=dropout_rate, return_sequences=False, use_skip_connections=True,)(x_in)
-    y = Dense(1, activation="sigmoid")(x)
-
-    model = Model(x_in, y)
-    model.compile(
-        optimizer=Adam(lr),
-        loss="binary_crossentropy",
-        metrics=["accuracy", AUC(name="auc")]
-    )
-    return model
-
 # Final money:  712.6811369842858
 # Profit:  212.68113698428579
 # Percentage profitable:  0.561430608365019
+# Best params: OrderedDict({'p': 58, 'q': 69}) dist:ged, vol:EGARCH
+# avg-loglike: -109872.64736199903
 hmm_scaler = StandardScaler()
 hmm_features = ['RSI_PC2', 'MFV', 'OBV', 'VWAP', 'Range', 'Volume-ATR']
 # lstm_features = ['MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'RSI_PC1', 'Closing_Marubozu-OBV', 'Doji-RSI', 'RSI_PC2', 'Closing_Marubozu', 'Short_Candle-RSI', 'Lower_Wick', 'Volume',
@@ -1265,6 +1236,16 @@ meta_labels = labels[cut:]
 meta_weights = weights[cut:]
 closes = closes[cut:]
 
+# rets = 1 * np.diff(np.log(closes))
+# am = arch_model(rets, vol='EGARCH', p=1, q=1, dist='ged') #58 69
+# res = am.fit(disp='off')
+# fcasts = res.forecast(start=0, horizon=1, reindex=False)
+# meta_garch_var = fcasts.variance.iloc[0:].values.flatten()
+# meta_garch_var = np.insert(meta_garch_var, 0, 0)
+# meta_train = meta_train.reset_index(drop=True)
+# meta_train['EGARCH'] = meta_garch_var
+# meta_features.append('EGARCH')
+
 hmm_scaled = hmm_scaler.fit_transform(hmm_train[hmm_features].values)
 # hmm = GaussianHMM(n_components=15, covariance_type="full", n_iter=131, min_covar=0.034885114865499216, random_state=42)
 # hmm.fit(hmm_scaled)
@@ -1291,7 +1272,7 @@ labels_test = meta_labels[cut:]
 weights_test = meta_weights[cut:]
 closes_test = closes[cut:]
 
-stack, pred_labels = build_meta_model(data_train[meta_features], labels_train, weights_train, data_test[meta_features], labels_test, data_train[lstm_features], data_test[lstm_features])
+stack, pred_labels = build_meta_model(data_train[meta_features], labels_train, weights_train, data_test[meta_features], labels_test, data_train[lstm_features], data_test[lstm_features], closes_test)
 profit = trading_simulation(pred_labels, closes_test)
 
 #HMM hyperparameter tuning
@@ -1369,4 +1350,21 @@ profit = trading_simulation(pred_labels, closes_test)
 # lgbm_opt.fit(data, labels, sample_weight=weights)
 # print("LGBM best: ", lgbm_opt.best_params_, "auc:", lgbm_opt.best_score_)
 # best_lgbm = lgbm_opt.best_estimator_
-
+#ARCH hyperparameter tuning
+# search_space = {
+#     'p': Integer(1, 200),
+#     'q': Integer(1, 200)
+# }
+#
+# arch_bayes = BayesSearchCV(
+#     estimator=ARCHWrapper(),
+#     search_spaces=search_space,
+#     n_iter=75,
+#     cv=TimeSeriesSplit(5),
+#     n_jobs=-1
+# )
+#
+# X = ret.reshape(-1, 1)
+# arch_bayes.fit(X, ret)
+# print("Best params:", arch_bayes.best_params_)
+# print("avg-loglike:", arch_bayes.best_score_)
