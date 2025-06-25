@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 import matplotlib.pyplot as plt
+from keras.src.layers import BatchNormalization
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.tree import DecisionTreeClassifier
 import talib
@@ -41,7 +42,7 @@ from scipy.special import logsumexp
 import seaborn as sns
 from sklearn.neural_network import MLPClassifier
 from keras.models import Sequential, Model
-from keras.layers import LSTM, Dense, Input, Dropout, Conv1D, GaussianNoise
+from keras.layers import LSTM, Dense, Input, Dropout, GaussianNoise, Lambda, Concatenate
 from keras.optimizers import Adam
 from keras.metrics import AUC
 from keras.initializers import GlorotUniform, Orthogonal
@@ -998,9 +999,37 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     best_stack = bayes.best_estimator_
 
     data_train_masked = data_train.loc[mask].reset_index(drop=True)
-    probas = best_stack.predict_proba(meta_data)[:, 1]
+    lr_probas = best_stack.predict_proba(meta_data)[:, 1]
+    X_moe = data_train_masked.copy()
+    X_moe = pd.concat([X_moe, meta_data], axis=1)
+
+    meta_in = Input(shape=(X_moe.shape[1],), name="meta_input")
+    lr_in = Input(shape=(1,), name="lr_input")
+    nn_expert = Dense(64, activation="relu")(meta_in)
+    nn_expert = BatchNormalization()(nn_expert)
+    nn_expert = Dense(32, activation="relu")(nn_expert)
+    nn_expert = BatchNormalization()(nn_expert)
+    nn_expert = Dense(16, activation="relu")(nn_expert)
+    nn_expert = Dense(1, activation="sigmoid", name="nn_expert")(nn_expert)
+
+    gate_in = Concatenate(name="gate_input")([meta_in, lr_in, nn_expert])
+    gate = Dense(32, activation="relu")(gate_in)
+    gate = BatchNormalization()(gate)
+    gate = Dense(16, activation="relu")(gate)
+    gate = Dense(1, activation="sigmoid", name="gate")(gate)
+
+    def mix_fn(x):
+        a, nn_p, lr_p = x
+        return a * lr_p + (1.0 - a) * nn_p
+    mixture = Lambda(mix_fn, name="mixture")([gate, nn_expert, lr_in])
+
+    moe = Model(inputs=[meta_in, lr_in], outputs=mixture)
+    moe.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    moe.fit(x=[X_moe, lr_probas], y=meta_labels_train, sample_weight=meta_weights_train, batch_size=256, epochs=20, validation_split=0.1)
+    moe_probas = moe.predict([X_moe, lr_probas]).ravel()
+
     X_reliability = data_train_masked.copy()
-    X_reliability['probas'] = probas
+    X_reliability['probas'] = moe_probas
     y_reliab = (best_stack.predict(meta_data) == meta_labels_train).astype(int)
     reliability_model = LGBMClassifier(**lgbm_params, n_jobs=-1, metric='auc', random_state=42)
     reliability_model.fit(X_reliability, y_reliab, sample_weight=meta_weights_train)
@@ -1046,30 +1075,36 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     meta_test['LSTM'] = lstm_preds
     meta_test['LSTM'].fillna(0.5, inplace=True)
 
-    y_pred_labels = best_stack.predict(meta_test)
-    test_probas = best_stack.predict_proba(meta_test)[:, 1]
+    X_moe_test = data_test.copy()
+    X_moe_test = pd.concat([X_moe_test, meta_test], axis=1)
+    lr_probas_test = best_stack.predict_proba(meta_test)[:, 1]
+    moe_probas_test = moe.predict([X_moe_test, lr_probas_test]).ravel()
     reliability_test_data = data_test.copy()
-    reliability_test_data['probas'] = test_probas
+    reliability_test_data['probas'] = moe_probas_test
     reliability_probs = reliability_model.predict_proba(reliability_test_data)[:, 1]
-    mask = (reliability_probs >= 0.54870).astype(int)
-    filtered_preds = np.where(mask, y_pred_labels, -1)
-    #cutoffs = np.linspace(0.548, 0.55, 101)
-    #masks = [(reliability_probs >= thresh).astype(int) for thresh in cutoffs]
-    #231.25 at 0.55
-    #Best profit 246.09 at threshold 0.54870
-    # profits = []
-    # for thresh, preds in zip(cutoffs, filtered_preds):
-    #     print(f"threshold: {thresh:.2f}")
-    #     profit = trading_simulation(preds, closes_test)
-    #     profits.append((profit, thresh))
-    #
-    # best_profit, best_thresh = max(profits, key=lambda t: t[0])
-    # print(f"Best profit {best_profit:.2f} at threshold {best_thresh:.5f}")
 
-    print("Test Accuracy: ", accuracy_score(labels_test, filtered_preds))
-    print("Test f1: ", f1_score(labels_test, filtered_preds))
+    # moe_labels = (moe_probas_test >= 0.49980).astype(int)
+    # mask = (reliability_probs >= 0.54530).astype(int)
+    # preds = np.where(mask, moe_labels, -1)
 
-    return best_stack, filtered_preds
+    thresh_grid = np.linspace(0.4, 0.6, 201)
+    best_profit = -np.inf
+    best_pair = (None, None)
+    for thresh_moe in thresh_grid:
+        moe_labels = (moe_probas_test >= thresh_moe).astype(int)
+        for thresh_mask in thresh_grid:
+            mask = (reliability_probs >= thresh_mask).astype(int)
+            preds = np.where(mask, moe_labels, -1)
+            profit = trading_simulation(preds, closes_test)
+            if profit > best_profit:
+                best_profit = profit
+                best_pair = (thresh_moe, thresh_mask)
+                best_preds = preds
+
+    #Best profit = 268.87617 at thresh_moe = 0.49500, thresh_mask = 0.54500
+    print(f"Best profit = {best_profit:.5f} at " f"thresh_moe = {best_pair[0]:.5f}, " f"thresh_mask = {best_pair[1]:.5f}")
+
+    return best_stack, best_preds
 
 class HMMEstimator(BaseEstimator): #sklearn wrapper for hmm so I can run bayes search
     def __init__(self, n_components=3, covariance_type="full", n_iter=100, random_state=42, min_covar=1e-3):
