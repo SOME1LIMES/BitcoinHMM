@@ -18,6 +18,8 @@ from xgboost import plot_importance
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn_genetic import GAFeatureSelectionCV
+from sklearn.feature_selection import RFECV
+from sklearn import set_config
 import requests
 from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
 import json
@@ -54,7 +56,11 @@ from arch import arch_model
 import tensorflow as tf
 import random
 import os
+from trendline import walkforward_model, trendline_breakout_dataset
+import skopt.searchcv as _skopt_searchcv
+from sklearn.model_selection._search import BaseSearchCV
 
+_skopt_searchcv.BayesSearchCV.fit = BaseSearchCV.fit
 np.random.seed(42)
 tf.random.set_seed(42)
 random.seed(42)
@@ -66,6 +72,7 @@ backend.clear_session()
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', 100)
+set_config(enable_metadata_routing=True)
 #pd.set_option('display.float_format', '{:.0f}'.format)
 
 api_key = 'IbIgJihiEgl4rEjWnOFazg7F4YVzJXVG8if3iKcGsurgspgblDN2F73XMPdUzOcH'
@@ -338,6 +345,16 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
     df.loc[df['Close'] < df['Lower'], 'Don_Signal'] = -1
     df['Don_Signal'] = df['Don_Signal'].ffill()
     df.drop(['Upper', 'Lower'], axis=1, inplace=True)
+
+    #trendline breakout
+    trades, data_x, data_y = trendline_breakout_dataset(df[['Open', 'High', 'Low', 'Close', 'Volume']], 72)
+    signal, prob = walkforward_model(
+        np.log(df['Close']).to_numpy(),
+        trades, data_x, data_y,
+        365 * 24 * 2, 365 * 24
+    )
+    df['Sig'] = signal
+    df['Proba_Sig'] = prob
 
     # Generate Scree Plot
     # explained_variance_ratio = pca.explained_variance_ratio_
@@ -976,6 +993,7 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     # plt.show()
 
     lr = LogisticRegression(max_iter=20000, random_state=42)
+    lr.set_fit_request(sample_weight=True)
     search_space = {
         'C': Real(1e-4, 1000, prior='log-uniform'),
         'penalty': Categorical(['l1', 'l2']),
@@ -991,12 +1009,14 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
         n_jobs = -1,
         verbose = 1,
         refit = True,
-        random_state=42
+        random_state=42,
+        fit_params={'sample_weight': meta_weights_train}
     )
-    bayes.fit(meta_data, meta_labels_train, sample_weight=meta_weights_train)
+    bayes.fit(meta_data, meta_labels_train)
     print("best params:", bayes.best_params_)
     print("best CV AUC:", bayes.best_score_)
     best_stack = bayes.best_estimator_
+    best_stack.fit(meta_data, meta_labels_train, sample_weight=meta_weights_train)
 
     data_train_masked = data_train.loc[mask].reset_index(drop=True)
     lr_probas = best_stack.predict_proba(meta_data)[:, 1]
@@ -1083,28 +1103,28 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     reliability_test_data['probas'] = moe_probas_test
     reliability_probs = reliability_model.predict_proba(reliability_test_data)[:, 1]
 
-    # moe_labels = (moe_probas_test >= 0.49980).astype(int)
-    # mask = (reliability_probs >= 0.54530).astype(int)
-    # preds = np.where(mask, moe_labels, -1)
+    moe_labels = (moe_probas_test >= 0.49500).astype(int)
+    mask = (reliability_probs >= 0.54450).astype(int)
+    preds = np.where(mask, moe_labels, -1)
 
-    thresh_grid = np.linspace(0.4, 0.6, 201)
-    best_profit = -np.inf
-    best_pair = (None, None)
-    for thresh_moe in thresh_grid:
-        moe_labels = (moe_probas_test >= thresh_moe).astype(int)
-        for thresh_mask in thresh_grid:
-            mask = (reliability_probs >= thresh_mask).astype(int)
-            preds = np.where(mask, moe_labels, -1)
-            profit = trading_simulation(preds, closes_test)
-            if profit > best_profit:
-                best_profit = profit
-                best_pair = (thresh_moe, thresh_mask)
-                best_preds = preds
+    # thresh_grid = np.linspace(0.47, 0.57, 201)
+    # best_profit = -np.inf
+    # best_pair = (None, None)
+    # for thresh_moe in thresh_grid:
+    #     moe_labels = (moe_probas_test >= thresh_moe).astype(int)
+    #     for thresh_mask in thresh_grid:
+    #         mask = (reliability_probs >= thresh_mask).astype(int)
+    #         preds = np.where(mask, moe_labels, -1)
+    #         profit = trading_simulation(preds, closes_test)
+    #         if profit > best_profit:
+    #             best_profit = profit
+    #             best_pair = (thresh_moe, thresh_mask)
+    #             best_preds = preds
 
-    #Best profit = 268.87617 at thresh_moe = 0.49500, thresh_mask = 0.54500
-    print(f"Best profit = {best_profit:.5f} at " f"thresh_moe = {best_pair[0]:.5f}, " f"thresh_mask = {best_pair[1]:.5f}")
+    #Best profit = 271.11941 at thresh_moe = 0.49500, thresh_mask = 0.54450
+    #print(f"Best profit = {best_profit:.5f} at " f"thresh_moe = {best_pair[0]:.5f}, " f"thresh_mask = {best_pair[1]:.5f}")
 
-    return best_stack, best_preds
+    return best_stack, preds
 
 class HMMEstimator(BaseEstimator): #sklearn wrapper for hmm so I can run bayes search
     def __init__(self, n_components=3, covariance_type="full", n_iter=100, random_state=42, min_covar=1e-3):
@@ -1236,11 +1256,6 @@ def build_stacked_lstm(timesteps, n_feats,
     m.compile(optimizer='adam', loss='binary_crossentropy', metrics=["accuracy", AUC(name="auc")])
     return m
 
-# Final money:  712.6811369842858
-# Profit:  212.68113698428579
-# Percentage profitable:  0.561430608365019
-# Best params: OrderedDict({'p': 58, 'q': 69}) dist:ged, vol:EGARCH
-# avg-loglike: -109872.64736199903
 hmm_scaler = StandardScaler()
 hmm_features = ['RSI_PC2', 'MFV', 'OBV', 'VWAP', 'Range', 'Volume-ATR']
 # lstm_features = ['MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'RSI_PC1', 'Closing_Marubozu-OBV', 'Doji-RSI', 'RSI_PC2', 'Closing_Marubozu', 'Short_Candle-RSI', 'Lower_Wick', 'Volume',
@@ -1250,8 +1265,102 @@ meta_features = ['MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_
                'Volume-ATR', 'OBV', 'KC_Upper', 'Range', 'VWAP', 'Long_Candle-OBV', 'Body_Size', 'CCI', 'Doji-OBV', 'Fast_%D', 'Label', 'Weights']
 agg_features = ['Closing_Marubozu-OBV_Dev_16', 'Volume_Dev_16', 'Volume_Mean_48', 'Closing_Marubozu-OBV_Dev_4', 'MFV_Mean_16', 'OBV_Dev_16', 'OBV_Dev_96', 'OBV_Dev_48', 'Doji-OBV_Mean_16', 'Price_Diff_Mean_4',
                 'Volume_Dev_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Mean_4', 'OBV_Dev_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'Doji-OBV_Dev_16']
+# meta_features = ['Low', 'Volume', 'BTC-ETH_Diff', 'Price_Diff', 'Returns', 'Volume_Change', 'MFV', 'VWAP', 'RSI', 'Fast_%K', 'Fast_%D',
+# 'WILLR', 'CCI', 'ADX', 'Momentum', 'R1', 'Body_Size', 'Upper_Wick', 'Lower_Wick', 'Range', 'Body_Ratio', 'Upper_Wick_Ratio',
+# 'Lower_Wick_Ratio', 'Closing_Marubozu', 'Volume-ATR', 'VWAP-ATR', 'Stochastic-RSI', 'BB-KC', 'Closing_Marubozu-OBV',
+# 'Closing_Marubozu-ATR', 'Closing_Marubozu-RSI', 'Short_Candle-ATR', 'Short_Candle-RSI', 'Long_Candle-OBV', 'Long_Candle-ATR',
+# 'Long_Candle-RSI', 'Doji-ATR', 'Doji-RSI', 'Belt_Hold-RSI', 'Open_Mean_4', 'Open_Drawdown_4', 'High_Dev_4', 'Low_Dev_4',
+# 'Low_Drawdown_4', 'Close_Dev_4', 'Close_Drawdown_4', 'Volume_Mean_4', 'Volume_Dev_4', 'Volume_Drawdown_4', 'Hour_Sin_Mean_4',
+# 'Hour_Sin_Dev_4', 'Hour_Cos_Mean_4', 'BTC-ETH_Diff_Mean_4', 'BTC-ETH_Diff_Drawdown_4', 'Price_Diff_Mean_4',
+# 'Price_Diff_Dev_4', 'Returns_Mean_4', 'Volume_Change_Mean_4', 'OBV_Dev_4', 'MFV_Mean_4', 'MFV_Dev_4', 'A/D_Dev_4',
+# 'CMF_Drawdown_4', 'VWAP_Mean_4', 'VWAP_Dev_4', 'LOW_EMA_Dev_4', 'HIGH_EMA_Dev_4', 'RSI_Drawdown_4', 'Aroon_Mean_4',
+# 'Fast_%K_Mean_4', 'Fast_%K_Drawdown_4', 'Fast_%D_Mean_4', 'Fast_%D_Dev_4', 'Fast_%D_Drawdown_4', 'WILLR_Mean_4',
+# 'WILLR_Dev_4', 'CCI_Mean_4', 'CCI_Dev_4', 'CCI_Drawdown_4', 'ATR_Dev_4', 'ATR_Drawdown_4', 'Momentum_Mean_4',
+# 'Momentum_Dev_4', 'TSI_Mean_4', 'TSI_Dev_4', 'TSI_Drawdown_4', 'BB_Upper_Dev_4', 'BB_Lower_Dev_4', 'BB_Width_Dev_4',
+# 'BB_Width_Drawdown_4', 'MACD_Dev_4', 'MACDSignal_Mean_4', 'MACDHist_Dev_4', 'PP_Drawdown_4', 'S1_Dev_4',
+# 'KC_Middle_Dev_4', 'KC_Upper_Dev_4', 'KC_Lower_Dev_4', 'KC_Width_Dev_4', 'KC_Width_Drawdown_4', 'Body_Size_Mean_4',
+# 'Body_Size_Dev_4', 'Upper_Wick_Mean_4', 'Upper_Wick_Dev_4', 'Lower_Wick_Mean_4', 'Lower_Wick_Dev_4', 'Range_Mean_4',
+# 'Range_Dev_4', 'Body_Ratio_Mean_4', 'Body_Ratio_Dev_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Ratio_Dev_4',
+# 'Lower_Wick_Ratio_Mean_4', 'Lower_Wick_Ratio_Dev_4', 'Hikkake_Dev_4', 'Volume-ATR_Mean_4', 'Volume-ATR_Dev_4',
+# 'RSI-MACD_Dev_4', 'RSI-MACD_Drawdown_4', 'Stochastic-RSI_Mean_4', 'Stochastic-RSI_Dev_4', 'Stochastic-RSI_Drawdown_4',
+# 'BB-KC_Dev_4', 'BB-KC_Drawdown_4', 'LOW-HIGH_EMA_Dev_4', 'Closing_Marubozu-OBV_Mean_4', 'Closing_Marubozu-ATR_Mean_4',
+# 'Closing_Marubozu-RSI_Mean_4', 'Short_Candle-ATR_Mean_4', 'Short_Candle-RSI_Dev_4', 'Long_Candle-OBV_Mean_4',
+# 'Proba_Sig_Mean_4', 'Close_Dev_16', 'Volume_Mean_16', 'Volume_Dev_16', 'Volume_Drawdown_16', 'Hour_Sin_Dev_16',
+# 'Hour_Cos_Dev_16', 'BTC-ETH_Diff_Mean_16', 'BTC-ETH_Diff_Dev_16', 'BTC-ETH_Diff_Drawdown_16', 'Returns_Drawdown_16',
+# 'OBV_Dev_16', 'MFV_Dev_16', 'A/D_Dev_16', 'A/D_Drawdown_16', 'CMF_Dev_16', 'CMF_Drawdown_16', 'VWAP_Drawdown_16',
+# 'RSI_Drawdown_16', 'Aroon_Mean_16', 'Aroon_Dev_16', 'Fast_%K_Mean_16', 'Fast_%K_Dev_16', 'Fast_%D_Mean_16',
+# 'Fast_%D_Dev_16', 'Fast_%D_Drawdown_16', 'WILLR_Mean_16', 'CCI_Drawdown_16', 'ATR_Dev_16', 'ATR_Drawdown_16',
+# 'ADX_Mean_16', 'ADX_Dev_16', 'ADX_Drawdown_16', 'TSI_Dev_16', 'BB_Upper_Dev_16', 'BB_Lower_Drawdown_16', 'MACD_Dev_16',
+# 'MACDSignal_Dev_16', 'MACDHist_Mean_16', 'MACDHist_Drawdown_16', 'R1_Dev_16', 'R2_Dev_16', 'Tenkan_Sen_Dev_16',
+# 'Senkou_Span_A_Dev_16', 'Senkou_Span_B_Dev_16', 'Chikou_Span_Dev_16', 'KC_Middle_Dev_16', 'KC_Upper_Mean_16',
+# 'KC_Upper_Dev_16', 'Body_Size_Drawdown_16', 'Upper_Wick_Mean_16', 'Upper_Wick_Dev_16', 'Lower_Wick_Mean_16',
+# 'Lower_Wick_Dev_16', 'Range_Drawdown_16', 'Body_Ratio_Mean_16', 'Body_Ratio_Dev_16', 'Body_Ratio_Drawdown_16',
+# 'Upper_Wick_Ratio_Mean_16', 'Upper_Wick_Ratio_Dev_16', 'Lower_Wick_Ratio_Mean_16', 'Lower_Wick_Ratio_Dev_16',
+# 'Harami_Dev_16', 'High_Wave_Dev_16', 'Hikkake_Dev_16', 'Long_Candle_Dev_16', 'Spinning_Top_Dev_16', 'Volume-ATR_Mean_16',
+# 'Volume-ATR_Drawdown_16', 'RSI-MACD_Dev_16', 'Stochastic-RSI_Mean_16', 'Stochastic-RSI_Dev_16', 'BB-KC_Mean_16',
+# 'BB-KC_Drawdown_16', 'LOW-HIGH_EMA_Drawdown_16', 'Short_Candle-ATR_Mean_16', 'Short_Candle-RSI_Mean_16',
+# 'Short_Candle-RSI_Dev_16', 'Long_Candle-OBV_Mean_16', 'Long_Candle-RSI_Dev_16', 'Doji-OBV_Mean_16', 'Doji-RSI_Mean_16',
+# 'Belt_Hold-ATR_Mean_16', 'Belt_Hold-RSI_Mean_16', 'Belt_Hold-RSI_Dev_16', 'Proba_Sig_Mean_16', 'Close_Drawdown_48',
+# 'Volume_Mean_48', 'Volume_Drawdown_48', 'Hour_Cos_Dev_48', 'BTC-ETH_Diff_Mean_48', 'BTC-ETH_Diff_Dev_48',
+# 'Price_Diff_Drawdown_48', 'MFV_Dev_48', 'MFV_Drawdown_48', 'A/D_Dev_48', 'CMF_Mean_48', 'CMF_Drawdown_48',
+# 'RSI_Dev_48', 'RSI_Drawdown_48', 'Aroon_Dev_48', 'WILLR_Dev_48', 'CCI_Drawdown_48', 'ADX_Dev_48', 'TSI_Dev_48',
+# 'TSI_Drawdown_48', 'BB_Upper_Dev_48', 'BB_Lower_Drawdown_48', 'MACDHist_Drawdown_48', 'R2_Drawdown_48',
+# 'Chikou_Span_Drawdown_48', 'KC_Upper_Dev_48', 'KC_Lower_Drawdown_48', 'Body_Size_Dev_48', 'Body_Size_Drawdown_48',
+# 'Range_Drawdown_48', 'Body_Ratio_Mean_48', 'Body_Ratio_Dev_48', 'Body_Ratio_Drawdown_48', 'Closing_Marubozu_Dev_48',
+# 'Engulfing_Dev_48', 'Harami_Dev_48', 'High_Wave_Dev_48', 'Hikkake_Mean_48', 'Hikkake_Dev_48', 'Spinning_Top_Dev_48',
+# 'Volume-ATR_Mean_48', 'Volume-ATR_Drawdown_48', 'VWAP-ATR_Drawdown_48', 'RSI-MACD_Mean_48', 'BB-KC_Mean_48',
+# 'BB-KC_Dev_48', 'Ichimoku_Overlap_Drawdown_48', 'Closing_Marubozu-ATR_Dev_48', 'Short_Candle-OBV_Dev_48',
+# 'Short_Candle-ATR_Mean_48', 'Short_Candle-RSI_Dev_48', 'Long_Candle-ATR_Mean_48', 'Doji-ATR_Mean_48', 'Doji-RSI_Mean_48',
+# 'Long_Doji-OBV_Mean_48', 'Long_Doji-RSI_Mean_48', 'Long_Doji-RSI_Dev_48', 'Belt_Hold-ATR_Mean_48', 'Belt_Hold-RSI_Dev_48',
+# 'Proba_Sig_Mean_48', 'Volume_Mean_96', 'Volume_Dev_96', 'Day_Dev_96', 'BTC-ETH_Diff_Mean_96', 'BTC-ETH_Diff_Drawdown_96',
+# 'Price_Diff_Mean_96', 'Returns_Mean_96', 'Returns_Dev_96', 'Volatility_Dev_96', 'Volatility_Drawdown_96',
+# 'Volume_Change_Mean_96', 'Volume_Change_Drawdown_96', 'OBV_Dev_96', 'MFV_Mean_96', 'MFV_Dev_96', 'A/D_Dev_96',
+# 'CMF_Drawdown_96', 'VWAP_Mean_96', 'VWAP_Drawdown_96', 'Aroon_Mean_96', 'Fast_%K_Dev_96', 'Fast_%D_Dev_96',
+# 'WILLR_Dev_96', 'CCI_Dev_96', 'ATR_Drawdown_96', 'ADX_Mean_96', 'ADX_Dev_96', 'Momentum_Mean_96', 'Momentum_Drawdown_96',
+# 'TSI_Dev_96', 'TSI_Drawdown_96', 'BB_Upper_Dev_96', 'BB_Lower_Dev_96', 'BB_Width_Drawdown_96', 'MACD_Mean_96',
+# 'MACDSignal_Mean_96', 'MACDSignal_Drawdown_96', 'MACDHist_Mean_96', 'R1_Dev_96', 'Chikou_Span_Dev_96', 'KC_Lower_Dev_96',
+# 'KC_Width_Drawdown_96', 'Lower_Wick_Ratio_Mean_96', 'Three_Outside_Dev_96', 'Closing_Marubozu_Dev_96', 'Harami_Dev_96',
+# 'Harami_Cross_Dev_96', 'Hikkake_Dev_96', 'Long_Candle_Dev_96', 'Short_Candle_Dev_96', 'Spinning_Top_Dev_96',
+# 'Volume-ATR_Mean_96', 'Volume-ATR_Dev_96', 'Volume-ATR_Drawdown_96', 'VWAP-ATR_Drawdown_96', 'RSI-MACD_Mean_96',
+# 'RSI-MACD_Drawdown_96', 'Stochastic-RSI_Mean_96', 'Stochastic-RSI_Dev_96', 'BB-KC_Dev_96', 'BB-KC_Drawdown_96',
+# 'Ichimoku_Overlap_Dev_96', 'LOW-HIGH_EMA_Mean_96', 'Closing_Marubozu-OBV_Drawdown_96', 'Closing_Marubozu-ATR_Drawdown_96',
+# 'Closing_Marubozu-RSI_Dev_96', 'Short_Candle-ATR_Mean_96', 'Short_Candle-ATR_Drawdown_96', 'Short_Candle-RSI_Dev_96',
+# 'Short_Candle-RSI_Drawdown_96', 'Long_Candle-OBV_Drawdown_96', 'Long_Candle-RSI_Mean_96', 'Long_Candle-RSI_Dev_96',
+# 'Doji-ATR_Mean_96', 'Doji-RSI_Mean_96', 'Dragonfly_Doji-ATR_Mean_96', 'Dragonfly_Doji-ATR_Dev_96',
+# 'Dragonfly_Doji-RSI_Mean_96', 'Belt_Hold-ATR_Mean_96', 'Belt_Hold-ATR_Dev_96', 'Belt_Hold-ATR_Drawdown_96',
+# 'Belt_Hold-RSI_Drawdown_96', 'Proba_Sig_Mean_96', 'Proba_Sig_Dev_96', 'Day_Mean_384', 'Day_Dev_384',
+# 'BTC-ETH_Diff_Mean_384', 'BTC-ETH_Diff_Dev_384', 'Price_Diff_Mean_384', 'Volume_Change_Mean_384',
+# 'Volume_Change_Drawdown_384', 'MFV_Drawdown_384', 'Fast_%K_Dev_384', 'WILLR_Dev_384', 'CCI_Dev_384',
+# 'ATR_Drawdown_384', 'ADX_Drawdown_384', 'Lower_Wick_Ratio_Mean_384', 'Three_Outside_Dev_384', 'Engulfing_Dev_384',
+# 'Harami_Mean_384', 'High_Wave_Mean_384', 'Hikkake_Dev_384', 'Short_Candle_Dev_384', 'Closing_Marubozu-RSI_Dev_384',
+# 'Closing_Marubozu-RSI_Drawdown_384', 'Marubozu-RSI_Dev_384', 'Short_Candle-OBV_Mean_384', 'Short_Candle-ATR_Mean_384',
+# 'Short_Candle-RSI_Dev_384', 'Dragonfly_Doji-ATR_Mean_384', 'Belt_Hold-RSI_Drawdown_384', 'Sig_Mean_384', 'Sig_Dev_384',
+# 'Proba_Sig_Mean_384', 'Proba_Sig_Dev_384', 'Day_Mean_1152', 'BTC-ETH_Diff_Mean_1152', 'Returns_Mean_1152',
+# 'VWAP_Mean_1152', 'Aroon_Dev_1152', 'Fast_%K_Dev_1152', 'WILLR_Dev_1152', 'ATR_Dev_1152', 'ADX_Mean_1152',
+# 'MACDHist_Mean_1152', 'Three_Outside_Dev_1152', 'Belt_Hold_Dev_1152', 'Engulfing_Dev_1152', 'Harami_Cross_Dev_1152',
+# 'Hikkake_Mean_1152', 'Short_Candle_Dev_1152', 'Stochastic-RSI_Dev_1152', 'BB-KC_Mean_1152', 'Ichimoku_Overlap_Mean_1152',
+# 'Closing_Marubozu-RSI_Dev_1152', 'Short_Candle-RSI_Dev_1152', 'Long_Doji-RSI_Mean_1152', 'Long_Doji-RSI_Dev_1152',
+# 'Belt_Hold-ATR_Mean_1152', 'Sig_Mean_1152', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4',
+# 'ADX_PC5', 'RSI_PC1_Dev_4', 'RSI_PC1_Drawdown_4', 'RSI_PC2_Mean_4', 'RSI_PC2_Dev_4', 'RSI_PC2_Drawdown_4',
+# 'RSI_PC3_Mean_4', 'RSI_PC3_Drawdown_4', 'ATR_PC1_Dev_4', 'ATR_PC1_Drawdown_4', 'ATR_PC2_Mean_4', 'ATR_PC2_Dev_4',
+# 'ATR_PC2_Drawdown_4', 'ATR_PC3_Dev_4', 'ATR_PC3_Drawdown_4', 'ADX_PC1_Dev_4', 'ADX_PC2_Dev_4', 'ADX_PC3_Mean_4',
+# 'ADX_PC3_Dev_4', 'ADX_PC3_Drawdown_4', 'ADX_PC4_Mean_4', 'ADX_PC4_Dev_4', 'ADX_PC4_Drawdown_4', 'ADX_PC5_Mean_4',
+# 'ADX_PC5_Dev_4', 'ADX_PC5_Drawdown_4', 'RSI_PC3_Mean_16', 'RSI_PC3_Dev_16', 'RSI_PC3_Drawdown_16', 'ATR_PC2_Dev_16',
+# 'ATR_PC2_Drawdown_16', 'ADX_PC1_Mean_16', 'ADX_PC1_Dev_16', 'ADX_PC1_Drawdown_16', 'ADX_PC2_Dev_16', 'ADX_PC3_Mean_16',
+# 'ADX_PC3_Dev_16', 'ADX_PC4_Dev_16', 'ADX_PC4_Drawdown_16', 'RSI_PC1_Dev_48', 'RSI_PC2_Mean_48', 'RSI_PC2_Dev_48',
+# 'RSI_PC3_Mean_48', 'RSI_PC3_Drawdown_48', 'ATR_PC2_Mean_48', 'ADX_PC1_Dev_48', 'ADX_PC2_Mean_48', 'ADX_PC2_Drawdown_48',
+# 'ADX_PC3_Mean_48', 'ADX_PC3_Dev_48', 'ADX_PC4_Dev_48', 'ADX_PC4_Drawdown_48', 'RSI_PC1_Mean_96', 'RSI_PC1_Dev_96',
+# 'RSI_PC2_Dev_96', 'RSI_PC3_Dev_96', 'RSI_PC3_Drawdown_96', 'ADX_PC1_Mean_96', 'ADX_PC1_Dev_96', 'ADX_PC2_Dev_96',
+# 'ADX_PC2_Drawdown_96', 'ADX_PC3_Mean_96', 'ADX_PC3_Dev_96', 'ADX_PC3_Drawdown_96', 'ADX_PC4_Dev_96', 'ADX_PC4_Drawdown_96',
+# 'ADX_PC5_Mean_96', 'ADX_PC5_Dev_96', 'ADX_PC5_Drawdown_96', 'RSI_PC2_Dev_384', 'RSI_PC3_Dev_384', 'ATR_PC2_Drawdown_384',
+# 'ATR_PC3_Drawdown_384', 'ADX_PC2_Mean_384', 'ADX_PC2_Dev_384', 'ADX_PC3_Mean_384', 'ADX_PC3_Dev_384', 'ADX_PC4_Mean_384',
+# 'ADX_PC4_Drawdown_384', 'ADX_PC5_Mean_384', 'ADX_PC5_Dev_384', 'RSI_PC1_Dev_1152', 'RSI_PC2_Dev_1152', 'RSI_PC3_Dev_1152',
+# 'ATR_PC1_Dev_1152', 'ADX_PC1_Mean_1152', 'ADX_PC2_Mean_1152', 'ADX_PC2_Dev_1152', 'ADX_PC4_Mean_1152', 'ADX_PC5_Mean_1152',
+# 'ADX_PC5_Dev_1152', 'state_1_proba', 'state_3_proba', 'state_8_proba', 'state_9_proba', 'state_12_proba', 'Label', 'Weights']
 #data = load_and_preprocess_data("BTCUSDC_15m.csv", meta_features)
 data = pd.read_csv("BTCUSDC_15m_processed.csv")
+n = len(data)
+data = data.iloc[int(n*0.9):]
 labels = data.pop('Label').tolist()
 labels = [int(x) for x in labels]
 weights = data.pop('Weights').tolist()
@@ -1260,7 +1369,7 @@ meta_features.remove('Weights')
 
 data['Direction'] = (data['Returns'] > 0).astype(int)
 closes = data['Close'].tolist()
-meta_features.extend(['EX_PC2'])
+meta_features.extend(['EX_PC1', 'EX_PC2', 'EX_PC3'])
 meta_features.extend(agg_features)
 #
 n = len(data)
@@ -1403,3 +1512,24 @@ profit = trading_simulation(pred_labels, closes_test)
 # arch_bayes.fit(X, ret)
 # print("Best params:", arch_bayes.best_params_)
 # print("avg-loglike:", arch_bayes.best_score_)
+#LGBM feature search
+# lgbm_params = {
+#     'boosting_type': 'gbdt',
+#     'colsample_bytree': 0.1,
+#     'learning_rate': 0.003093443570013053,
+#     'max_depth': 15,
+#     'n_estimators': 1239,
+#     'num_leaves': 20,
+#     'reg_alpha': 2.8867915528468985e-08,
+#     'reg_lambda': 11.404719722698687,
+#     'subsample': 0.5443075312616172,
+#     'min_child_samples': 5,
+#     'min_split_gain': 0.0,
+#     'scale_pos_weight': 1.1992235739783454,
+#     'subsample_freq': 10
+# }
+# lgbm = LGBMClassifier(**lgbm_params, n_jobs=-1, metric='auc', random_state=42)
+# lgbm.set_fit_request(sample_weight=True)
+# selector = RFECV(lgbm, min_features_to_select=50, cv=TimeSeriesSplit(n_splits=5), step=1, scoring='roc_auc', verbose=1)
+# selector.fit(meta_train, meta_labels, sample_weight=meta_weights)
+# print("Selected features:", list(meta_train.columns[selector.support_]))
