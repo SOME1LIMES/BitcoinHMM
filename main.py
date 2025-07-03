@@ -8,16 +8,18 @@ from sklearn.tree import DecisionTreeClassifier
 import talib
 from datetime import datetime
 from xgboost import XGBClassifier
-from skopt import BayesSearchCV
+from skopt import BayesSearchCV, gp_minimize
 from skopt.space import Real, Integer, Categorical
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
+from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import f1_score, accuracy_score, make_scorer, roc_auc_score
 from xgboost import plot_importance
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn_genetic import GAFeatureSelectionCV
+from genetic_selection import GeneticSelectionCV
 import requests
 from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
 import json
@@ -41,7 +43,7 @@ import sys
 from scipy.special import logsumexp
 import seaborn as sns
 from sklearn.neural_network import MLPClassifier
-from keras.models import Sequential, Model
+from keras.models import Sequential, Model, load_model
 from keras.layers import LSTM, Dense, Input, Dropout, GaussianNoise, Lambda, Concatenate
 from keras.optimizers import Adam
 from keras.metrics import AUC
@@ -748,7 +750,7 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
     trade_count = 0
     historical_daily_starting_assets = []
     for label in labels:
-        print(f"close: {close_prices[count]}, label: {label}")
+        #print(f"close: {close_prices[count]}, label: {label}")
         if count % 96 == 0: #update daily starting assets at the start of each day
             daily_starting_assets = money + (bitcoin * close_prices[count])
             historical_daily_starting_assets.append(daily_starting_assets)
@@ -774,7 +776,7 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
         if sell_order and label == 0:
             money += bitcoin * close_prices[count]
             last_sold_price = close_prices[count]
-            print(f"Day {day_count}: SOLD {bitcoin} BTC at {last_sold_price} each.")
+            #print(f"Day {day_count}: SOLD {bitcoin} BTC at {last_sold_price} each.")
             bitcoin = 0
             sell_order = False
         elif buy_order and label == 1:
@@ -784,7 +786,7 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
             money -= amount_to_spend
             buy_order = False
             last_bought_price = close_prices[count]
-            print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {last_bought_price} each.")
+            #print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {last_bought_price} each.")
 
         if last_sold_price > last_bought_price:
             profitable_trade_count += 1
@@ -792,7 +794,7 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
         else:
             trade_count += 1
 
-        print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
+        #print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
         count += 1
 
     total_assets = money + bitcoin * close_prices[count-2]
@@ -907,32 +909,35 @@ def calculate_meta_features(data, labels, weights, base_learners, tscv):
                 meta[test_idx, col] = y_pred
                 aucs.append(roc_auc_score(labels[test_idx], y_pred, sample_weight=weights[test_idx]))
 
-    lgbm = dict(base_learners)['lgbm']
-    importances = lgbm.feature_importances_
-    feat_names = data.columns
-    feat_imp = pd.Series(importances, index=feat_names)
-    feat_imp_list = list(zip(feat_imp.index.tolist(), feat_imp.values.tolist()))
-    corr_matrix = data.corr().abs()
-
-    def prune_by_corr(importance_series, corr_mat, threshold):
-        selected = []
-        for feat in importance_series.index:
-            if any(corr_mat.loc[feat, sel] > threshold for sel in selected):
-                continue
-            selected.append(feat)
-        return selected
-
-    for thresh in np.arange(0.85, 0.951, 0.01):
-        t = round(thresh, 2)
-        sorted_imp = feat_imp.sort_values(ascending=False)
-        kept = prune_by_corr(sorted_imp, corr_matrix, t)
-        print(f"Threshold={t:.2f}: kept {len(kept)} / {len(sorted_imp)} features")
-        print("Kept features:", kept, "\n")
+    # lgbm = dict(base_learners)['lgbm']
+    # importances = lgbm.feature_importances_
+    # feat_names = data.columns
+    # feat_imp = pd.Series(importances, index=feat_names)
+    # feat_imp_list = list(zip(feat_imp.index.tolist(), feat_imp.values.tolist()))
+    # feat_imp_list.sort(key=lambda x: x[1], reverse=True)
+    # top50_names = [feat for feat, imp in feat_imp_list[:50]]
+    # print(top50_names)
+    # corr_matrix = data.corr().abs()
+    #
+    # def prune_by_corr(importance_series, corr_mat, threshold):
+    #     selected = []
+    #     for feat in importance_series.index:
+    #         if any(corr_mat.loc[feat, sel] > threshold for sel in selected):
+    #             continue
+    #         selected.append(feat)
+    #     return selected
+    #
+    # for thresh in np.arange(0.85, 0.951, 0.01):
+    #     t = round(thresh, 2)
+    #     sorted_imp = feat_imp.sort_values(ascending=False)
+    #     kept = prune_by_corr(sorted_imp, corr_matrix, t)
+    #     print(f"Threshold={t:.2f}: kept {len(kept)} / {len(sorted_imp)} features")
+    #     print("Kept features:", kept, "\n")
 
     print(f"LGBM train‐set AUC: {sum(aucs)/len(aucs)}")
     return pd.DataFrame(meta, index=data.index, columns=[name for name, _ in base_learners])
 
-def calculate_lstm_features(data, weights, window, hidden_units, dropout, tscv):
+def calculate_lstm_features(data, weights, window, hidden_units, dropout, learning_rate, rec_drop, noise, ker, rec, tscv):
     preds = np.full(len(data), np.nan)
     features = data.columns.tolist()
     cols = [c for c in data.columns if c != "Direction"]
@@ -954,7 +959,8 @@ def calculate_lstm_features(data, weights, window, hidden_units, dropout, tscv):
 
         es = EarlyStopping(monitor="val_auc", patience=10, restore_best_weights=True, mode="max")
         rlrop = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, mode="min", min_lr=1e-6)
-        model = build_stacked_lstm(window, len(features), hidden_units, dropout)
+        model = build_stacked_lstm(timesteps=window, n_feats=len(features), lstm_units=hidden_units, dropout=dropout, lr=learning_rate, noise=noise,
+                                   ker=ker, rec=rec, rec_dropout=rec_drop)
         model.fit(X_train, y_train, sample_weight=w_train, epochs=30, batch_size=64, verbose=1, shuffle=False, validation_split=0.1, callbacks=[es, rlrop])
         pred = model.predict(X_test, verbose=1).ravel()
 
@@ -963,7 +969,8 @@ def calculate_lstm_features(data, weights, window, hidden_units, dropout, tscv):
             preds[orig_i] = p
     return preds
 
-def build_meta_model(data_train, labels_train, weights_train, data_test, labels_test, lstm_data_train, lstm_data_test, closes_test):
+def build_meta_model(data_train, labels_train, weights_train, data_test, labels_test, closes_test, lstm_data_train, lstm_data_test, lstm_hidden_units,
+                     lstm_dropout, lstm_learning_rate, lstm_window_size, lstm_rec_drop, lstm_noise, lstm_ker, lstm_rec):
     lgbm_params = {
         'boosting_type': 'gbdt',
         'colsample_bytree': 0.1,
@@ -981,9 +988,6 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     }
 
     lstm_features = lstm_data_train.columns.tolist()
-    lstm_window = 35
-    lstm_hidden_units = [64, 32, 16]
-    lstm_dropout = 0.2
     estimators = [
         ('lgbm', LGBMClassifier(**lgbm_params, n_jobs=-1, metric='auc', random_state=42)),
     ]
@@ -995,7 +999,8 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     meta_labels_train = np.array(labels_train)[mask]
     meta_weights_train = np.array(weights_train)[mask]
 
-    lstm_data = calculate_lstm_features(lstm_data_train, weights_train, lstm_window, lstm_hidden_units, lstm_dropout, tscv)
+    lstm_data = calculate_lstm_features(lstm_data_train, weights_train, lstm_window_size, lstm_hidden_units, lstm_dropout,
+                                        lstm_learning_rate, lstm_rec_drop, lstm_noise, lstm_ker, lstm_rec, tscv)
     lstm_data = lstm_data[mask]
     lstm_data = np.nan_to_num(lstm_data, nan=0.5)
     meta_data['LSTM'] = lstm_data
@@ -1053,9 +1058,10 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
         return a * lr_p + (1.0 - a) * nn_p
     mixture = Lambda(mix_fn, name="mixture")([gate, nn_expert, lr_in])
 
+    es = EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True, mode="max")
     moe = Model(inputs=[meta_in, lr_in], outputs=mixture)
     moe.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-    moe.fit(x=[X_moe, lr_probas], y=meta_labels_train, sample_weight=meta_weights_train, batch_size=256, epochs=20, validation_split=0.1)
+    moe.fit(x=[X_moe, lr_probas], y=meta_labels_train, sample_weight=meta_weights_train, batch_size=256, epochs=20, validation_split=0.1, callbacks=[es])
     moe_probas = moe.predict([X_moe, lr_probas]).ravel()
 
     X_reliability = data_train[mask].reset_index(drop=True)
@@ -1070,19 +1076,20 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     scaled_lstm_train = pd.DataFrame()
     scaled_lstm_train[cols] = lstm_scaler.transform(lstm_data_train[cols])
     scaled_lstm_train['Direction'] = lstm_data_train['Direction']
-    X_train, y_train = prep_lstm_data(scaled_lstm_train, lstm_features, lstm_window, 'Direction')
-    w = np.array(weights_train[lstm_window:], dtype=np.float32)
+    X_train, y_train = prep_lstm_data(scaled_lstm_train, lstm_features, lstm_window_size, 'Direction')
+    w = np.array(weights_train[lstm_window_size:], dtype=np.float32)
 
     es = EarlyStopping(monitor="val_auc", patience=10, restore_best_weights=True, mode="max")
     rlrop = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, mode="min", min_lr=1e-6)
-    lstm = build_stacked_lstm(lstm_window, len(lstm_features), lstm_hidden_units, lstm_dropout)
+    lstm = build_stacked_lstm(timesteps=lstm_window_size, n_feats=len(lstm_features), lstm_units=lstm_hidden_units, dropout=lstm_dropout, lr=lstm_learning_rate,
+                            noise=lstm_noise, ker=lstm_ker, rec=lstm_rec, rec_dropout=lstm_rec_drop)
     lstm.fit(X_train, y_train, epochs=30, batch_size=64, verbose=1, sample_weight=w, shuffle=False, validation_split=0.1, callbacks=[es, rlrop])
 
     lstm_data_test = lstm_data_test.reset_index(drop=True)
     scaled_lstm_test = pd.DataFrame()
     scaled_lstm_test[cols] = lstm_scaler.transform(lstm_data_test[cols])
     scaled_lstm_test['Direction'] = lstm_data_test['Direction']
-    X_test, y_test = prep_lstm_data(scaled_lstm_test, lstm_features, lstm_window, 'Direction')
+    X_test, y_test = prep_lstm_data(scaled_lstm_test, lstm_features, lstm_window_size, 'Direction')
     lstm_preds = lstm.predict(X_test, verbose=1).ravel()
 
     bg = X_train[np.random.choice(len(X_train), 100, replace=False)]
@@ -1101,7 +1108,7 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
         else:
             clf.fit(data_train, labels_train, sample_weight=weights_train)
     meta_test = pd.DataFrame({name: clf.predict_proba(data_test)[:, 1] for name, clf in estimators}, index=data_test.index)
-    lstm_preds = pd.Series(lstm_preds, index=data_test.index[lstm_window:])
+    lstm_preds = pd.Series(lstm_preds, index=data_test.index[lstm_window_size:])
     meta_test['LSTM'] = lstm_preds
     meta_test['LSTM'].fillna(0.5, inplace=True)
 
@@ -1116,6 +1123,7 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     moe_labels = (moe_probas_test >= 0.50300).astype(int)
     mask = (reliability_probs >= 0.57900).astype(int)
     preds = np.where(mask, moe_labels, -1)
+    profit = trading_simulation(preds, closes_test)
 
     # thresh_grid = np.linspace(0.4, 0.6, 201)
     # best_profit = -np.inf
@@ -1133,12 +1141,82 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
 
     #Best profit = 268.87617 at thresh_moe = 0.49500, thresh_mask = 0.54500
     #Best profit = 272.15604 at thresh_moe = 0.50300, thresh_mask = 0.57900 - new lgbm data
+    #Best profit = 295.27515 at thresh_moe = 0.50000, thresh_mask = 0.58200 - new lstm hypers
 
     #print(f"Best profit = {best_profit:.5f} at " f"thresh_moe = {best_pair[0]:.5f}, " f"thresh_mask = {best_pair[1]:.5f}")
+    save_meta_model("meta_model", estimators, best_stack, lstm, lstm_features, lstm_window_size, lstm_scaler, moe, reliability_model)
 
-    return best_stack, preds
+    return best_stack, preds, profit
 
-class HMMEstimator(BaseEstimator): #sklearn wrapper for hmm so I can run bayes search
+
+def save_meta_model(path, base_learners, meta_lr, lstm_model, lstm_features, lstm_window_size, lstm_scaler, moe_model, reliability_model):
+    os.makedirs(path, exist_ok=True)
+    joblib.dump(base_learners, os.path.join(path, "base_learners.pkl"))
+    joblib.dump(meta_lr, os.path.join(path, "meta_lr.pkl"))
+    lstm_model.save(os.path.join(path, "lstm_model.keras"))
+    joblib.dump(lstm_scaler, os.path.join(path, "lstm_scaler.pkl"))
+    with open(os.path.join(path, "lstm_config.json"), "w") as f:
+        json.dump({
+            "features": lstm_features,
+            "window_size": lstm_window_size
+        }, f)
+    moe_model.save(os.path.join(path, "moe_model"))
+    joblib.dump(reliability_model, os.path.join(path, "reliability_model.pkl"))
+
+def load_meta_model(path):
+    base_learners = joblib.load(os.path.join(path, "base_learners.pkl"))
+    meta_lr = joblib.load(os.path.join(path, "meta_lr.pkl"))
+    lstm_model = load_model(os.path.join(path, "lstm_model"), compile=False)
+    lstm_scaler = joblib.load(os.path.join(path, "lstm_scaler.pkl"))
+    with open(os.path.join(path, "lstm_config.json")) as f:
+        cfg = json.load(f)
+    lstm_features = cfg["features"]
+    lstm_window_size = cfg["window_size"]
+
+    moe_model = load_model(os.path.join(path, "moe_model"), compile=False)
+    reliability_model = joblib.load(os.path.join(path, "reliability_model.pkl"))
+
+    return (base_learners, meta_lr, lstm_model, lstm_features, lstm_window_size, lstm_scaler, moe_model, reliability_model)
+
+def predict_with_meta_model(models, data_test, lstm_data_test, closes_test):
+    (base_learners, meta_lr, lstm_model, lstm_features, lstm_window_size, lstm_scaler, moe_model, reliability_model, thresholds) = models
+
+    meta_test = pd.DataFrame(
+      {name: clf.predict_proba(data_test)[:,1]
+        for name, clf in base_learners.items()},
+      index=data_test.index)
+
+    X = lstm_data_test[lstm_features].copy()
+    X[lstm_features] = lstm_scaler.transform(X[lstm_features])
+    # prep sliding windows exactly as during training:
+    X_seq, _ = prep_lstm_data(X, lstm_features, lstm_window_size, target="Direction")
+    lstm_preds = lstm_model.predict(X_seq).ravel()
+    # pad front with 0.5 to match length
+    pad = pd.Series(0.5, index=data_test.index[:lstm_window_size])
+    lstm_series = pd.Series(lstm_preds, index=data_test.index[lstm_window_size:])
+    meta_test["LSTM"] = pd.concat([pad, lstm_series]).reindex(data_test.index)
+
+    lr_probas = meta_lr.predict_proba(meta_test)[:,1]
+    X_moe_test = pd.concat([
+        data_test.reset_index(drop=True),
+        meta_test.reset_index(drop=True)
+    ], axis=1)
+    moe_probas = moe_model.predict([X_moe_test, lr_probas]).ravel()
+
+    reliability_input = data_test.copy()
+    reliability_input["probas"] = moe_probas
+    mask_probas = reliability_model.predict_proba(reliability_input)[:,1]
+
+    tm, tmask = 0.50000, 0.58200
+    moe_labels = (moe_probas  >= tm).astype(int)
+    mask_labels = (mask_probas >= tmask).astype(int)
+    preds = np.where(mask_labels, moe_labels, -1)
+    profit = trading_simulation(preds, closes_test)
+
+    return preds, profit
+
+class HMMEstimator(BaseEstimator, RegressorMixin): #sklearn wrapper for hmm so I can run bayes search
+    _estimator_type = "regressor"
     def __init__(self, n_components=3, covariance_type="full", n_iter=100, random_state=42, min_covar=1e-3):
         self.n_components = n_components
         self.covariance_type = covariance_type
@@ -1167,6 +1245,9 @@ class HMMEstimator(BaseEstimator): #sklearn wrapper for hmm so I can run bayes s
         if self._failed == True:
             raise RuntimeError("HMM didn’t fit properly; cannot predict")
         return self.model_.predict(X)
+
+    def _more_tags(self):
+        return {"requires_y": False}
 
 def hmm_log_likelihood(estimator, X, y=None): #wrapper for scoring estimator
     return estimator.score(X)
@@ -1233,47 +1314,44 @@ def build_lstm(timesteps, n_feats, hidden_units=32):
     m.compile(optimizer=Adam(1e-3), loss="binary_crossentropy", metrics=["accuracy", AUC(name="auc")])
     return m
 
-def build_stacked_lstm(timesteps, n_feats,
-                       lstm_units=[64,32],
-                       dropout=0.2):
+def build_stacked_lstm(timesteps, n_feats, lstm_units=[60,24,4], dropout=0.35567097637432504, noise=0.9263082484254979,
+                       ker=0.06514259484764427, rec=0.09150447158682373, rec_dropout=0.2, lr=0.0002498531379402823):
+    timesteps = int(timesteps)
+    n_feats = int(n_feats)
+    lstm_units = [int(u) for u in lstm_units]
+
     m = Sequential()
-    m.add(GaussianNoise(1e-2, input_shape=(timesteps, n_feats)))
+    m.add(GaussianNoise(noise, input_shape=(timesteps, n_feats)))
     m.add(LSTM(lstm_units[0],
                return_sequences=True,
                input_shape=(timesteps, n_feats),
                kernel_initializer=GlorotUniform(seed=42),
                recurrent_initializer=Orthogonal(seed=42),
-               kernel_regularizer=l2(1e-4),
-               recurrent_regularizer=l2(1e-4),
-               recurrent_dropout=dropout/2))
+               kernel_regularizer=l2(ker),
+               recurrent_regularizer=l2(rec),
+               recurrent_dropout=rec_dropout))
     m.add(Dropout(dropout))
     for units in lstm_units[1:-1]:
         m.add(LSTM(units,
                    return_sequences=True,
                    kernel_initializer=GlorotUniform(seed=42),
                    recurrent_initializer=Orthogonal(seed=42),
-                   kernel_regularizer=l2(1e-4),
-                   recurrent_regularizer=l2(1e-4),
-                   recurrent_dropout=dropout/2))
+                   kernel_regularizer=l2(ker),
+                   recurrent_regularizer=l2(rec),
+                   recurrent_dropout=rec_dropout))
         m.add(Dropout(dropout))
     m.add(LSTM(lstm_units[-1],
                return_sequences=False,
                kernel_initializer=GlorotUniform(seed=42),
                recurrent_initializer=Orthogonal(seed=42),
-               kernel_regularizer=l2(1e-4),
-               recurrent_regularizer=l2(1e-4),
-               recurrent_dropout=dropout/2))
+               kernel_regularizer=l2(ker),
+               recurrent_regularizer=l2(rec),
+               recurrent_dropout=rec_dropout))
     m.add(Dropout(dropout))
-    m.add(Dense(1, activation='sigmoid', kernel_regularizer=l2(1e-4)))
-    m.compile(optimizer='adam', loss='binary_crossentropy', metrics=["accuracy", AUC(name="auc")])
+    m.add(Dense(1, activation='sigmoid', kernel_regularizer=l2(ker)))
+    m.compile(optimizer=Adam(lr), loss='binary_crossentropy', metrics=["accuracy", AUC(name="auc")])
     return m
 
-#0.85 - LGBM train‐set AUC: 0.5787709525507917
-#0.86 - LGBM train‐set AUC: 0.5804979896626669
-#0.87 - LGBM train‐set AUC: 0.5810134914073231
-#0.88 - LGBM train‐set AUC: 0.5793300249216193
-#0.89 - LGBM train‐set AUC: 0.5772109268128706
-#0.9 - LGBM train‐set AUC: 0.5795585124492989
 hmm_scaler = StandardScaler()
 hmm_features = ['RSI_PC2', 'MFV', 'OBV', 'VWAP', 'Range', 'Volume-ATR']
 lstm_features = ['RSI_PC2', 'RSI_PC1', 'MFV', 'OBV', 'VWAP', 'Range', 'Volume-ATR', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'Lower_Wick', 'Direction']
@@ -1334,8 +1412,13 @@ labels_test = meta_labels[cut:]
 weights_test = meta_weights[cut:]
 closes_test = closes[cut:]
 
-stack, pred_labels = build_meta_model(data_train[meta_features], labels_train, weights_train, data_test[meta_features], labels_test, data_train[lstm_features], data_test[lstm_features], closes_test)
-profit = trading_simulation(pred_labels, closes_test)
+#→ trying hidden1=84, hidden2=55, hidden3=9, lr=0.00060551, dropout=0.09111804, window=40, noise=0.20802087, ker=0.05681326, rec=0.00322820, rec_drop=0.21257794
+#307
+stack, pred_labels, profit = build_meta_model(data_train[meta_features], labels_train, weights_train, data_test[meta_features], labels_test, closes_test, data_train[lstm_features], data_test[lstm_features],
+    lstm_hidden_units=[84,55,9], lstm_dropout=0.09111804, lstm_learning_rate=0.00060551, lstm_window_size=40, lstm_rec_drop=0.5,
+    lstm_noise=0.20802087, lstm_ker=0.05681326, lstm_rec=0.00322820)
+print(profit)
+#286.2362360730648 at 0.5 rec_drop
 
 #HMM hyperparameter tuning
 # X = data[hmm_features].values
@@ -1430,3 +1513,122 @@ profit = trading_simulation(pred_labels, closes_test)
 # arch_bayes.fit(X, ret)
 # print("Best params:", arch_bayes.best_params_)
 # print("avg-loglike:", arch_bayes.best_score_)
+
+#LSTM tuning
+# space = [
+#     Integer(16, 128, name="hidden1"),
+#     Integer(8, 64,   name="hidden2"),
+#     Integer(4, 32,   name="hidden3"),
+#     Real(1e-4, 1e-2, "log-uniform", name="lr"),
+#     Real(0.0, 0.5,  name="dropout"),
+#     Integer(25, 45, name="window_size"),
+#     Real(0.0, 0.5,  name="rec_dropout"),
+#     Real(1e-4, 1, name="noise"),
+#     Real(1e-4, 1e-1, name="ker"),
+#     Real(1e-4, 1e-1, name="rec")
+# ]
+# def objective(params):
+#     hidden1, hidden2, hidden3, lr, dropout, window_size, rec_dropout, noise, ker, rec = params
+#     print(f"→ trying hidden1={hidden1}, hidden2={hidden2}, hidden3={hidden3}, "
+#           f"lr={lr:.8f}, dropout={dropout:.8f}, window={window_size}, "
+#           f"noise={noise:.8f}, ker={ker:.8f}, rec={rec:.8f}, rec_drop={rec_dropout:.8f}")
+#
+#     stack, preds, profit = build_meta_model(
+#         data_train[meta_features], labels_train, weights_train,
+#         data_test[meta_features], labels_test, closes_test, data_train[lstm_features], data_test[lstm_features],
+#         lstm_hidden_units = [hidden1, hidden2, hidden3],
+#         lstm_dropout = dropout,
+#         lstm_learning_rate = lr,
+#         lstm_window_size = window_size,
+#         lstm_rec_drop = rec_dropout,
+#         lstm_noise = noise,
+#         lstm_ker = ker,
+#         lstm_rec = rec
+#     )
+#     return -profit
+#
+# result = gp_minimize(
+#     objective,
+#     space,
+#     n_calls=30,
+#     random_state=42,
+#     verbose=True
+# )
+#
+# print("Best parameters:", result.x)
+# print("Best profit:", -result.fun)
+
+#hmm feature search
+#hmm_feature_search = ['MFV', 'OBV', 'Stochastic-RSI', 'Upper_Wick', 'RSI_PC1', 'Lower_Wick', 'Lower_Wick_Ratio', 'BTC-ETH_Diff', 'Upper_Wick_Ratio', 'EX_PC2', 'RSI_PC2', 'Closing_Marubozu-OBV', 'Doji-RSI', 'Closing_Marubozu-ATR', 'Short_Candle-RSI', 'Returns', 'Volume-ATR', 'CCI', 'Volume', 'EX_PC3', 'ATR_Drawdown_4', 'Lower_Wick_Ratio_Mean_4', 'Low', 'Body_Ratio', 'TSI_Dev_48', 'Belt_Hold-ATR_Mean_1152', 'Fast_%D', 'Hikkake_Mean_1152', 'Returns_Mean_4', 'OBV_Dev_4', 'RSI_Drawdown_4', 'VWAP', 'Volume_Drawdown_4', 'Range', 'RSI-MACD_Dev_4', 'Day_Mean_384', 'LOW-HIGH_EMA_Mean_96', 'OBV_Dev_96', 'RSI_PC2_Mean_4', 'Closing_Marubozu-ATR_Mean_4', 'VWAP_Drawdown_16', 'Upper_Wick_Mean_4', 'Lower_Wick_Ratio_Dev_4', 'Closing_Marubozu-OBV_Mean_4', 'WILLR_Dev_48', 'Lower_Wick_Mean_4', 'KC_Upper_Dev_4', 'KC_Width_Drawdown_96', 'Day_Mean_1152', 'Volume_Change_Mean_4', 'Doji-ATR_Mean_96']
+# X = data[hmm_feature_search].values
+# scaler = StandardScaler()
+# X_scaled = scaler.fit_transform(X)
+#
+# tscv = TimeSeriesSplit(n_splits=5)
+# hmm = HMMEstimator(n_components=15, covariance_type="full", n_iter=131, min_covar=0.0349, random_state=42)
+# selector = GeneticSelectionCV(
+#         hmm,
+#         cv=tscv,
+#         verbose=1,
+#         scoring=hmm_log_likelihood,
+#         max_features=5,
+#         n_population=40,
+#         crossover_proba=0.5,
+#         mutation_proba=0.2,
+#         n_generations=20,
+#         crossover_independent_proba=0.5,
+#         mutation_independent_proba=0.05,
+#         tournament_size=3,
+#         n_gen_no_change=10,
+#         caching=True,
+#         n_jobs=5
+#     )
+#
+# selector.fit(X_scaled, np.zeros((X_scaled.shape[0])))
+# best_mask = selector.support_
+# scores = selector.generation_scores_
+# selected_idx = np.where(best_mask)[0]
+# selected_feats = [hmm_features[i] for i in selected_idx]
+#
+# print("best scores: ")
+# print(scores)
+# print("Selected HMM features:", selected_feats)
+#LSTM feature search
+# lstm_feature_search = ['MFV', 'Stochastic-RSI', 'Upper_Wick', 'RSI_PC1', 'Lower_Wick', 'Lower_Wick_Ratio', 'BTC-ETH_Diff', 'Upper_Wick_Ratio', 'EX_PC2', 'RSI_PC2', 'Closing_Marubozu-OBV', 'Doji-RSI', 'Closing_Marubozu-ATR', 'Short_Candle-RSI', 'Returns', 'Volume-ATR', 'CCI', 'Volume', 'EX_PC3', 'ATR_Drawdown_4', 'Lower_Wick_Ratio_Mean_4', 'Low', 'Body_Ratio', 'TSI_Dev_48', 'Belt_Hold-ATR_Mean_1152', 'Fast_%D', 'Hikkake_Mean_1152', 'Returns_Mean_4', 'OBV_Dev_4', 'RSI_Drawdown_4', 'VWAP', 'Volume_Drawdown_4', 'Range', 'RSI-MACD_Dev_4', 'Day_Mean_384', 'LOW-HIGH_EMA_Mean_96', 'OBV_Dev_96', 'RSI_PC2_Mean_4', 'Closing_Marubozu-ATR_Mean_4', 'VWAP_Drawdown_16', 'Upper_Wick_Mean_4', 'Lower_Wick_Ratio_Dev_4', 'Closing_Marubozu-OBV_Mean_4', 'WILLR_Dev_48', 'Lower_Wick_Mean_4', 'KC_Upper_Dev_4', 'KC_Width_Drawdown_96', 'Day_Mean_1152', 'Volume_Change_Mean_4', 'Doji-ATR_Mean_96']
+#
+# mask_space = [
+#     Categorical([0,1], name=f"m{i}")
+#     for i in range(len(lstm_feature_search))
+# ]
+#
+# def objective(mask):
+#     selected = [f for f, m in zip(lstm_feature_search, mask) if m]
+#     if "Direction" not in selected:
+#         selected.append("Direction")
+#     print(selected)
+#     if len(selected) == 0:
+#         return 1e6
+#
+#     stack, preds, profit = build_meta_model(data_train[meta_features], labels_train, weights_train,
+#                                                   data_test[meta_features], labels_test, closes_test,
+#                                                   data_train[selected], data_test[selected],
+#                                                   lstm_hidden_units=[84, 55, 9], lstm_dropout=0.09111804,
+#                                                   lstm_learning_rate=0.00060551, lstm_window_size=40, lstm_rec_drop=0.5,
+#                                                   lstm_noise=0.20802087, lstm_ker=0.05681326, lstm_rec=0.00322820)
+#
+#     return -profit
+#
+# res = gp_minimize(
+#     objective,
+#     mask_space,
+#     n_calls=50,
+#     random_state=42,
+#     verbose=True
+# )
+#
+# best_mask = res.x
+# best_features = [f for f,m in zip(meta_features, best_mask) if m]
+# best_profit = -res.fun
+#
+# print("Selected features:", best_features)
+# print("Profit:", best_profit)
