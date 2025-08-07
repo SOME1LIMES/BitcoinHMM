@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.tree import DecisionTreeClassifier
 import talib
 from datetime import datetime
-from xgboost import XGBClassifier
+#from xgboost import XGBClassifier
 from skopt import BayesSearchCV, gp_minimize
 from skopt.space import Real, Integer, Categorical
 from sklearn.decomposition import PCA
@@ -15,18 +15,18 @@ from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import f1_score, accuracy_score, make_scorer, roc_auc_score
-from xgboost import plot_importance
+#from xgboost import plot_importance
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn_genetic import GAFeatureSelectionCV
-from genetic_selection import GeneticSelectionCV
+from sklearn.linear_model import BayesianRidge
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+# from sklearn_genetic import GAFeatureSelectionCV
+# from genetic_selection import GeneticSelectionCV
 import requests
 from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
 import json
 import time
-import urllib.parse
-import hashlib
-import hmac
 import datetime
 import tkinter as tk
 from tkinter import messagebox
@@ -50,13 +50,21 @@ from keras.metrics import AUC
 from keras.initializers import GlorotUniform, Orthogonal
 from keras.regularizers import l2
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
+from keras.saving import register_keras_serializable
 from keras import backend
-import keras_tuner as kt
-from arch import arch_model
+#import keras_tuner as kt
+#from arch import arch_model
 import tensorflow as tf
 import random
 import os
+import logging
+from logging.handlers import RotatingFileHandler
+import math
+from decimal import Decimal, ROUND_DOWN
 from trendline import walkforward_model, trendline_breakout_dataset
+from api import (get_historical_data, get_recent_data, safe_get_balances, buy_btc_market,
+                 sell_btc_market, buy_btc_limit, sell_btc_limit, get_all_open_orders,
+                 get_exchange_info, cancel_open_orders, get_symbol_filters)
 
 np.random.seed(42)
 tf.random.set_seed(42)
@@ -64,6 +72,7 @@ random.seed(42)
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
 os.environ["TF_DETERMINISTIC_OPS"] = "1"
+os.environ["TF_CUDNN_DETERMINISM"] = "1"
 os.environ["PYTHONHASHSEED"] = "42"
 backend.clear_session()
 warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
@@ -71,7 +80,11 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', 100)
 #pd.set_option('display.float_format', '{:.0f}'.format)
 
-api_key = 'IbIgJihiEgl4rEjWnOFazg7F4YVzJXVG8if3iKcGsurgspgblDN2F73XMPdUzOcH'
+logger = logging.getLogger("continuous_trading")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler("trading.log", maxBytes=20_000_000, backupCount=3)
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logger.addHandler(handler)
 
 def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, eth_data=None):
     if file:
@@ -400,7 +413,6 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
     df['Label_Drawdown_1152'] = (df['Label'].shift(1) / df['Label'].shift(1).rolling(window=1152).max() - 1).rolling(window=1152).min()
 
     df = pd.concat([df, agg_df], axis=1)
-    df = df.dropna(axis=1, thresh=len(df) - 1452)
     df = df.fillna(0)
 
     #defragmenting dataframe
@@ -547,7 +559,6 @@ def load_and_preprocess_data(filepath, xg_features=None, file=True, data=None, e
                 training_agg_df[f'{feature}_Drawdown_{period}'] = (training_df[feature] / training_df[feature].rolling(window=period).max() - 1).rolling(window=period).min()
 
     training_df = pd.concat([training_df, training_agg_df], axis=1)
-    training_df = training_df.dropna(axis=1, thresh=len(training_df) - 1452)
     training_df = training_df.fillna(0)
 
     # magnitude_weight = np.log1p(training_df['Price_Diff_Future_Abs'].values)
@@ -614,109 +625,6 @@ def custom_pnl_objective(y_true, y_pred):
 
     return grad.astype(np.float32), hess.astype(np.float32)
 
-def get_binanceus_signature(data, secret):
-    postdata = urllib.parse.urlencode(data)
-    message = postdata.encode()
-    byte_key = bytes(secret, 'UTF-8')
-    mac = hmac.new(byte_key, message, hashlib.sha256).hexdigest()
-    return mac
-
-def exchange_btc(side, quoteOrderQty):
-    data = {
-        "symbol": 'BTCUSDC',
-        "side": side,
-        "type": 'MARKET',
-        "quoteOrderQty": quoteOrderQty,
-        "timestamp": int(round(time.time() * 1000))
-    }
-    headers = {
-        'X-MBX-APIKEY': api_key
-    }
-    signature = get_binanceus_signature(data, api_sec)
-    payload = {
-        **data,
-        "signature": signature,
-    }
-    req = requests.post(('https://api.binance.us/api/v3/order'), headers=headers, data=payload)
-    return req.text
-
-def get_historical_data(start_time, end_time, symbol='BTCUSDC'):
-    url = 'https://api.binance.us/api/v3/klines'
-    headers = {
-        'X-MBX-APIKEY': api_key,
-    }
-    parameters = {
-        'symbol': symbol,
-        'interval': '15m',
-        'startTime': str(start_time),
-        'limit': '1000'
-    }
-
-    flag = True
-    dataframes = []
-    session = requests.Session()
-    while(flag):
-        session.headers.update(headers)
-
-        try:
-            response = session.get(url, params=parameters)
-            data = json.loads(response.text)
-        except (ConnectionError, requests.Timeout, requests.TooManyRedirects) as e:
-            print(e)
-
-        df = pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
-
-        for i in range(len(data)):
-            df.loc[len(df)] = {"Timestamp": int(data[i][0]),
-                               "Open": float(data[i][1]),
-                               "High": float(data[i][2]),
-                               "Low": float(data[i][3]),
-                               "Close": float(data[i][4]),
-                               "Volume": float(data[i][5])}
-            close_time = int(data[i][6])
-
-            if close_time >= end_time:
-                flag = False
-        dataframes.append(df)
-
-        start_time += (1000*15*60000) #add time in milliseconds
-        parameters['startTime'] = start_time #update time
-
-    combined_df = pd.concat(dataframes, ignore_index=True)
-    return combined_df
-
-def get_recent_data(count='1000', symbol='BTCUSDC'):
-    url = 'https://api.binance.us/api/v3/klines'
-    headers = {
-        'X-MBX-APIKEY': api_key,
-    }
-    parameters = {
-        'symbol': symbol,
-        'interval': '15m',
-        'limit': count
-    }
-
-    session = requests.Session()
-    session.headers.update(headers)
-
-    try:
-        response = session.get(url, params=parameters)
-        data = json.loads(response.text)
-    except (ConnectionError, requests.Timeout, requests.TooManyRedirects) as e:
-        print(e)
-
-    df = pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
-
-    for i in range(len(data)):
-        df.loc[len(df)] = {"Timestamp": int(data[i][0]),
-                            "Open": float(data[i][1]),
-                            "High": float(data[i][2]),
-                            "Low": float(data[i][3]),
-                            "Close": float(data[i][4]),
-                            "Volume": float(data[i][5])}
-
-    return df
-
 def convert_data_to_windows(data, window_size=2):
     final = pd.DataFrame()
     non_windowed = ['Label', 'Weights', 'RSI_PC1', 'RSI_PC2', 'RSI_PC3', 'ATR_PC1', 'ATR_PC2', 'ATR_PC3', 'ADX_PC1', 'ADX_PC2', 'ADX_PC3', 'ADX_PC4', 'ADX_PC5']
@@ -733,7 +641,7 @@ def convert_data_to_windows(data, window_size=2):
     # window_data['Label'] = window_data['Label'].shift(1)
     # window_data['Weights'] = window_data['Weights'].shift(1)
 
-def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5):
+def trading_simulation(labels, closes, starting_money=500, spend_percentage=1):
     money = starting_money
     bitcoin = 0
     close_prices = closes
@@ -743,7 +651,6 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
     #0 is sell, 2 is buy
     count = 0
     day_count = 0
-    overconfidence = 0
     last_bought_price = 0
     last_sold_price = 0
     profitable_trade_count = 0
@@ -761,13 +668,9 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
             #         return
             day_count += 1
 
-        # hold = False
-        # if (probability[0] >= (0.5 - holdout_threshold) and (probability[0] <= (0.5 - holdout_threshold))) and (probability[1] >= (0.5 - holdout_threshold) and (probability[1] <= (0.5 - holdout_threshold))):
-        #     hold = True
-
-        if label == 1 and sell_order == False:
+        if label == 1:
             sell_order = True
-        elif label == 0 and buy_order == False:
+        elif label == 0:
             #print(f"Overconfidence on Day {count}: {overconfidence}")
             buy_order = True
 
@@ -779,20 +682,22 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
             #print(f"Day {day_count}: SOLD {bitcoin} BTC at {last_sold_price} each.")
             bitcoin = 0
             sell_order = False
+            if last_sold_price > last_bought_price:
+                #print("1")
+                profitable_trade_count += 1
+                trade_count += 1
+            else:
+                #print("0")
+                trade_count += 1
         elif buy_order and label == 1:
-            amount_to_spend = money * spend_percentage
+            spend = money * spend_percentage
+            amount_to_spend = min(spend, money)
             bitcoin_bought = amount_to_spend / close_prices[count]
             bitcoin += bitcoin_bought
             money -= amount_to_spend
             buy_order = False
             last_bought_price = close_prices[count]
             #print(f"Day {day_count}: BOUGHT {bitcoin_bought} BTC at {last_bought_price} each.")
-
-        if last_sold_price > last_bought_price:
-            profitable_trade_count += 1
-            trade_count += 1
-        else:
-            trade_count += 1
 
         #print(f"Money: {money}, Bitcoin: {bitcoin}, Count: {count}")
         count += 1
@@ -801,7 +706,7 @@ def trading_simulation(labels, closes, starting_money=500, spend_percentage=0.5)
     profit = total_assets - starting_money
     print("Final money: ", total_assets)
     print("Profit: ", profit)
-    print("Percentage profitable: ", profitable_trade_count / trade_count)
+    #print("Percentage profitable: ", profitable_trade_count / trade_count)
     return profit
 
 def get_next_interval(interval_seconds):
@@ -815,82 +720,132 @@ def notify():
     messagebox.showinfo("Notification", "Your code has finished running!")
     root.destroy()
 
-def continuous_sim(xgboost_model, xg_features, agg_features):
+def continuous_sim(models, meta_features, agg_features, lstm_features, hmm_features,
+                   min_prob=0.539, max_prob=0.548, overconfidence_mult=100,
+                   starting_money=500, spend_percentage=1):
+    # while True:
+    #     now = datetime.datetime.now()
+    #     if now.minute % 15 == 0 and now.second == 1:
+    #         break
+    #     time.sleep(0.1)
+
     twenty_days_ms = 60 * 24 * 60 * 60 * 1000
     current_time = int(time.time() * 1000)
-    # while current_time % (15 * 60 * 1000) != 0:
-    #     current_time = int(time.time() * 1000)
-
     print(f"Current time: {current_time}")
     start_time = current_time - twenty_days_ms
     raw_data = get_historical_data(start_time, current_time)
     eth_data = get_historical_data(start_time, current_time, 'ETHUSDC')
+    raw_data.drop(raw_data.index[-1], inplace=True)
+    eth_data.drop(eth_data.index[-1], inplace=True)
+    eth_df = eth_data.copy()
     recent_df = raw_data.copy()
     # 1735732800000, 1738411200000 -> Jan 2025
     # 1648728000000, 1738324800000 -> March 2023 to now
-    recent_df = load_and_preprocess_data("", xg_features, False, data=recent_df, eth_data=eth_data)
-    xg_features.extend(['EX_PC2'])
-    print(recent_df['EX_PC2'].tail(10))
-    #recent_df = recent_df.dropna()
+    recent_df = load_and_preprocess_data("", meta_features, False, data=recent_df, eth_data=eth_df)
+    recent_df['Direction'] = (recent_df['Returns'] > 0).astype(int)
 
-    recent_df['Label'] = 0
-    recent_df['Weights'] = 0
-    recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+    # non_zero = [c for c in recent_df.columns if not (recent_df[c] == 0).all()]
+    # imp = IterativeImputer(
+    #     estimator=BayesianRidge(),
+    #     missing_values=0,
+    #     sample_posterior=False,
+    #     max_iter=20,
+    #     tol=1e-3,
+    #     n_nearest_features=10,
+    #     initial_strategy='median',
+    #     imputation_order='ascending',
+    #     random_state=42
+    # )
+    # recent_df[non_zero] = pd.DataFrame(
+    #     imp.fit_transform(recent_df[non_zero]),
+    #     index=recent_df.index,
+    #     columns=non_zero
+    # )
 
-    recent_df = recent_df.drop(index=recent_df.index[:window_size-1])
+    hmm_scaler = joblib.load('hmm_scaler.pkl')
+    hmm = joblib.load('trained_hmm.pkl')
+    meta_hmm = hmm_scaler.transform(recent_df[hmm_features].values)
+    hmm_df = hmm_walk_forward(hmm, meta_hmm)
+    hmm_df = hmm_df.reset_index(drop=True)
     recent_df = recent_df.reset_index(drop=True)
-    recent_df_windowed = recent_df_windowed.reset_index(drop=True)
-    recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
-    recent_df.drop(['Label'], axis=1, inplace=True)
-    recent_df.drop(['Weights'], axis=1, inplace=True)
-    pred_labels = xgboost_model.predict(recent_df).tolist()
-    last_label = pred_labels[-1]
+    recent_df = pd.concat([recent_df, hmm_df], axis=1)
 
-    time.sleep(900)
+    full_features = meta_features.copy()
+    full_features.extend(agg_features)
+    labels, probas = predict_with_meta_model(models, recent_df[full_features], recent_df[lstm_features])
+    label = labels[-1]
+    proba = probas[-1]
+    price = recent_df['Close'].iloc[-1]
+    timestamp = raw_data['Timestamp'].iloc[-1]
+
+    money = starting_money
+    bitcoin = 0.0
+    buy_order = False
+    sell_order = False
+    count = 0
 
     while True:
-        row = get_recent_data('1')
-        eth_row = get_recent_data('1', 'ETHUSDC')
+       # overconfidence = abs(proba - 0.511) * overconfidence_mult
+        hold = (min_prob <= proba <= max_prob)
+
+        if label == 1 and not hold:
+            sell_order = True
+        elif label == 0 and not hold:
+            buy_order = True
+
+        if sell_order and label == 0:
+            money += bitcoin * price
+            bitcoin = 0.0
+            sell_order = False
+        elif buy_order and label == 1:
+            desired = money * spend_percentage
+            spend = min(desired, money)
+            btc_amt = spend / price
+            bitcoin += btc_amt
+            money -= spend
+            buy_order = False
+
+        count += 1
+        print("timestamp: " + str(timestamp))
+        print("last close: " + str(price))
+        print(f"[{count}] label={label}  proba={proba:.4f}  money={money:.2f}  btc={bitcoin:.6f}")
+        while True:
+            now = datetime.datetime.now()
+            if now.minute % 15 == 0 and now.second == 10:
+                break
+            time.sleep(0.1)
+
+        row = get_recent_data('2')
+        eth_row = get_recent_data('2', 'ETHUSDC')
+        row = row.iloc[[0]]
+        eth_row = eth_row.iloc[[0]]
         raw_data = pd.concat([raw_data, row], ignore_index=True)
         eth_data = pd.concat([eth_data, eth_row], ignore_index=True)
         recent_df = raw_data.copy()
+        eth_df = eth_data.copy()
         # 1735732800000, 1738411200000 -> Jan 2025
         # 1648728000000, 1738324800000 -> March 2023 to now
-        recent_df = load_and_preprocess_data("", False, data=recent_df, eth_data=eth_data)
-        recent_df = recent_df.dropna()
+        recent_df = load_and_preprocess_data("", meta_features, False, data=recent_df, eth_data=eth_df)
+        recent_df['Direction'] = (recent_df['Returns'] > 0).astype(int)
+        #recent_df = recent_df.fillna(0)
 
-        recent_df['Label'] = 0
-        recent_df['Weights'] = 0
-        recent_df_windowed = convert_data_to_windows(recent_df[xg_features], window_size)
+        # recent_df[non_zero] = pd.DataFrame(
+        #     imp.transform(recent_df[non_zero]),
+        #     index=recent_df.index,
+        #     columns=non_zero
+        # )
 
-        recent_df = recent_df.drop(index=recent_df.index[:window_size-1])
+        meta_hmm = hmm_scaler.transform(recent_df[hmm_features].values)
+        hmm_df = hmm_walk_forward(hmm, meta_hmm)
+        hmm_df = hmm_df.reset_index(drop=True)
         recent_df = recent_df.reset_index(drop=True)
-        recent_df_windowed = recent_df_windowed.reset_index(drop=True)
-        recent_df = pd.concat([recent_df_windowed, recent_df[agg_features]], axis=1)
-        recent_df.drop(['Label'], axis=1, inplace=True)
-        recent_df.drop(['Weights'], axis=1, inplace=True)
+        recent_df = pd.concat([recent_df, hmm_df], axis=1)
 
-        # 1740362400000
-
-        last_price = recent_df['Close_t0'].iloc[-2]
-        recent_price = recent_df['Close_t0'].iloc[-1]
-        #last_timestamp = recent_df['Timestamp_t0'].iloc[-2]
-        #recent_timestamp = recent_df['Timestamp_t0'].iloc[-1]
-        print(f"Last price: {last_price}")
-        print(f"Recent price: {recent_price}")
-        print("Label: " + str(last_label))
-        if last_price >= recent_price and last_label == 0:
-            print("Sell prediction correct")
-        elif last_price < recent_price and last_label == 1:
-            print("Buy prediction correct")
-        else:
-            print("Prediction incorrect")
-
-        pred_labels = xgboost_model.predict(recent_df).tolist()
-        probas = xgboost_model.predict_proba(recent_df).tolist()
-        print(probas[-1])
-        last_label = pred_labels[-1]
-        time.sleep(900)
+        labels, probas = predict_with_meta_model(models, recent_df[full_features], recent_df[lstm_features])
+        label = labels[-1]
+        proba = probas[-1]
+        price = recent_df['Close'].iloc[-1]
+        timestamp = raw_data['Timestamp'].iloc[-1]
 
 def calculate_meta_features(data, labels, weights, base_learners, tscv):
     labels = np.array(labels)
@@ -968,6 +923,11 @@ def calculate_lstm_features(data, weights, window, hidden_units, dropout, learni
             orig_i = test_idx[i + window]
             preds[orig_i] = p
     return preds
+
+@register_keras_serializable()
+def mix_fn(x):
+    a, nn_p, lr_p = x
+    return a * lr_p + (1.0 - a) * nn_p
 
 def build_meta_model(data_train, labels_train, weights_train, data_test, labels_test, closes_test, lstm_data_train, lstm_data_test, lstm_hidden_units,
                      lstm_dropout, lstm_learning_rate, lstm_window_size, lstm_rec_drop, lstm_noise, lstm_ker, lstm_rec):
@@ -1052,10 +1012,6 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     gate = BatchNormalization()(gate)
     gate = Dense(16, activation="relu")(gate)
     gate = Dense(1, activation="sigmoid", name="gate")(gate)
-
-    def mix_fn(x):
-        a, nn_p, lr_p = x
-        return a * lr_p + (1.0 - a) * nn_p
     mixture = Lambda(mix_fn, name="mixture")([gate, nn_expert, lr_in])
 
     es = EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True, mode="max")
@@ -1120,33 +1076,34 @@ def build_meta_model(data_train, labels_train, weights_train, data_test, labels_
     reliability_data_test['probas'] = moe_probas_test
     reliability_probs = reliability_model.predict_proba(reliability_data_test)[:, 1]
 
-    moe_labels = (moe_probas_test >= 0.50300).astype(int)
-    mask = (reliability_probs >= 0.57900).astype(int)
-    preds = np.where(mask, moe_labels, -1)
-    profit = trading_simulation(preds, closes_test)
+    # moe_labels = (moe_probas_test >= 0.50300).astype(int)
+    # mask = (reliability_probs >= 0.57900).astype(int)
+    # preds = np.where(mask, moe_labels, -1)
+    # profit = trading_simulation(preds, closes_test)
 
-    # thresh_grid = np.linspace(0.4, 0.6, 201)
-    # best_profit = -np.inf
-    # best_pair = (None, None)
-    # for thresh_moe in thresh_grid:
-    #     moe_labels = (moe_probas_test >= thresh_moe).astype(int)
-    #     for thresh_mask in thresh_grid:
-    #         mask = (reliability_probs >= thresh_mask).astype(int)
-    #         preds = np.where(mask, moe_labels, -1)
-    #         profit = trading_simulation(preds, closes_test)
-    #         if profit > best_profit:
-    #             best_profit = profit
-    #             best_pair = (thresh_moe, thresh_mask)
-    #             best_preds = preds
+    thresh_grid = np.linspace(0.4, 0.6, 201)
+    best_profit = -np.inf
+    best_pair = (None, None)
+    for thresh_moe in thresh_grid:
+        moe_labels = (moe_probas_test >= thresh_moe).astype(int)
+        for thresh_mask in thresh_grid:
+            mask = (reliability_probs >= thresh_mask).astype(int)
+            preds = np.where(mask, moe_labels, -1)
+            profit = trading_simulation(preds, closes_test)
+            if profit > best_profit:
+                best_profit = profit
+                best_pair = (thresh_moe, thresh_mask)
+                best_preds = preds
 
     #Best profit = 268.87617 at thresh_moe = 0.49500, thresh_mask = 0.54500
     #Best profit = 272.15604 at thresh_moe = 0.50300, thresh_mask = 0.57900 - new lgbm data
     #Best profit = 295.27515 at thresh_moe = 0.50000, thresh_mask = 0.58200 - new lstm hypers
+    #Best profit = 259.92007 at thresh_moe = 0.50100, thresh_mask = 0.51700 - laptop
 
-    #print(f"Best profit = {best_profit:.5f} at " f"thresh_moe = {best_pair[0]:.5f}, " f"thresh_mask = {best_pair[1]:.5f}")
+    print(f"Best profit = {best_profit:.5f} at " f"thresh_moe = {best_pair[0]:.5f}, " f"thresh_mask = {best_pair[1]:.5f}")
     save_meta_model("meta_model", estimators, best_stack, lstm, lstm_features, lstm_window_size, lstm_scaler, moe, reliability_model)
 
-    return best_stack, preds, profit
+    return best_stack, best_preds, best_profit
 
 
 def save_meta_model(path, base_learners, meta_lr, lstm_model, lstm_features, lstm_window_size, lstm_scaler, moe_model, reliability_model):
@@ -1160,34 +1117,35 @@ def save_meta_model(path, base_learners, meta_lr, lstm_model, lstm_features, lst
             "features": lstm_features,
             "window_size": lstm_window_size
         }, f)
-    moe_model.save(os.path.join(path, "moe_model"))
+    moe_model.save(os.path.join(path, "moe_model.keras"))
     joblib.dump(reliability_model, os.path.join(path, "reliability_model.pkl"))
 
 def load_meta_model(path):
     base_learners = joblib.load(os.path.join(path, "base_learners.pkl"))
     meta_lr = joblib.load(os.path.join(path, "meta_lr.pkl"))
-    lstm_model = load_model(os.path.join(path, "lstm_model"), compile=False)
+    lstm_model = load_model(os.path.join(path, "lstm_model.keras"), compile=False)
     lstm_scaler = joblib.load(os.path.join(path, "lstm_scaler.pkl"))
     with open(os.path.join(path, "lstm_config.json")) as f:
         cfg = json.load(f)
     lstm_features = cfg["features"]
     lstm_window_size = cfg["window_size"]
 
-    moe_model = load_model(os.path.join(path, "moe_model"), compile=False)
+    moe_model = load_model(os.path.join(path, "moe_model.keras"), compile=False, custom_objects={"mix_fn": mix_fn})
     reliability_model = joblib.load(os.path.join(path, "reliability_model.pkl"))
 
     return (base_learners, meta_lr, lstm_model, lstm_features, lstm_window_size, lstm_scaler, moe_model, reliability_model)
 
-def predict_with_meta_model(models, data_test, lstm_data_test, closes_test):
-    (base_learners, meta_lr, lstm_model, lstm_features, lstm_window_size, lstm_scaler, moe_model, reliability_model, thresholds) = models
+def predict_with_meta_model(models, data_test, lstm_data_test):
+    (base_learners, meta_lr, lstm_model, lstm_features, lstm_window_size, lstm_scaler, moe_model, reliability_model) = models
 
     meta_test = pd.DataFrame(
       {name: clf.predict_proba(data_test)[:,1]
-        for name, clf in base_learners.items()},
+        for name, clf in base_learners},
       index=data_test.index)
 
-    X = lstm_data_test[lstm_features].copy()
-    X[lstm_features] = lstm_scaler.transform(X[lstm_features])
+    X = lstm_data_test.copy()
+    cols = [c for c in lstm_features if c != "Direction"]
+    X[cols] = lstm_scaler.transform(X[cols])
     # prep sliding windows exactly as during training:
     X_seq, _ = prep_lstm_data(X, lstm_features, lstm_window_size, target="Direction")
     lstm_preds = lstm_model.predict(X_seq).ravel()
@@ -1207,16 +1165,15 @@ def predict_with_meta_model(models, data_test, lstm_data_test, closes_test):
     reliability_input["probas"] = moe_probas
     mask_probas = reliability_model.predict_proba(reliability_input)[:,1]
 
-    tm, tmask = 0.50000, 0.58200
-    moe_labels = (moe_probas  >= tm).astype(int)
+    tm, tmask = 0.48500, 0.53300
+    moe_labels = (moe_probas >= tm).astype(int)
     mask_labels = (mask_probas >= tmask).astype(int)
     preds = np.where(mask_labels, moe_labels, -1)
-    profit = trading_simulation(preds, closes_test)
+    probas = np.where(mask_labels, moe_probas, -1)
 
-    return preds, profit
+    return preds, probas
 
-class HMMEstimator(BaseEstimator, RegressorMixin): #sklearn wrapper for hmm so I can run bayes search
-    _estimator_type = "regressor"
+class HMMEstimator(BaseEstimator): #sklearn wrapper for hmm so I can run bayes search
     def __init__(self, n_components=3, covariance_type="full", n_iter=100, random_state=42, min_covar=1e-3):
         self.n_components = n_components
         self.covariance_type = covariance_type
@@ -1352,74 +1309,242 @@ def build_stacked_lstm(timesteps, n_feats, lstm_units=[60,24,4], dropout=0.35567
     m.compile(optimizer=Adam(lr), loss='binary_crossentropy', metrics=["accuracy", AUC(name="auc")])
     return m
 
+def quantize_down(value, tick):
+    d = Decimal(str(value))
+    q = (d // tick) * tick
+    return format(q, f"f")
+
+def continuous_trading(models, meta_features, agg_features, lstm_features, hmm_features,
+                   min_prob=0.539, max_prob=0.548, spend_percentage=1):
+    # while True:
+    #     now = datetime.datetime.now()
+    #     if now.minute % 15 == 0 and now.second == 0:
+    #         break
+    #     time.sleep(0.1)
+    filters = get_symbol_filters("BTCUSDC")
+    price_tick = Decimal(filters['PRICE_FILTER']['tickSize'])
+    qty_step = Decimal(filters['LOT_SIZE']['stepSize'])
+    min_notional = Decimal(filters["MIN_NOTIONAL"]["minNotional"])
+
+    twenty_days_ms = 15000 * 15 * 60 * 1000
+    current_time = int(time.time() * 1000)
+    print(f"Current time: {current_time}")
+    logger.info(f"Starting continuous_trading at unix ms {current_time}")
+    start_time = current_time - twenty_days_ms
+
+    raw_data = get_historical_data(start_time, current_time)
+    eth_data = get_historical_data(start_time, current_time, 'ETHUSDC')
+    recent_df = raw_data.copy()
+    recent_df = load_and_preprocess_data("", meta_features, False, data=recent_df, eth_data=eth_data)
+    recent_df['Direction'] = (recent_df['Returns'] > 0).astype(int)
+
+    hmm_scaler = joblib.load('hmm_scaler.pkl')
+    hmm = joblib.load('trained_hmm.pkl')
+    meta_hmm = hmm_scaler.transform(recent_df[hmm_features].values)
+    hmm_df = hmm_walk_forward(hmm, meta_hmm)
+    hmm_df = hmm_df.reset_index(drop=True)
+    recent_df = recent_df.reset_index(drop=True)
+    recent_df = pd.concat([recent_df, hmm_df], axis=1)
+
+    full_features = meta_features.copy()
+    full_features.extend(agg_features)
+    labels, probas = predict_with_meta_model(models, recent_df[full_features], recent_df[lstm_features])
+    label = labels[-1]
+    proba = probas[-1]
+    close = recent_df['Close'].iloc[-1]
+
+    buy_order = False
+    sell_order = False
+    count = 0
+    bitcoin, money = safe_get_balances()
+    while True:
+        print("Latest price: " + str(close))
+        logger.info("Latest price: " + str(close))
+
+        hold = (min_prob <= proba <= max_prob)
+
+        if label == 1 and not hold:
+            sell_order = True
+        elif label == 0 and not hold:
+            buy_order = True
+
+        if sell_order and label == 0 and bitcoin != 0:
+            sell_price = Decimal(str(close))
+            raw_qty = Decimal(str(bitcoin))
+            qty_str = quantize_down(raw_qty, qty_step)
+            price_str = quantize_down(sell_price, price_tick)
+            #^ need this incase str() returns a float in scientific notation
+            text = sell_btc_limit(qty_str, price_str)
+            deadline = datetime.datetime.now() + datetime.timedelta(minutes=14)
+            while datetime.datetime.now() < deadline:
+                time.sleep(60 - datetime.datetime.now().second)
+                bitcoin, _ = safe_get_balances()
+                raw_qty = Decimal(str(bitcoin))
+                qty_str = quantize_down(raw_qty, qty_step)
+
+                #if order still active
+                if len(get_all_open_orders()) == 1:
+                    sell_price -= Decimal(str((0.125 * recent_df['ATR'].iloc[-1])/14))
+                    price_str = quantize_down(sell_price, price_tick)
+                    cancel_open_orders()
+                    text = sell_btc_limit(qty_str, price_str)
+                else:
+                    break
+
+            bitcoin, _ = safe_get_balances()
+            if bitcoin != 0:
+                cancel_open_orders()
+                text = sell_btc_market(qty_str)
+
+            logger.info(f"Sell order response: {text}")
+            logger.info(f"BTC qty: {qty_str}")
+            sell_order = False
+        elif buy_order and label == 1:
+            desired = money * spend_percentage
+            spend = min(desired, money)
+            buy_price = close
+            raw_qty = spend/buy_price
+            qty_str = quantize_down(raw_qty, qty_step)
+            price_str = quantize_down(close, price_tick)
+            text = buy_btc_limit(qty_str, price_str)
+            deadline = datetime.datetime.now() + datetime.timedelta(minutes=14)
+            while datetime.datetime.now() < deadline:
+                time.sleep(60 - datetime.datetime.now().second)
+                _, money = safe_get_balances()
+                desired = money * spend_percentage
+                spend = min(desired, money)
+
+                # if order still active
+                if len(get_all_open_orders()) == 1:
+                    buy_price += (0.125 * recent_df['ATR'].iloc[-1]) / 14
+                    raw_qty = spend / buy_price
+                    qty_str = quantize_down(raw_qty, qty_step)
+                    price_str = quantize_down(close, price_tick)
+                    cancel_open_orders()
+                    text = buy_btc_limit(qty_str, price_str)
+                else:
+                    break
+
+            if len(get_all_open_orders()) == 1:
+                cancel_open_orders()
+                text = "Buy order cancelled"
+
+            logger.info(f"Buy order response: {text}")
+            logger.info(f"USDC qty: {str(spend)}")
+            buy_order = False
+
+        count += 1
+        bitcoin, money = safe_get_balances()
+        print(f"[{count}] label={label}  proba={proba:.4f}  usdc={money:.10f}  btc={bitcoin:.10f}")
+        logger.info(f"[{count}] label={label}  proba={proba:.4f}  usdc={money:.10f}  btc={bitcoin:.10f}")
+
+        while True:
+            now = datetime.datetime.now()
+            if now.minute % 15 == 0 and now.second == 3:
+                break
+            time.sleep(0.05)
+
+        row = get_recent_data('1')
+        eth_row = get_recent_data('1', 'ETHUSDC')
+        raw_data = pd.concat([raw_data, row], ignore_index=True)
+        eth_data = pd.concat([eth_data, eth_row], ignore_index=True)
+        recent_df = raw_data.copy()
+        recent_df = load_and_preprocess_data("", meta_features, False, data=recent_df, eth_data=eth_data)
+        recent_df['Direction'] = (recent_df['Returns'] > 0).astype(int)
+
+        meta_hmm = hmm_scaler.transform(recent_df[hmm_features].values)
+        hmm_df = hmm_walk_forward(hmm, meta_hmm)
+        hmm_df = hmm_df.reset_index(drop=True)
+        recent_df = recent_df.reset_index(drop=True)
+        recent_df = pd.concat([recent_df, hmm_df], axis=1)
+
+        labels, probas = predict_with_meta_model(models, recent_df[full_features], recent_df[lstm_features])
+        label = labels[-1]
+        proba = probas[-1]
+        close = recent_df['Close'].iloc[-1]
+
 hmm_scaler = StandardScaler()
 hmm_features = ['RSI_PC2', 'MFV', 'OBV', 'VWAP', 'Range', 'Volume-ATR']
 lstm_features = ['RSI_PC2', 'RSI_PC1', 'MFV', 'OBV', 'VWAP', 'Range', 'Volume-ATR', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'Lower_Wick', 'Direction']
-meta_features =  ['Short_Candle-RSI', 'Volume-ATR', 'Lower_Wick_Ratio', 'Stochastic-RSI', 'Closing_Marubozu-OBV', 'Returns', 'Lower_Wick', 'Returns_Mean_4', 'ATR_Drawdown_4', 'MFV', 'RSI_PC1', 'Low', 'EX_PC2', 'Body_Ratio', 'Belt_Hold-ATR_Mean_1152', 'VWAP_Drawdown_16', 'EX_PC3', 'RSI_PC2_Mean_4', 'Volume-ATR_Mean_96', 'Proba_Sig_Mean_48', 'Lower_Wick_Ratio_Mean_4', 'Hour_Sin_Dev_16', 'Volume_Drawdown_4', 'RSI_PC3', 'CCI', 'state_9_proba', 'BTC-ETH_Diff', 'ADX_PC1_Dev_4', 'CCI_Mean_4', 'Doji-RSI_Mean_16', 'ADX_PC5_Mean_4', 'RSI_PC1_Dev_48', 'BTC-ETH_Diff_Drawdown_16', 'WILLR_Dev_48', 'Volume-ATR_Dev_4', 'Body_Ratio_Dev_48', 'Fast_%D', 'Short_Candle_Dev_384', 'Hour_Cos_Dev_48', 'Spinning_Top_Dev_48', 'ADX_PC4', 'Belt_Hold-RSI_Drawdown_384', 'BTC-ETH_Diff_Dev_384', 'BB-KC_Drawdown_16', 'Long_Doji-RSI_Mean_48', 'RSI_PC3_Drawdown_4', 'ADX_PC4_Drawdown_48', 'RSI_PC2', 'Aroon_Mean_4', 'Lower_Wick_Mean_4', 'Stochastic-RSI_Dev_4', 'Hikkake_Dev_96', 'Body_Size', 'ATR_Drawdown_16', 'MFV_Dev_4', 'Closing_Marubozu-RSI_Dev_1152', 'Closing_Marubozu-OBV_Drawdown_96', 'ATR_Drawdown_384', 'Fast_%K_Mean_16', 'KC_Upper_Dev_4', 'Volume_Change_Drawdown_96', 'Short_Candle-OBV_Mean_384', 'BTC-ETH_Diff_Mean_96', 'TSI_Drawdown_48', 'Short_Candle-RSI_Dev_16', 'Short_Candle-ATR_Drawdown_96', 'Aroon_Mean_96', 'RSI_PC3_Dev_96', 'Body_Size_Drawdown_16', 'ADX_PC2_Dev_96', 'MACDHist_Dev_4', 'Body_Ratio_Mean_4', 'Short_Candle-ATR_Mean_4', 'Upper_Wick_Ratio', 'RSI_PC3_Drawdown_48', 'TSI_Dev_4', 'Proba_Sig_Dev_96', 'OBV_Dev_4', 'MFV_Dev_48', 'RSI-MACD_Mean_96', 'ATR_PC2_Dev_4', 'Upper_Wick', 'Long_Candle-ATR_Mean_48', 'RSI-MACD_Mean_48', 'Proba_Sig_Dev_384', 'Fast_%K_Drawdown_4', 'Long_Candle-OBV_Mean_4', 'Close_Dev_4', 'Harami_Dev_48', 'BB_Width_Dev_4', 'ADX_PC1_Mean_16', 'Proba_Sig_Mean_16', 'ADX_PC3_Mean_16', 'Belt_Hold_Dev_1152', 'RSI_PC3_Dev_16', 'Chikou_Span_Dev_16', 'A/D_Dev_16', 'BB_Lower_Drawdown_16', 'Long_Candle_Dev_16', 'Closing_Marubozu-ATR', 'ADX_PC3_Drawdown_96', 'ADX_PC2_Drawdown_48', 'MACDSignal_Dev_16', 'Fast_%D_Dev_4', 'ADX_PC2_Mean_1152', 'ADX_Dev_48', 'Upper_Wick_Ratio_Mean_4', 'Doji-ATR_Mean_96', 'state_8_proba', 'A/D_Dev_96', 'state_1_proba', 'Upper_Wick_Mean_4', 'Volume_Dev_96', 'ADX_PC3_Drawdown_4', 'Closing_Marubozu-ATR_Mean_4', 'RSI_PC2_Dev_1152', 'Hikkake_Mean_48', 'Body_Ratio_Mean_16', 'Lower_Wick_Dev_16', 'BTC-ETH_Diff_Mean_16', 'WILLR_Dev_384', 'BB_Upper_Dev_4', 'Long_Doji-RSI_Mean_1152', 'VWAP_Dev_4', 'Volume', 'High_Wave_Dev_16', 'Hour_Sin_Dev_4', 'BB-KC_Dev_96', 'Engulfing_Dev_384', 'Long_Candle-RSI_Mean_96', 'BTC-ETH_Diff_Dev_48', 'RSI-MACD_Dev_16', 'Fast_%D_Drawdown_16', 'Upper_Wick_Dev_16', 'CMF_Drawdown_48', 'Lower_Wick_Ratio_Dev_16', 'MACDHist_Mean_1152', 'MACDHist_Drawdown_16', 'R2_Drawdown_48', 'Ichimoku_Overlap_Dev_96', 'Hikkake_Mean_1152', 'Momentum_Dev_4', 'ADX_PC3_Mean_384', 'ADX_PC4_Drawdown_384', 'ADX_PC4_Dev_4', 'Open_Drawdown_4', 'Day_Mean_384', 'ADX_PC4_Dev_16', 'RSI-MACD_Drawdown_4', 'Low_Dev_4', 'OBV_Dev_16', 'ADX_PC2', 'Body_Size_Dev_48', 'CCI_Dev_96', 'CCI_Drawdown_16', 'ADX_PC4_Mean_1152', 'CMF_Drawdown_4', 'RSI_Drawdown_48', 'CMF_Dev_16', 'ADX_Dev_16', 'Momentum_Mean_96', 'ADX_PC1_Mean_1152', 'state_3_proba', 'ATR_Dev_1152', 'LOW-HIGH_EMA_Dev_4', 'Returns_Dev_96', 'RSI_PC2_Dev_48', 'Short_Candle-RSI_Drawdown_96', 'Volume_Mean_48', 'Volume-ATR_Drawdown_96', 'Volume-ATR_Mean_16', 'MFV_Drawdown_384', 'Belt_Hold-RSI', 'Closing_Marubozu-ATR_Dev_48', 'TSI_Dev_16', 'RSI_PC2_Drawdown_4', 'KC_Width_Drawdown_96', 'Day_Dev_384', 'ADX_PC2_Dev_384', 'ADX_PC5_Mean_384', 'Belt_Hold-RSI_Drawdown_96', 'Dragonfly_Doji-ATR_Mean_96', 'S1_Dev_4', 'Volume-ATR_Drawdown_48', 'Dragonfly_Doji-RSI_Mean_96', 'Stochastic-RSI_Dev_16', 'Close_Dev_16', 'ADX_PC5_Dev_4', 'BB_Upper_Dev_96', 'ADX_PC5_Dev_96', 'Three_Outside_Dev_96', 'Closing_Marubozu_Dev_48', 'MACD_Dev_4', 'Short_Candle-ATR_Mean_16', 'ADX_PC2_Dev_1152', 'BB-KC_Drawdown_96', 'RSI_PC3_Mean_16', 'ADX_PC5_Drawdown_4', 'Hikkake_Dev_16', 'RSI_PC1_Dev_4', 'High_Dev_4', 'Fast_%D_Dev_96', 'High_Wave_Mean_384', 'ADX_PC2_Mean_384', 'Closing_Marubozu-RSI_Dev_96', 'TSI_Dev_48', 'ADX_Mean_96', 'MACDHist_Drawdown_48', 'ATR_PC2_Drawdown_384', 'Lower_Wick_Ratio_Dev_4', 'ADX_PC5_Mean_1152', 'Long_Candle-ATR', 'MACDHist_Mean_96', 'RSI_PC3_Dev_384', 'ADX_PC5_Dev_384', 'Closing_Marubozu-RSI_Drawdown_384', 'RSI_PC2_Dev_384', 'Doji-RSI', 'BTC-ETH_Diff_Mean_1152', 'TSI_Drawdown_4', 'RSI_Drawdown_4', 'ATR_PC2_Dev_16', 'ADX_Drawdown_16', 'RSI_PC2_Dev_96', 'Belt_Hold-ATR_Mean_96', 'ADX_PC3_Dev_96', 'Doji-ATR', 'Price_Diff_Mean_384', 'RSI_PC3_Mean_48', 'ADX_PC1_Drawdown_16', 'Range', 'BB-KC_Dev_4', 'ADX_PC2_Dev_4', 'Aroon_Dev_16', 'RSI_PC1_Dev_1152', 'KC_Width_Dev_4', 'BTC-ETH_Diff_Dev_16', 'ADX_PC5_Dev_1152', 'BB-KC_Dev_48', 'BB_Lower_Drawdown_48', 'Harami_Dev_96', 'Senkou_Span_A_Dev_16', 'ADX_PC3_Dev_4', 'Aroon_Mean_16', 'ATR_PC3_Drawdown_384', 'ADX_PC5_Mean_96', 'state_12_proba', 'RSI_PC3_Drawdown_96', 'Belt_Hold-ATR_Drawdown_96', 'Range_Mean_4', 'ATR_PC1_Drawdown_4', 'ADX_Drawdown_384', 'Day_Mean_1152', 'Spinning_Top_Dev_16', 'Belt_Hold-RSI_Dev_48', 'Body_Size_Drawdown_48', 'Price_Diff_Drawdown_48', 'VWAP', 'BTC-ETH_Diff_Drawdown_4', 'ATR_PC2_Mean_4', 'Closing_Marubozu-OBV_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'ADX_PC2_Dev_16', 'Volume_Change_Mean_4', 'ADX_PC3_Mean_96', 'Fast_%D_Drawdown_4', 'RSI_PC3_Mean_4', 'ADX_PC3_Mean_4', 'ADX_PC1_Dev_16', 'ADX_PC4_Mean_4', 'ADX_PC4_Dev_48', 'Aroon_Dev_48', 'Short_Candle-ATR_Mean_48', 'Closing_Marubozu_Dev_96', 'ADX_PC3_Mean_48', 'BB_Width_Drawdown_96', 'RSI_PC3_Dev_1152', 'Belt_Hold-ATR_Mean_48', 'Fast_%D_Dev_16', 'ADX_PC3_Dev_16', 'ADX_PC1_Dev_96', 'RSI_PC1_Dev_96', 'Hikkake_Dev_384', 'CCI_Drawdown_4', 'ADX_PC3', 'ADX_PC5_Drawdown_96', 'Hikkake_Dev_4', 'Belt_Hold-RSI_Mean_16', 'Long_Candle-OBV', 'Day_Dev_96', 'Belt_Hold-ATR_Mean_16', 'LOW-HIGH_EMA_Drawdown_16', 'VWAP-ATR_Drawdown_96', 'BTC-ETH_Diff_Drawdown_96', 'Volume_Change_Mean_384', 'ADX_PC2_Drawdown_96', 'Sig_Mean_1152', 'ADX_PC3_Dev_384', 'Volatility_Drawdown_96', 'Engulfing_Dev_48', 'Stochastic-RSI_Mean_96', 'KC_Upper_Dev_48', 'BTC-ETH_Diff_Mean_48', 'Closing_Marubozu-ATR_Drawdown_96', 'BTC-ETH_Diff_Mean_384', 'CMF_Drawdown_96', 'Upper_Wick_Ratio_Dev_4', 'ADX_PC4_Drawdown_16', 'Lower_Wick_Ratio_Mean_16', 'VWAP-ATR_Drawdown_48', 'Long_Candle-OBV_Mean_16', 'Short_Candle-ATR', 'CCI_Dev_4', 'BB_Lower_Dev_4', 'ADX_PC3_Dev_48', 'ATR_PC2_Mean_48', 'Senkou_Span_B_Dev_16', 'Closing_Marubozu-RSI_Dev_384', 'TSI_Drawdown_96', 'Short_Candle-OBV_Dev_48', 'Short_Candle-ATR_Mean_96', 'Short_Candle-RSI_Dev_96', 'Range_Drawdown_16', 'Body_Ratio_Drawdown_48', 'Harami_Mean_384', 'CCI_Drawdown_48', 'Proba_Sig_Mean_96', 'Short_Candle-ATR_Mean_384', 'Upper_Wick_Ratio_Dev_16', 'ATR_PC2_Drawdown_4', 'MACDHist_Mean_16', 'ADX_PC4_Drawdown_96', 'Hour_Sin_Mean_4', 'Low_Drawdown_4', 'VWAP_Drawdown_96', 'TSI_Dev_96', 'Hikkake_Dev_48', 'Long_Candle-OBV_Drawdown_96', 'CMF_Drawdown_16', 'Short_Candle-RSI_Dev_4', 'Marubozu-RSI_Dev_384', 'TSI_Mean_4', 'Aroon_Dev_1152', 'RSI_PC1_Drawdown_4', 'Range_Drawdown_48', 'ATR_PC3_Drawdown_4', 'MACDSignal_Drawdown_96', 'BB-KC_Mean_48', 'RSI_Drawdown_16', 'Long_Doji-OBV_Mean_48', 'Volatility_Dev_96', 'ADX_PC4_Dev_96', 'RSI_PC2_Mean_48', 'KC_Lower_Dev_4', 'Lower_Wick_Ratio_Mean_96', 'ADX_PC4_Mean_384', 'ADX_PC1', 'Volume_Change_Mean_96', 'Long_Candle-RSI_Dev_96', 'Momentum_Drawdown_96', 'Chikou_Span_Drawdown_48', 'ADX_PC2_Mean_48', 'Harami_Dev_16', 'Ichimoku_Overlap_Drawdown_48', 'Ichimoku_Overlap_Mean_1152', 'Body_Ratio_Dev_16', 'Volume_Change', 'ATR_Dev_16', 'BB-KC', 'RSI_PC2_Dev_4', 'Body_Ratio_Mean_48', 'ADX_PC4_Drawdown_4', 'RSI-MACD_Drawdown_96', 'MFV_Drawdown_48', 'Stochastic-RSI_Dev_96', 'Dragonfly_Doji-ATR_Mean_384', 'Body_Ratio_Dev_4', 'Returns_Drawdown_16', 'A/D_Drawdown_16', 'OBV_Dev_96', 'CMF_Mean_48', 'Harami_Cross_Dev_1152', 'BB_Width_Drawdown_4', 'RSI-MACD_Dev_4', 'Proba_Sig_Mean_4', 'Returns_Mean_1152', 'Three_Outside_Dev_1152', 'BB-KC_Drawdown_4', 'BB_Upper_Dev_16', 'Long_Candle_Dev_96', 'BB-KC_Mean_16', 'Short_Candle-RSI_Mean_16', 'KC_Upper_Dev_16', 'MACDSignal_Mean_4', 'Belt_Hold-RSI_Dev_16', 'Harami_Cross_Dev_96', 'CCI_Dev_384', 'ATR_PC2_Drawdown_16', 'VWAP-ATR', 'LOW-HIGH_EMA_Mean_96', 'RSI_PC3_Drawdown_16', 'Hour_Cos_Mean_4', 'Doji-RSI_Mean_96', 'Volume_Change_Drawdown_384', 'Three_Outside_Dev_384', 'Label', 'Weights']
+#meta_features = ['EX_PC1', 'EX_PC2', 'EX_PC3', 'state_1_proba', 'state_3_proba', 'state_4_proba', 'state_7_proba', 'state_8_proba', 'state_9_proba', 'state_12_proba', 'state_13_proba', 'state', 'MFV', 'Upper_Wick_Ratio', 'WILLR', 'Lower_Wick_Ratio', 'Upper_Wick', 'RSI_PC1', 'Closing_Marubozu-OBV', 'Doji-RSI', 'RSI_PC2', 'Closing_Marubozu', 'Short_Candle-RSI', 'Lower_Wick', 'Volume', 'Volume-ATR', 'OBV', 'KC_Upper', 'Range', 'VWAP', 'Long_Candle-OBV', 'Body_Size', 'CCI', 'Doji-OBV', 'Fast_%D', 'Closing_Marubozu-OBV_Dev_16', 'Volume_Dev_16', 'Volume_Mean_48', 'Closing_Marubozu-OBV_Dev_4', 'MFV_Mean_16', 'OBV_Dev_16', 'OBV_Dev_96', 'OBV_Dev_48', 'Doji-OBV_Mean_16', 'Price_Diff_Mean_4', 'Volume_Dev_96', 'Upper_Wick_Ratio_Mean_96', 'Lower_Wick_Mean_4', 'OBV_Dev_4', 'Upper_Wick_Ratio_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'Doji-OBV_Dev_16', 'Label', 'Weights']
+meta_features = ['Short_Candle-RSI', 'Volume-ATR', 'Lower_Wick_Ratio', 'Stochastic-RSI', 'Closing_Marubozu-OBV', 'Returns', 'Lower_Wick', 'MFV', 'RSI_PC1', 'Low', 'Body_Ratio', 'RSI_PC3', 'CCI', 'BTC-ETH_Diff', 'Fast_%D', 'ADX_PC4', 'RSI_PC2', 'Body_Size', 'Upper_Wick_Ratio', 'Upper_Wick', 'Closing_Marubozu-ATR', 'Volume', 'ADX_PC2', 'Belt_Hold-RSI', 'Long_Candle-ATR', 'Doji-RSI', 'Doji-ATR', 'Range', 'VWAP', 'ADX_PC3', 'Long_Candle-OBV', 'Short_Candle-ATR', 'ADX_PC1', 'Volume_Change', 'BB-KC', 'VWAP-ATR']
+extra_features = ['Returns_Mean_4', 'ATR_Drawdown_4', 'EX_PC2', 'Belt_Hold-ATR_Mean_1152', 'VWAP_Drawdown_16', 'EX_PC3', 'RSI_PC2_Mean_4', 'Volume-ATR_Mean_96', 'Proba_Sig_Mean_48', 'Lower_Wick_Ratio_Mean_4', 'state_9_proba', 'Hour_Sin_Dev_16', 'Volume_Drawdown_4','ADX_PC1_Dev_4', 'CCI_Mean_4', 'Doji-RSI_Mean_16', 'ADX_PC5_Mean_4', 'state_8_proba', 'RSI_PC1_Dev_48', 'state_1_proba', 'state_3_proba', 'BTC-ETH_Diff_Drawdown_16', 'WILLR_Dev_48', 'Volume-ATR_Dev_4', 'state_12_proba', 'Body_Ratio_Dev_48','Short_Candle_Dev_384', 'Hour_Cos_Dev_48', 'Spinning_Top_Dev_48','Belt_Hold-RSI_Drawdown_384', 'BTC-ETH_Diff_Dev_384', 'BB-KC_Drawdown_16', 'Long_Doji-RSI_Mean_48', 'RSI_PC3_Drawdown_4', 'ADX_PC4_Drawdown_48','Aroon_Mean_4', 'Lower_Wick_Mean_4', 'Stochastic-RSI_Dev_4', 'Hikkake_Dev_96','ATR_Drawdown_16', 'MFV_Dev_4', 'Closing_Marubozu-RSI_Dev_1152', 'Closing_Marubozu-OBV_Drawdown_96', 'ATR_Drawdown_384', 'Fast_%K_Mean_16', 'KC_Upper_Dev_4', 'Volume_Change_Drawdown_96', 'Short_Candle-OBV_Mean_384', 'BTC-ETH_Diff_Mean_96', 'TSI_Drawdown_48', 'Short_Candle-RSI_Dev_16', 'Short_Candle-ATR_Drawdown_96', 'Aroon_Mean_96', 'RSI_PC3_Dev_96', 'Body_Size_Drawdown_16', 'ADX_PC2_Dev_96', 'MACDHist_Dev_4', 'Body_Ratio_Mean_4', 'Short_Candle-ATR_Mean_4','RSI_PC3_Drawdown_48', 'TSI_Dev_4', 'Proba_Sig_Dev_96', 'OBV_Dev_4', 'MFV_Dev_48', 'RSI-MACD_Mean_96', 'ATR_PC2_Dev_4','Long_Candle-ATR_Mean_48', 'RSI-MACD_Mean_48', 'Proba_Sig_Dev_384', 'Fast_%K_Drawdown_4', 'Long_Candle-OBV_Mean_4', 'Close_Dev_4', 'Harami_Dev_48', 'BB_Width_Dev_4', 'ADX_PC1_Mean_16', 'Proba_Sig_Mean_16', 'ADX_PC3_Mean_16', 'Belt_Hold_Dev_1152', 'RSI_PC3_Dev_16', 'Chikou_Span_Dev_16', 'A/D_Dev_16', 'BB_Lower_Drawdown_16', 'Long_Candle_Dev_16', 'ADX_PC3_Drawdown_96', 'ADX_PC2_Drawdown_48', 'MACDSignal_Dev_16', 'Fast_%D_Dev_4', 'ADX_PC2_Mean_1152', 'ADX_Dev_48', 'Upper_Wick_Ratio_Mean_4', 'Doji-ATR_Mean_96','A/D_Dev_96','Upper_Wick_Mean_4', 'Volume_Dev_96', 'ADX_PC3_Drawdown_4', 'Closing_Marubozu-ATR_Mean_4', 'RSI_PC2_Dev_1152', 'Hikkake_Mean_48', 'Body_Ratio_Mean_16', 'Lower_Wick_Dev_16', 'BTC-ETH_Diff_Mean_16', 'WILLR_Dev_384', 'BB_Upper_Dev_4', 'Long_Doji-RSI_Mean_1152', 'VWAP_Dev_4','High_Wave_Dev_16', 'Hour_Sin_Dev_4', 'BB-KC_Dev_96', 'Engulfing_Dev_384', 'Long_Candle-RSI_Mean_96', 'BTC-ETH_Diff_Dev_48', 'RSI-MACD_Dev_16', 'Fast_%D_Drawdown_16', 'Upper_Wick_Dev_16', 'CMF_Drawdown_48', 'Lower_Wick_Ratio_Dev_16', 'MACDHist_Mean_1152', 'MACDHist_Drawdown_16', 'R2_Drawdown_48', 'Ichimoku_Overlap_Dev_96', 'Hikkake_Mean_1152', 'Momentum_Dev_4', 'ADX_PC3_Mean_384', 'ADX_PC4_Drawdown_384', 'ADX_PC4_Dev_4', 'Open_Drawdown_4', 'Day_Mean_384', 'ADX_PC4_Dev_16', 'RSI-MACD_Drawdown_4', 'Low_Dev_4', 'OBV_Dev_16','Body_Size_Dev_48', 'CCI_Dev_96', 'CCI_Drawdown_16', 'ADX_PC4_Mean_1152', 'CMF_Drawdown_4', 'RSI_Drawdown_48', 'CMF_Dev_16', 'ADX_Dev_16', 'Momentum_Mean_96', 'ADX_PC1_Mean_1152','ATR_Dev_1152', 'LOW-HIGH_EMA_Dev_4', 'Returns_Dev_96', 'RSI_PC2_Dev_48', 'Short_Candle-RSI_Drawdown_96', 'Volume_Mean_48', 'Volume-ATR_Drawdown_96', 'Volume-ATR_Mean_16', 'MFV_Drawdown_384', 'Closing_Marubozu-ATR_Dev_48', 'TSI_Dev_16', 'RSI_PC2_Drawdown_4', 'KC_Width_Drawdown_96', 'Day_Dev_384', 'ADX_PC2_Dev_384', 'ADX_PC5_Mean_384', 'Belt_Hold-RSI_Drawdown_96', 'Dragonfly_Doji-ATR_Mean_96', 'S1_Dev_4', 'Volume-ATR_Drawdown_48', 'Dragonfly_Doji-RSI_Mean_96', 'Stochastic-RSI_Dev_16', 'Close_Dev_16', 'ADX_PC5_Dev_4', 'BB_Upper_Dev_96', 'ADX_PC5_Dev_96', 'Three_Outside_Dev_96', 'Closing_Marubozu_Dev_48', 'MACD_Dev_4', 'Short_Candle-ATR_Mean_16', 'ADX_PC2_Dev_1152', 'BB-KC_Drawdown_96', 'RSI_PC3_Mean_16', 'ADX_PC5_Drawdown_4', 'Hikkake_Dev_16', 'RSI_PC1_Dev_4', 'High_Dev_4', 'Fast_%D_Dev_96', 'High_Wave_Mean_384', 'ADX_PC2_Mean_384', 'Closing_Marubozu-RSI_Dev_96', 'TSI_Dev_48', 'ADX_Mean_96', 'MACDHist_Drawdown_48', 'ATR_PC2_Drawdown_384', 'Lower_Wick_Ratio_Dev_4', 'ADX_PC5_Mean_1152','MACDHist_Mean_96', 'RSI_PC3_Dev_384', 'ADX_PC5_Dev_384', 'Closing_Marubozu-RSI_Drawdown_384', 'RSI_PC2_Dev_384','BTC-ETH_Diff_Mean_1152', 'TSI_Drawdown_4', 'RSI_Drawdown_4', 'ATR_PC2_Dev_16', 'ADX_Drawdown_16', 'RSI_PC2_Dev_96', 'Belt_Hold-ATR_Mean_96', 'ADX_PC3_Dev_96','Price_Diff_Mean_384', 'RSI_PC3_Mean_48', 'ADX_PC1_Drawdown_16','BB-KC_Dev_4', 'ADX_PC2_Dev_4', 'Aroon_Dev_16', 'RSI_PC1_Dev_1152', 'KC_Width_Dev_4', 'BTC-ETH_Diff_Dev_16', 'ADX_PC5_Dev_1152', 'BB-KC_Dev_48', 'BB_Lower_Drawdown_48', 'Harami_Dev_96', 'Senkou_Span_A_Dev_16', 'ADX_PC3_Dev_4', 'Aroon_Mean_16', 'ATR_PC3_Drawdown_384', 'ADX_PC5_Mean_96', 'RSI_PC3_Drawdown_96', 'Belt_Hold-ATR_Drawdown_96', 'Range_Mean_4', 'ATR_PC1_Drawdown_4', 'ADX_Drawdown_384', 'Day_Mean_1152', 'Spinning_Top_Dev_16', 'Belt_Hold-RSI_Dev_48', 'Body_Size_Drawdown_48', 'Price_Diff_Drawdown_48','BTC-ETH_Diff_Drawdown_4', 'ATR_PC2_Mean_4', 'Closing_Marubozu-OBV_Mean_4', 'Upper_Wick_Ratio_Mean_16', 'ADX_PC2_Dev_16', 'Volume_Change_Mean_4', 'ADX_PC3_Mean_96', 'Fast_%D_Drawdown_4', 'RSI_PC3_Mean_4', 'ADX_PC3_Mean_4', 'ADX_PC1_Dev_16', 'ADX_PC4_Mean_4', 'ADX_PC4_Dev_48', 'Aroon_Dev_48', 'Short_Candle-ATR_Mean_48', 'Closing_Marubozu_Dev_96', 'ADX_PC3_Mean_48', 'BB_Width_Drawdown_96', 'RSI_PC3_Dev_1152', 'Belt_Hold-ATR_Mean_48', 'Fast_%D_Dev_16', 'ADX_PC3_Dev_16', 'ADX_PC1_Dev_96', 'RSI_PC1_Dev_96', 'Hikkake_Dev_384', 'CCI_Drawdown_4','ADX_PC5_Drawdown_96', 'Hikkake_Dev_4', 'Belt_Hold-RSI_Mean_16','Day_Dev_96', 'Belt_Hold-ATR_Mean_16', 'LOW-HIGH_EMA_Drawdown_16', 'VWAP-ATR_Drawdown_96', 'BTC-ETH_Diff_Drawdown_96', 'Volume_Change_Mean_384', 'ADX_PC2_Drawdown_96', 'Sig_Mean_1152', 'ADX_PC3_Dev_384', 'Volatility_Drawdown_96', 'Engulfing_Dev_48', 'Stochastic-RSI_Mean_96', 'KC_Upper_Dev_48', 'BTC-ETH_Diff_Mean_48', 'Closing_Marubozu-ATR_Drawdown_96', 'BTC-ETH_Diff_Mean_384', 'CMF_Drawdown_96', 'Upper_Wick_Ratio_Dev_4', 'ADX_PC4_Drawdown_16', 'Lower_Wick_Ratio_Mean_16', 'VWAP-ATR_Drawdown_48', 'Long_Candle-OBV_Mean_16','CCI_Dev_4', 'BB_Lower_Dev_4', 'ADX_PC3_Dev_48', 'ATR_PC2_Mean_48', 'Senkou_Span_B_Dev_16', 'Closing_Marubozu-RSI_Dev_384', 'TSI_Drawdown_96', 'Short_Candle-OBV_Dev_48', 'Short_Candle-ATR_Mean_96', 'Short_Candle-RSI_Dev_96', 'Range_Drawdown_16', 'Body_Ratio_Drawdown_48', 'Harami_Mean_384', 'CCI_Drawdown_48', 'Proba_Sig_Mean_96', 'Short_Candle-ATR_Mean_384', 'Upper_Wick_Ratio_Dev_16', 'ATR_PC2_Drawdown_4', 'MACDHist_Mean_16', 'ADX_PC4_Drawdown_96', 'Hour_Sin_Mean_4', 'Low_Drawdown_4', 'VWAP_Drawdown_96', 'TSI_Dev_96', 'Hikkake_Dev_48', 'Long_Candle-OBV_Drawdown_96', 'CMF_Drawdown_16', 'Short_Candle-RSI_Dev_4', 'Marubozu-RSI_Dev_384', 'TSI_Mean_4', 'Aroon_Dev_1152', 'RSI_PC1_Drawdown_4', 'Range_Drawdown_48', 'ATR_PC3_Drawdown_4', 'MACDSignal_Drawdown_96', 'BB-KC_Mean_48', 'RSI_Drawdown_16', 'Long_Doji-OBV_Mean_48', 'Volatility_Dev_96', 'ADX_PC4_Dev_96', 'RSI_PC2_Mean_48', 'KC_Lower_Dev_4', 'Lower_Wick_Ratio_Mean_96', 'ADX_PC4_Mean_384','Volume_Change_Mean_96', 'Long_Candle-RSI_Dev_96', 'Momentum_Drawdown_96', 'Chikou_Span_Drawdown_48', 'ADX_PC2_Mean_48', 'Harami_Dev_16', 'Ichimoku_Overlap_Drawdown_48', 'Ichimoku_Overlap_Mean_1152', 'Body_Ratio_Dev_16','ATR_Dev_16','RSI_PC2_Dev_4', 'Body_Ratio_Mean_48', 'ADX_PC4_Drawdown_4', 'RSI-MACD_Drawdown_96', 'MFV_Drawdown_48', 'Stochastic-RSI_Dev_96', 'Dragonfly_Doji-ATR_Mean_384', 'Body_Ratio_Dev_4', 'Returns_Drawdown_16', 'A/D_Drawdown_16', 'OBV_Dev_96', 'CMF_Mean_48', 'Harami_Cross_Dev_1152', 'BB_Width_Drawdown_4', 'RSI-MACD_Dev_4', 'Proba_Sig_Mean_4', 'Returns_Mean_1152', 'Three_Outside_Dev_1152', 'BB-KC_Drawdown_4', 'BB_Upper_Dev_16', 'Long_Candle_Dev_96', 'BB-KC_Mean_16', 'Short_Candle-RSI_Mean_16', 'KC_Upper_Dev_16', 'MACDSignal_Mean_4', 'Belt_Hold-RSI_Dev_16', 'Harami_Cross_Dev_96', 'CCI_Dev_384', 'ATR_PC2_Drawdown_16','LOW-HIGH_EMA_Mean_96', 'RSI_PC3_Drawdown_16', 'Hour_Cos_Mean_4', 'Doji-RSI_Mean_96', 'Volume_Change_Drawdown_384', 'Three_Outside_Dev_384']
 
-#data = load_and_preprocess_data("BTCUSDC_15m.csv", meta_features)
-data = pd.read_csv("BTCUSDC_15m_processed.csv")
-labels = data.pop('Label').tolist()
-labels = [int(x) for x in labels]
-weights = data.pop('Weights').tolist()
-meta_features.remove('Label')
-meta_features.remove('Weights')
-
-data['Direction'] = (data['Returns'] > 0).astype(int)
-closes = data['Close'].tolist()
+#{'filterType': 'LOT_SIZE', 'minQty': '0.00001000', 'maxQty': '9000.00000000', 'stepSize': '0.00001000'}
+models = load_meta_model('meta_model')
+continuous_trading(models, meta_features, extra_features, lstm_features, hmm_features)
+#continuous_sim(models, meta_features, extra_features, lstm_features, hmm_features)
 #
-n = len(data)
-cut = int(n * 0.2)
-hmm_train = data.iloc[:cut]
-meta_train = data.iloc[cut:]
-meta_labels = labels[cut:]
-meta_weights = weights[cut:]
-closes = closes[cut:]
 
-# rets = 1 * np.diff(np.log(closes))
-# am = arch_model(rets, vol='EGARCH', p=1, q=1, dist='ged') #58 69
-# res = am.fit(disp='off')
-# fcasts = res.forecast(start=0, horizon=1, reindex=False)
-# meta_garch_var = fcasts.variance.iloc[0:].values.flatten()
-# meta_garch_var = np.insert(meta_garch_var, 0, 0)
-# meta_train = meta_train.reset_index(drop=True)
-# meta_train['EGARCH'] = meta_garch_var
-# meta_features.append('EGARCH')
-
-hmm_scaled = hmm_scaler.fit_transform(hmm_train[hmm_features].values)
+# data = load_and_preprocess_data("BTCUSDC_15m.csv", meta_features)
+# meta_features.extend(extra_features)
+# data = pd.read_csv("BTCUSDC_15m_processed.csv")
+# labels = data.pop('Label').tolist()
+# labels = [int(x) for x in labels]
+# weights = data.pop('Weights').tolist()
+#
+# data['Direction'] = (data['Returns'] > 0).astype(int)
+# closes = data['Close'].tolist()
+# n = len(data)
+# cut = int(n * 0.2)
+# hmm_train = data.iloc[:cut]
+# meta_train = data.iloc[cut:]
+# meta_labels = labels[cut:]
+# meta_weights = weights[cut:]
+# closes = closes[cut:]
+# # #
+# hmm_scaled = hmm_scaler.fit_transform(hmm_train[hmm_features].values)
+# joblib.dump(hmm_scaler, 'hmm_scaler.pkl')
 # hmm = GaussianHMM(n_components=15, covariance_type="full", n_iter=131, min_covar=0.034885114865499216, random_state=42)
 # hmm.fit(hmm_scaled)
 # joblib.dump(hmm, 'trained_hmm.pkl')
-hmm = joblib.load('trained_hmm.pkl')
+# # hmm = joblib.load('trained_hmm.pkl')
+# #
+# meta_hmm = hmm_scaler.transform(meta_train[hmm_features].values)
+# hmm_df = hmm_walk_forward(hmm, meta_hmm)
+# #
+# hmm_df = hmm_df.reset_index(drop=True)
+# #hmm_df.drop(['state_2_proba', 'state_5_proba', 'state_6_proba', 'state_10_proba', 'state_11_proba', 'state_14_proba', 'state_0_proba'], axis=1, inplace=True)
+# #drop useless (mostly useless) hmm features
+# meta_train = meta_train.reset_index(drop=True)
+# meta_train = pd.concat([meta_train, hmm_df], axis=1)
+# #meta_features.extend(hmm_df.columns.tolist())
+# #
+# n = len(meta_train)
+# cut = int(n * 0.98)
+# data_train = meta_train.iloc[:cut]
+# labels_train = meta_labels[:cut]
+# weights_train = meta_weights[:cut]
+# data_test = meta_train.iloc[cut:]
+# labels_test = meta_labels[cut:]
+# weights_test = meta_weights[cut:]
+# closes_test = closes[cut:]
 
-meta_hmm = hmm_scaler.transform(meta_train[hmm_features].values)
-hmm_df = hmm_walk_forward(hmm, meta_hmm)
-
-hmm_df = hmm_df.reset_index(drop=True)
-#hmm_df.drop(['state_2_proba', 'state_5_proba', 'state_6_proba', 'state_10_proba', 'state_11_proba', 'state_14_proba', 'state_0_proba'], axis=1, inplace=True)
-#drop useless (mostly useless) hmm features
-meta_train = meta_train.reset_index(drop=True)
-meta_train = pd.concat([meta_train, hmm_df], axis=1)
-#meta_features.extend(hmm_df.columns.tolist())
-
-n = len(meta_train)
-cut = int(n * 0.9)
-data_train = meta_train.iloc[:cut]
-labels_train = meta_labels[:cut]
-weights_train = meta_weights[:cut]
-data_test = meta_train.iloc[cut:]
-labels_test = meta_labels[cut:]
-weights_test = meta_weights[cut:]
-closes_test = closes[cut:]
+# models = load_meta_model('meta_model')
+# preds, probas = predict_with_meta_model(models, data_test[meta_features], data_test[lstm_features])
+# profit = trading_simulation(preds, closes_test)
 
 #→ trying hidden1=84, hidden2=55, hidden3=9, lr=0.00060551, dropout=0.09111804, window=40, noise=0.20802087, ker=0.05681326, rec=0.00322820, rec_drop=0.21257794
 #307
-stack, pred_labels, profit = build_meta_model(data_train[meta_features], labels_train, weights_train, data_test[meta_features], labels_test, closes_test, data_train[lstm_features], data_test[lstm_features],
-    lstm_hidden_units=[84,55,9], lstm_dropout=0.09111804, lstm_learning_rate=0.00060551, lstm_window_size=40, lstm_rec_drop=0.5,
-    lstm_noise=0.20802087, lstm_ker=0.05681326, lstm_rec=0.00322820)
-print(profit)
+# stack, pred_labels, profit = build_meta_model(data_train[meta_features], labels_train, weights_train, data_test[meta_features], labels_test, closes_test, data_train[lstm_features], data_test[lstm_features],
+#     lstm_hidden_units=[84,55,9], lstm_dropout=0.09111804, lstm_learning_rate=0.00060551, lstm_window_size=40, lstm_rec_drop=0.5,
+#     lstm_noise=0.20802087, lstm_ker=0.05681326, lstm_rec=0.00322820)
+# print(profit)
 #286.2362360730648 at 0.5 rec_drop
 
+#holdout threshold search
+# thresh_grid = np.linspace(0.4, 0.6, 201)
+# best_profit = -np.inf
+# best_pair = (None, None)
+# for min_proba in thresh_grid:
+#     for max_proba in thresh_grid:
+#         profit = trading_simulation(preds, probas, closes_test, min_proba, max_proba)
+#         if profit > best_profit:
+#             best_profit = profit
+#             best_pair = (min_proba, max_proba)
+#
+# print(best_profit)
+# print(best_pair)
 #HMM hyperparameter tuning
 # X = data[hmm_features].values
 # X_scaled = scaler.fit_transform(X)
